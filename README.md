@@ -4,6 +4,13 @@ Provides a mechanism for ingesting large tables into Databricks via [Lakehouse F
 
 ![Lakehouse Federation ingest diagram](assets/lakefed_ingest_diagram.png "Lakehouse Federation ingest diagram")
 
+The following sources are currently supported:
+- SQL Server
+- Oracle
+- PostgreSQL
+- Redshift
+- Synapse
+
 ## Getting Started
 
 **Setup Lakehouse Federation**  
@@ -16,7 +23,7 @@ Add create table statement to text file as shown in [config/ddl_create_lakefed_t
 Ingesting from Oracle requires permission to read the sys.dba_segments table. This is to obtain the source table size.
 
 **PostgreSQL Configuration**  
-The number of queries used for ingestion is determined in part by the size of the source table. Since Lakehouse Federation doesn't currently support PostgreSQL object size functions (E.g., pg_table_size), you need to create a view in the source database or use JDBC pushdown. Creating a view in the source database is recommended.
+The number of queries used for ingestion is determined in part by the size of the source table. Since Lakehouse Federation doesn't currently support PostgreSQL object size functions (E.g., pg_table_size), you need to create a view in the source database or use JDBC pushdown. **Creating a view in the source database is recommended.**
 
 1. Database view - create a view in the source database using the statement below. Leave the `jdbc_config_file` job parameter blank, and the view will be queried using Lakehouse Federation.
 
@@ -35,9 +42,13 @@ and table_type = 'BASE TABLE';
 
 2. JDBC pushdown - create a config file like [config/postgresql_jdbc.json](config/postgresql_jdbc.json). Use the path to the file as the value for the `jdbc_config_file` job parameter. [Secrets](https://learn.microsoft.com/en-us/azure/databricks/security/secrets/) must be used for JDBC credentials. See [notebooks/manage_secrets.ipynb](notebooks/manage_secrets.ipynb) for reference.
 
+## Recommendations
+- An all-purpose, single-node cluster with the dedicated (Formerly single user) access mode is recommended. If a job cluster is used, the parent and child jobs will use separate clusters, increasing the overall duration.
+- Number of cores should match or exceed the concurrency of the foreach task.
+
 ## Limitations
 - Does not handle skew. The solution works best when the partition column has an even distribution.
-- Does not provide atomicity. Individual queries are not executed as a single transaction. One could fail while the rest succeed.
+- Does not provide atomicity. Individual queries are not executed as a single transaction. One could fail while the rest succeed, or the source table could be altered before all ingestion queries are completed.
 
 ## Deploy Project as a Databricks Asset Bundle (DAB)
 
