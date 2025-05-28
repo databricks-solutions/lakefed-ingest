@@ -1,7 +1,7 @@
 # https://registry.terraform.io/providers/databricks/databricks/latest/docs/data-sources/node_type
 data "databricks_node_type" "general_purpose" {
   category = "General Purpose"
-  min_cores   = 8
+  min_cores   = 32
   is_io_cache_enabled = true
 }
 
@@ -32,7 +32,6 @@ resource "databricks_job" "this" {
   job_cluster {
     job_cluster_key = "default"
     new_cluster {
-      num_workers   = 8
       spark_version = data.databricks_spark_version.latest_lts.id
       node_type_id  = data.databricks_node_type.general_purpose.id
       data_security_mode = "SINGLE_USER"

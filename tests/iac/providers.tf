@@ -18,7 +18,7 @@ terraform {
 }
 
 provider "databricks" {
-  profile = "az_dbx"
+  profile = "DEFAULT"
 }
 
 provider "azurerm" {

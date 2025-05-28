@@ -9,7 +9,7 @@ include:
 variables:
   existing_cluster_id:
     description: The ID of an existing cluster
-    default: 0313-013331-pl7g2u6q
+    default: 0527-190356-td74nqh4
   existing_warehouse_id:
     description: The ID of an existing warehouse
     default: a50b6f1c6dc8d58c
@@ -24,7 +24,7 @@ targets:
     mode: development
     default: true
     workspace:
-      host: https://e2-demo-field-eng.cloud.databricks.com/
+      host: https://e2-demo-field-eng.cloud.databricks.com
 
   ## Optionally, there could be a 'staging' target here.
   ## (See Databricks docs on CI/CD at https://docs.databricks.com/dev-tools/bundles/ci-cd.html.)

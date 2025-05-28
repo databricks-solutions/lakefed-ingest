@@ -1,7 +1,7 @@
 resources:
   jobs:
-    lakehouse_federation_ingest_lvl1:
-      name: "Lakehouse Federation Ingest Lvl1"
+    lakehouse_federation_bulk_ingest:
+      name: "Lakehouse Federation Bulk Ingest"
       tasks:
         - task_key: config
           notebook_task:
@@ -10,18 +10,22 @@ resources:
           existing_cluster_id: ${var.existing_cluster_id}
           libraries:
             - whl: ../dist/*.whl
-        - task_key: foreach_batch
+        - task_key: foreach_task_id
           depends_on:
             - task_key: config
           for_each_task:
-            inputs: "{{tasks.config.values.batch_list}}"
-            concurrency: 1
+            inputs: "{{tasks.config.values.id_list}}"
+            concurrency: 8
             task:
-              task_key: run_batch_of_queries
-              run_job_task:
-                job_id: ${resources.jobs.lakehouse_federation_ingest_lvl2.id}
-                job_parameters:
-                  batch_id: "{{input}}"
+              task_key: run_query
+              notebook_task:
+                notebook_path: ../notebooks/run_query.ipynb
+                base_parameters:
+                  task_id: "{{input}}"
+                source: WORKSPACE
+              existing_cluster_id: ${var.existing_cluster_id}
+              max_retries: 3
+              min_retry_interval_millis: 0
       tags:
         workload: lakefed_bulk_ingest
       queue:
@@ -51,46 +55,3 @@ resources:
           default: default
         - name: tgt_table
           default: lakefed_tgt
-    lakehouse_federation_ingest_lvl2:
-      name: "Lakehouse Federation Ingest Lvl2"
-      tasks:
-        - task_key: get_partitions
-          notebook_task:
-            notebook_path: ../notebooks/get_partitions.ipynb
-            source: WORKSPACE
-          existing_cluster_id: ${var.existing_cluster_id}
-        - task_key: foreach_partition
-          depends_on:
-            - task_key: get_partitions
-          for_each_task:
-            inputs: "{{tasks.get_partitions.values.batch_of_partitions}}"
-            concurrency: 8
-            task:
-              task_key: run_query
-              notebook_task:
-                notebook_path: ../notebooks/run_query_py.ipynb
-                base_parameters:
-                  where_clause: "{{input}}"
-                source: WORKSPACE
-              existing_cluster_id: ${var.existing_cluster_id}
-              max_retries: 3
-              min_retry_interval_millis: 0
-      tags:
-        workload: lakefed_bulk_ingest
-      queue:
-        enabled: false
-      parameters:
-        - name: src_catalog
-          default: ckoester_postgresql
-        - name: src_schema
-          default: public
-        - name: src_table
-          default: lakefed_src_10m
-        - name: tgt_catalog
-          default: main
-        - name: tgt_schema
-          default: chris_koester
-        - name: tgt_table
-          default: lakefed_tgt
-        - name: batch_id
-          default: ""

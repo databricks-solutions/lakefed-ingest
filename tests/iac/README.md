@@ -7,7 +7,7 @@ The Terraform templates deploy the following resources in Azure for integration 
 
 ## Deployment Instructions
 
-1. Install Databricks CLI and configure authentication to Azure Databricks workspace. Set your profile name in providers.tf. The default profile name is "az_dbx".
+1. Install Databricks CLI and configure authentication to Azure Databricks workspace. Set your profile name in providers.tf. The default profile name is "DEFAULT".
 
 2. Install the Azure CLI and authenticate.
 

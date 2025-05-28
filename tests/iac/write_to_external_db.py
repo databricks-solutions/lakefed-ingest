@@ -63,7 +63,7 @@ qry = f"""\
     and table_type = 'BASE TABLE';
 """
 cmd = f'--command={qry}'
-subprocess.run(['psql', f'--host={host}', '--port=5432', '--dbname=postgres', '--username={username}', '--set=sslmode=require', cmd], env=env, capture_output=True)
+subprocess.run(['psql', f'--host={host}', '--port=5432', '--dbname=postgres', f'--username={username}', '--set=sslmode=require', cmd], env=env, capture_output=True)
 
 # COMMAND ----------
 

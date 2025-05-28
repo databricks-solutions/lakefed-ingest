@@ -43,7 +43,7 @@ and table_type = 'BASE TABLE';
 2. JDBC pushdown - create a config file like [config/postgresql_jdbc.json](config/postgresql_jdbc.json). Use the path to the file as the value for the `jdbc_config_file` job parameter. [Secrets](https://learn.microsoft.com/en-us/azure/databricks/security/secrets/) must be used for JDBC credentials. See [notebooks/manage_secrets.ipynb](notebooks/manage_secrets.ipynb) for reference.
 
 ## Recommendations
-- An all-purpose, single-node cluster with the dedicated (Formerly single user) access mode is recommended. If a job cluster is used, the parent and child jobs will use separate clusters, increasing the overall duration.
+- An all-purpose, single-node cluster with the dedicated (Formerly single user) access mode is recommended.
 - Number of cores should match or exceed the concurrency of the foreach task.
 
 ## Limitations

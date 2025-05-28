@@ -42,11 +42,3 @@ resource "azurerm_postgresql_flexible_server" "default" {
     local.base_tags
   )
 }
-
-# Equivalent to checkbox "Allow public access from any Azure service within Azure to this server"
-resource "azurerm_postgresql_flexible_server_firewall_rule" "allow_azure_services" {
-  name             = "allow_azure_services"
-  server_id        = azurerm_postgresql_flexible_server.default.id
-  start_ip_address = "0.0.0.0"
-  end_ip_address   = "0.0.0.0"
-}
