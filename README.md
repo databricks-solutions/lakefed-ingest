@@ -1,4 +1,4 @@
-# Lakehouse Federation Bulk Ingest
+# Lakehouse Federation Ingestion
 
 Provides a mechanism for ingesting large tables into Databricks via [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html). It works by dynamically generating N queries that each retrieve a range from the source table. The query ranges are contiguous and don't overlap. The queries are then executed N (Default is 8) at a time in a Databricks Job [foreach task](https://docs.databricks.com/en/jobs/for-each.html).
 
@@ -43,8 +43,8 @@ and table_type = 'BASE TABLE';
 2. JDBC pushdown - create a config file like [config/postgresql_jdbc.json](config/postgresql_jdbc.json). Use the path to the file as the value for the `jdbc_config_file` job parameter. [Secrets](https://learn.microsoft.com/en-us/azure/databricks/security/secrets/) must be used for JDBC credentials. See [notebooks/manage_secrets.ipynb](notebooks/manage_secrets.ipynb) for reference.
 
 ## Recommendations
-- An all-purpose, single-node cluster with the dedicated (Formerly single user) access mode is recommended.
-- Number of cores should match or exceed the concurrency of the foreach task.
+- Use a partition column with a relatively even distribution. If the partition column is also used in an index, that is even better.
+- Number of cores in the Databricks job should match or exceed the concurrency of the foreach task.
 
 ## Limitations
 - Does not handle skew. The solution works best when the partition column has an even distribution.
