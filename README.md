@@ -11,45 +11,6 @@ The following sources are currently supported:
 - Redshift
 - Synapse
 
-## Getting Started
-
-**Setup Lakehouse Federation**  
-Follow the [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html) instructions to create a connection and foreign catalog.
-
-**Add Create Statement for Target Table**  
-Add create table statement to text file as shown in [config/ddl_create_lakefed_tgt.txt](config/ddl_create_lakefed_tgt.txt). Placeholders in the statement are replaced with job parameters during runtime, so that these values only need to be specified once. Use the path to the file as the value for the `tgt_ddl_file_path` job parameter.
-
-**Oracle Configuration**  
-Ingesting from Oracle requires permission to read the sys.dba_segments table. This is to obtain the source table size.
-
-**PostgreSQL Configuration**  
-The number of queries used for ingestion is determined in part by the size of the source table. Since Lakehouse Federation doesn't currently support PostgreSQL object size functions (E.g., pg_table_size), you need to create a view in the source database or use JDBC pushdown. **Creating a view in the source database is recommended.**
-
-1. Database view - create a view in the source database using the statement below. Leave the `jdbc_config_file` job parameter blank, and the view will be queried using Lakehouse Federation.
-
-```sql
-create or replace view public.vw_pg_table_size
- as
- select
-  table_schema,
-  table_name,
-  pg_table_size(quote_ident(table_name)),
-  pg_size_pretty(pg_table_size(quote_ident(table_name))) as pg_table_size_pretty
-from information_schema.tables
-where table_schema not in ('pg_catalog', 'information_schema')
-and table_type = 'BASE TABLE';
-```
-
-2. JDBC pushdown - create a config file like [config/postgresql_jdbc.json](config/postgresql_jdbc.json). Use the path to the file as the value for the `jdbc_config_file` job parameter. [Secrets](https://learn.microsoft.com/en-us/azure/databricks/security/secrets/) must be used for JDBC credentials. See [notebooks/manage_secrets.ipynb](notebooks/manage_secrets.ipynb) for reference.
-
-## Recommendations
-- Use a partition column with a relatively even distribution. If the partition column is also used in an index, that is even better.
-- Number of cores in the Databricks job should match or exceed the concurrency of the foreach task.
-
-## Limitations
-- Does not handle skew. The solution works best when the partition column has an even distribution.
-- Does not provide atomicity. Individual queries are not executed as a single transaction. One could fail while the rest succeed, or the source table could be altered before all ingestion queries are completed.
-
 ## Deploy Project as a Databricks Asset Bundle (DAB)
 
 1. Install the Databricks CLI from https://docs.databricks.com/dev-tools/cli/databricks-cli.html
@@ -93,6 +54,45 @@ and table_type = 'BASE TABLE';
 7. For documentation on the Databricks asset bundles format used
    for this project, and for CI/CD configuration, see
    https://docs.databricks.com/dev-tools/bundles/index.html.
+
+## Getting Started
+
+**Setup Lakehouse Federation**  
+Follow the [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html) instructions to create a connection and foreign catalog.
+
+**Add Create Statement for Target Table**  
+Add create table statement to text file as shown in [config/ddl_create_lakefed_tgt.txt](config/ddl_create_lakefed_tgt.txt). Placeholders in the statement are replaced with job parameters during runtime, so that these values only need to be specified once. Use the path to the file as the value for the `tgt_ddl_file_path` job parameter.
+
+**Oracle Configuration**  
+Ingesting from Oracle requires permission to read the sys.dba_segments table. This is to obtain the source table size.
+
+**PostgreSQL Configuration**  
+The number of queries used for ingestion is determined in part by the size of the source table. Since Lakehouse Federation doesn't currently support PostgreSQL object size functions (E.g., pg_table_size), you need to create a view in the source database or use JDBC pushdown. **Creating a view in the source database is recommended.**
+
+1. Database view - create a view in the source database using the statement below. Leave the `jdbc_config_file` job parameter blank, and the view will be queried using Lakehouse Federation.
+
+```sql
+create or replace view public.vw_pg_table_size
+ as
+ select
+  table_schema,
+  table_name,
+  pg_table_size(quote_ident(table_name)),
+  pg_size_pretty(pg_table_size(quote_ident(table_name))) as pg_table_size_pretty
+from information_schema.tables
+where table_schema not in ('pg_catalog', 'information_schema')
+and table_type = 'BASE TABLE';
+```
+
+2. JDBC pushdown - create a config file like [config/postgresql_jdbc.json](config/postgresql_jdbc.json). Use the path to the file as the value for the `jdbc_config_file` job parameter. [Secrets](https://learn.microsoft.com/en-us/azure/databricks/security/secrets/) must be used for JDBC credentials. See [notebooks/manage_secrets.ipynb](notebooks/manage_secrets.ipynb) for reference.
+
+## Recommendations
+- Use a partition column with a relatively even distribution. If the partition column is also used in an index, that is even better.
+- Number of cores in the Databricks job should match or exceed the concurrency of the foreach task.
+
+## Limitations
+- Does not handle skew. The solution works best when the partition column has an even distribution.
+- Does not provide atomicity. Individual queries are not executed as a single transaction. One could fail while the rest succeed, or the source table could be altered before all ingestion queries are completed.
 
 ## Contributing
 
