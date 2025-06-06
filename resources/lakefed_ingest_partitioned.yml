@@ -1,13 +1,13 @@
 resources:
   jobs:
-    lakehouse_federation_bulk_ingest:
-      name: "Lakehouse Federation Bulk Ingest"
+    lakefed_ingest_partitioned:
+      name: "lakefed_ingest_partitioned"
       tasks:
         - task_key: config
           notebook_task:
-            notebook_path: ../notebooks/config.ipynb
+            notebook_path: ../src/lakefed_ingest/config_ingest_partitioned.ipynb
             source: WORKSPACE
-          existing_cluster_id: ${var.existing_cluster_id}
+          existing_cluster_id: ${var.cluster_id}
           libraries:
             - whl: ../dist/*.whl
         - task_key: foreach_task_id
@@ -19,11 +19,11 @@ resources:
             task:
               task_key: run_query
               notebook_task:
-                notebook_path: ../notebooks/run_query.ipynb
+                notebook_path: ../src/lakefed_ingest/run_query_partitioned.ipynb
                 base_parameters:
                   task_id: "{{input}}"
                 source: WORKSPACE
-              existing_cluster_id: ${var.existing_cluster_id}
+              existing_cluster_id: ${var.cluster_id}
               max_retries: 3
               min_retry_interval_millis: 0
       tags:

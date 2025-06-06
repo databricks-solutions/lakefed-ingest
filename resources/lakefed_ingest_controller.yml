@@ -1,0 +1,35 @@
+resources:
+  jobs:
+    lakefed_ingest_controller:
+      name: "lakefed_ingest_controller"
+      tasks:
+        - task_key: get_tasks
+          sql_task:
+            file:
+              path: ../src/lakefed_ingest/get_task_ids.sql
+            warehouse_id: ${var.warehouse_id}
+        - task_key: foreach_task_id
+          depends_on:
+            - task_key: get_tasks
+          for_each_task:
+            inputs: "{{tasks.get_tasks.output.rows}}"
+            concurrency: 4
+            task:
+              task_key: run_task
+              run_job_task:
+                job_id: ${resources.jobs.lakefed_ingest.id}
+                job_parameters:
+                  task_id: "{{input.id}}"
+      tags:
+        workload: lakefed_bulk_ingest
+      queue:
+        enabled: false
+      parameters:
+        - name: ctrl_catalog
+          default: lakefed_bulk_ingest
+        - name: ctrl_schema
+          default: default
+        - name: ctrl_table
+          default: control
+        - name: task_collection
+          default: adventureworks

@@ -1,0 +1,105 @@
+resources:
+  jobs:
+    lakefed_ingest:
+      name: "lakefed_ingest"
+      tasks:
+        - task_key: get_task
+          sql_task:
+            file:
+              path: ../src/lakefed_ingest/get_task.sql
+            warehouse_id: ${var.warehouse_id}
+        - task_key: create_sink_table
+          depends_on:
+            - task_key: get_task
+          sql_task:
+            file:
+              path: ../src/lakefed_ingest/create_sink_table.sql
+            warehouse_id: ${var.warehouse_id}
+            parameters:
+              tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
+              tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
+              tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
+              src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
+              src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
+              src_table: "{{tasks.get_task.output.first_row.src_table}}"
+              select_list: "{{tasks.get_task.output.first_row.select_list}}"
+        - task_key: if_incremental
+          depends_on:
+            - task_key: create_sink_table
+          condition_task:
+            op: EQUAL_TO
+            left: "{{tasks.get_task.output.first_row.load_type}}"
+            right: incremental
+        - task_key: copy_data
+          depends_on:
+            - task_key: if_incremental
+              outcome: "false"
+          notebook_task:
+            notebook_path: ../src/lakefed_ingest/copy_data.ipynb
+            base_parameters:
+              sink_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
+              sink_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
+              sink_table: "{{tasks.get_task.output.first_row.sink_table}}"
+              src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
+              src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
+              src_table: "{{tasks.get_task.output.first_row.src_table}}"
+              select_list: "{{tasks.get_task.output.first_row.select_list}}"
+              load_type: "{{tasks.get_task.output.first_row.load_type}}"
+            source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+        - task_key: get_new_watermark
+          depends_on:
+            - task_key: if_incremental
+              outcome: "true"
+          sql_task:
+            file:
+              path: ../src/lakefed_ingest/get_new_watermark.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+            parameters:
+              watermark_col: "{{tasks.get_task.output.first_row.watermark_col_name}}"
+              src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
+              src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
+              src_table: "{{tasks.get_task.output.first_row.src_table}}"
+        - task_key: copy_data_incremental
+          depends_on:
+            - task_key: get_new_watermark
+          notebook_task:
+            notebook_path: ../src/lakefed_ingest/copy_data.ipynb
+            base_parameters:
+              sink_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
+              sink_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
+              sink_table: "{{tasks.get_task.output.first_row.sink_table}}"
+              src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
+              src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
+              src_table: "{{tasks.get_task.output.first_row.src_table}}"
+              select_list: "{{tasks.get_task.output.first_row.select_list}}"
+              load_type: "{{tasks.get_task.output.first_row.load_type}}"
+              watermark_col_type: "{{tasks.get_task.output.first_row.watermark_col_type}}"
+              watermark_col_name: "{{tasks.get_task.output.first_row.watermark_col_name}}"
+              watermark_col_start_value: "{{tasks.get_task.output.first_row.watermark_col_start_value}}"
+              watermark_col_end_value: "{{tasks.get_new_watermark.output.first_row.watermark}}"
+            warehouse_id: ${var.warehouse_id}
+        - task_key: update_watermark
+          depends_on:
+            - task_key: copy_data_incremental
+          sql_task:
+            file:
+              path: ../src/lakefed_ingest/update_watermark.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+            parameters:
+              watermark_col_end_value: "{{tasks.get_new_watermark.output.first_row.watermark}}"
+      tags:
+        workload: lakefed_bulk_ingest
+      queue:
+        enabled: false
+      parameters:
+        - name: task_id
+          default: "1"
+        - name: ctrl_catalog
+          default: "lakefed_bulk_ingest"
+        - name: ctrl_schema
+          default: "default"
+        - name: ctrl_table
+          default: "control"
