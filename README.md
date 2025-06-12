@@ -60,8 +60,10 @@ The following sources are currently supported:
 **Setup Lakehouse Federation**  
 Follow the [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html) instructions to create a connection and foreign catalog.
 
-**Add Create Statement for Target Table**  
-Add create table statement to text file as shown in [config/ddl_create_lakefed_tgt.txt](config/ddl_create_lakefed_tgt.txt). Placeholders in the statement are replaced with job parameters during runtime, so that these values only need to be specified once. Use the path to the file as the value for the `tgt_ddl_file_path` job parameter.
+**Add Metadata to Control Table Table**  
+The solution is driven by metadata stored in a control table. In this table you can specific sources and sinks, loading behavior (Full, incremental, partitioned), etc.
+1. Create the control table using the [_create_control_table](notebooks/_create_control_table.ipynb) notebook.
+2. Merge metadata into the control table. See the [load_metadata_tpcds](notebooks/load_metadata_tpcds.ipynb) notebook for an example.
 
 **Oracle Configuration**  
 Ingesting from Oracle requires permission to read the sys.dba_segments table. This is to obtain the source table size.
@@ -85,6 +87,11 @@ and table_type = 'BASE TABLE';
 ```
 
 2. JDBC pushdown - create a config file like [config/postgresql_jdbc.json](config/postgresql_jdbc.json). Use the path to the file as the value for the `jdbc_config_file` job parameter. [Secrets](https://learn.microsoft.com/en-us/azure/databricks/security/secrets/) must be used for JDBC credentials. See [notebooks/manage_secrets.ipynb](notebooks/manage_secrets.ipynb) for reference.
+
+**Ingest Data**
+1. Run the lakefed_ingest_controller job and specify the desired task_collection.
+2. The lakefed_ingest_controller job will return ids belonging to the task_collection, and run the lakefed_ingest job for each one.
+3. The lakefed_ingest job will create the target table and perform a full or incremental load. If a full load is set to partitioned, it will run the lakefed_ingest_partitioned job.
 
 ## Recommendations
 - Use a partition column with a relatively even distribution. If the partition column is also used in an index, that is even better.
