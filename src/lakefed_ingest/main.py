@@ -27,43 +27,6 @@ def get_spark() -> SparkSession:
 spark = get_spark()
 dbutils = DBUtils(spark)
 
-def get_sql_ddl(catalog:str, schema:str, table:str, cluster_col:str, root_dir:str, file_path:str) -> str:
-    """Get SQL DDL to create target table
-    
-    Placeholders in DDL text are replaced so that object identifiers
-    don't need to be hard coded. This enables single-sourcing object
-    identifiers and reusing the solution without modifying code.
-    
-    String replacement solution source
-    https://stackoverflow.com/a/6117124
-    
-    Args:
-        catalog (str): Catalog name
-        schema (str): Schema name
-        table (str): Table name
-        cluster_col (str): Column used to cluster the target table
-        root_dir (str): Root directory for project files
-        file_path (str): Path of config file relative to project root (config/ddl_create_lakefed_tgt.txt)
-    
-    Returns:
-        str: SQL DDL statement
-    """
-    
-    file_path_full = os.path.join(root_dir, file_path)
-
-    with open(file_path_full) as f:
-        sql_ddl = f.read()
-    
-    # Define string replacements
-    rep = {'{catalog}': catalog, '{schema}': schema, '{table}': table, '{cluster_col}': cluster_col}
-    
-    # Perform string replacement
-    rep = dict((re.escape(k), v) for k, v in rep.items()) 
-    pattern = re.compile("|".join(rep.keys()))
-    sql_ddl = pattern.sub(lambda m: rep[re.escape(m.group(0))], sql_ddl)
-    
-    return sql_ddl
-
 def get_partition_boundaries(catalog:str, schema:str, table:str, partition_col:str) -> tuple[int, int]:
     """Get partition boundaries (Min and max values for partition column)
     
@@ -395,7 +358,7 @@ def _get_table_size_delta(catalog:str, schema:str, table:str) -> int:
     table_size_mb = table_size_in_bytes / 1024 / 1024
     return table_size_mb
 
-def get_table_size(catalog:str, schema:str, table:str, src_type:str, root_dir:str, jdbc_config_file:Optional[str]=None) -> int:
+def get_table_size(catalog:str, schema:str, table:str, src_type:str, root_dir:Optional[str]=None, jdbc_config_file:Optional[str]=None) -> int:
     """Get source table size
     
     Args:

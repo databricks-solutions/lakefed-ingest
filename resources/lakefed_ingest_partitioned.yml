@@ -15,26 +15,26 @@ resources:
             - task_key: config
           for_each_task:
             inputs: "{{tasks.config.values.id_list}}"
-            concurrency: 8
+            concurrency: ${var.concurrency}
             task:
-              task_key: run_query
+              task_key: copy_data
               notebook_task:
-                notebook_path: ../src/lakefed_ingest/run_query_partitioned.ipynb
-                base_parameters:
-                  task_id: "{{input}}"
+                notebook_path: ../src/lakefed_ingest/copy_data_partitioned.ipynb
                 source: WORKSPACE
-              existing_cluster_id: ${var.cluster_id}
-              max_retries: 3
+                warehouse_id: ${var.warehouse_id}
+                base_parameters:
+                  partition_id: "{{input}}"
+              max_retries: 2
               min_retry_interval_millis: 0
       tags:
-        workload: lakefed_bulk_ingest
+        workload: lakefed_ingest
       queue:
         enabled: false
       parameters:
         - name: src_type
           default: postgresql
         - name: src_catalog
-          default: lakefed_bulk_ingest_src
+          default: lakefed_ingest_src
         - name: src_schema
           default: public
         - name: src_table
@@ -43,14 +43,8 @@ resources:
           default: customer_id
         - name: partition_size_mb
           default: "256"
-        - name: root_dir
-          default: ${workspace.file_path}
-        - name: jdbc_config_file
-          default: ""
-        - name: tgt_ddl_file_path
-          default: config/ddl_create_lakefed_tgt.txt
         - name: tgt_catalog
-          default: lakefed_bulk_ingest
+          default: lakefed_ingest
         - name: tgt_schema
           default: default
         - name: tgt_table

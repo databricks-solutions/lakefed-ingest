@@ -13,7 +13,7 @@ resources:
             - task_key: get_tasks
           for_each_task:
             inputs: "{{tasks.get_tasks.output.rows}}"
-            concurrency: 4
+            concurrency: ${var.concurrency}
             task:
               task_key: run_task
               run_job_task:
@@ -21,12 +21,12 @@ resources:
                 job_parameters:
                   task_id: "{{input.id}}"
       tags:
-        workload: lakefed_bulk_ingest
+        workload: lakefed_ingest
       queue:
         enabled: false
       parameters:
         - name: ctrl_catalog
-          default: lakefed_bulk_ingest
+          default: lakefed_ingest
         - name: ctrl_schema
           default: default
         - name: ctrl_table

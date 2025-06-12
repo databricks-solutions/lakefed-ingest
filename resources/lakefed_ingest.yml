@@ -2,6 +2,7 @@ resources:
   jobs:
     lakefed_ingest:
       name: "lakefed_ingest"
+      max_concurrent_runs: 32
       tasks:
         - task_key: get_task
           sql_task:
@@ -11,18 +12,19 @@ resources:
         - task_key: create_sink_table
           depends_on:
             - task_key: get_task
-          sql_task:
-            file:
-              path: ../src/lakefed_ingest/create_sink_table.sql
-            warehouse_id: ${var.warehouse_id}
-            parameters:
-              tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
-              tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
-              tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
+          notebook_task:
+            notebook_path: ../src/lakefed_ingest/create_sink_table.ipynb
+            base_parameters:
               src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
               src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
               src_table: "{{tasks.get_task.output.first_row.src_table}}"
               select_list: "{{tasks.get_task.output.first_row.select_list}}"
+              tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
+              tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
+              tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
+              sink_cluster_cols: "{{tasks.get_task.output.first_row.sink_cluster_cols}}"
+            source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
         - task_key: if_incremental
           depends_on:
             - task_key: create_sink_table
@@ -32,7 +34,7 @@ resources:
             right: incremental
         - task_key: copy_data
           depends_on:
-            - task_key: if_incremental
+            - task_key: if_partitioned_copy
               outcome: "false"
           notebook_task:
             notebook_path: ../src/lakefed_ingest/copy_data.ipynb
@@ -90,15 +92,39 @@ resources:
             warehouse_id: ${var.warehouse_id}
             parameters:
               watermark_col_end_value: "{{tasks.get_new_watermark.output.first_row.watermark}}"
+        - task_key: if_partitioned_copy
+          depends_on:
+            - task_key: if_incremental
+              outcome: "false"
+          condition_task:
+            op: EQUAL_TO
+            left: "{{tasks.get_task.output.first_row.load_partitioned}}"
+            right: "true"
+        - task_key: copy_data_partitioned
+          depends_on:
+            - task_key: if_partitioned_copy
+              outcome: "true"
+          run_job_task:
+            job_id: ${resources.jobs.lakefed_ingest_partitioned.id}
+            job_parameters:
+              src_type: "{{tasks.get_task.output.first_row.src_type}}"
+              src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
+              src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
+              src_table: "{{tasks.get_task.output.first_row.src_table}}"
+              partition_col: "{{tasks.get_task.output.first_row.partition_col}}"
+              partition_size_mb: "{{tasks.get_task.output.first_row.partition_size_mb}}"
+              tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
+              tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
+              tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"    
       tags:
-        workload: lakefed_bulk_ingest
+        workload: lakefed_ingest
       queue:
         enabled: false
       parameters:
         - name: task_id
           default: "1"
         - name: ctrl_catalog
-          default: "lakefed_bulk_ingest"
+          default: "lakefed_ingest"
         - name: ctrl_schema
           default: "default"
         - name: ctrl_table

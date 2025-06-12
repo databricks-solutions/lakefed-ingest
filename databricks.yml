@@ -9,10 +9,13 @@ include:
 variables:
   cluster_id:
     description: The ID of an existing cluster
-    default: 0527-190356-td74nqh4
+    default: 0709-132523-cnhxf2p6
   warehouse_id:
     description: The ID of an existing warehouse
-    default: 3cf48e0632bfa3e6
+    default: 6e803b6689f05e5d
+  concurrency:
+    description: Concurrency of for each tasks
+    default: 16
 
 targets:
   # The 'dev' target, for development purposes. This target is the default.
@@ -28,7 +31,6 @@ targets:
 
   ## Optionally, there could be a 'staging' target here.
   ## (See Databricks docs on CI/CD at https://docs.databricks.com/dev-tools/bundles/ci-cd.html.)
-  
   staging:
     workspace:
       host: workspace_host

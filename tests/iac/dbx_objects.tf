@@ -1,5 +1,5 @@
-resource "databricks_catalog" "lakefed_bulk_ingest_src" {
-  name    = "lakefed_bulk_ingest_src"
+resource "databricks_catalog" "lakefed_ingest_src" {
+  name    = "lakefed_ingest_src"
   comment = "Transient federated catalog used for Lakehouse Federation Bulk Ingest integration tests"
   connection_name = databricks_connection.postgresql.name
   options = {
@@ -10,16 +10,16 @@ resource "databricks_catalog" "lakefed_bulk_ingest_src" {
   }
 }
 
-resource "databricks_catalog" "lakefed_bulk_ingest" {
-  name    = "lakefed_bulk_ingest"
+resource "databricks_catalog" "lakefed_ingest" {
+  name    = "lakefed_ingest"
   comment = "Transient catalog used for Lakehouse Federation Bulk Ingest integration tests"
   properties = {
     purpose = "Transient catalog used for Lakehouse Federation Bulk Ingest integration tests"
   }
 }
 
-resource "databricks_schema" "lakefed_bulk_ingest_default" {
-  catalog_name = databricks_catalog.lakefed_bulk_ingest.id
+resource "databricks_schema" "lakefed_ingest_default" {
+  catalog_name = databricks_catalog.lakefed_ingest.id
   name         = "default"
   comment      = "Transient schema used for Lakehouse Federation Bulk Ingest integration tests"
   properties = {
@@ -44,8 +44,8 @@ resource "databricks_connection" "postgresql" {
 
 resource "databricks_volume" "this" {
   name         = "init_scripts"
-  catalog_name = databricks_catalog.lakefed_bulk_ingest.name
-  schema_name  = databricks_schema.lakefed_bulk_ingest_default.name
+  catalog_name = databricks_catalog.lakefed_ingest.name
+  schema_name  = databricks_schema.lakefed_ingest_default.name
   volume_type  = "MANAGED"
   comment      = "Transient volume for used for Lakehouse Federation Bulk Ingest integration tests"
 }

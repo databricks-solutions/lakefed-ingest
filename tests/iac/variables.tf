@@ -9,7 +9,7 @@ variable "location" {
 }
 
 variable "common_tags" {
-  default     = { Project = "lakefed_bulk_ingest" }
+  default     = { Project = "lakefed_ingest" }
   description = "Additional resource tags"
   type        = map(string)
 }

@@ -18,7 +18,6 @@ az login
 3. [Set the Azure subscription ID](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/guides/4.0-upgrade-guide#specifying-subscription-id-is-now-mandatory) for the Terraform Azure Provider, which is required starting with v4.0. An environment variable is used to avoid putting the subscription ID in source control.
 
 ```sh
-# Bash etc.
 export ARM_SUBSCRIPTION_ID=00000000-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ```
 
