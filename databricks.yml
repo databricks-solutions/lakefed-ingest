@@ -8,13 +8,15 @@ include:
 
 variables:
   cluster_id:
-    description: The ID of an existing cluster
-    default: 0709-132523-cnhxf2p6
+    description: Lookup ID of an existing cluster
+    lookup:
+      cluster: "Field Eng Shared UC LTS Cluster"
   warehouse_id:
-    description: The ID of an existing warehouse
-    default: 6e803b6689f05e5d
+    description: Lookup ID of an existing warehouse
+    lookup:
+      warehouse: "lakefed_ingest"
   concurrency:
-    description: Concurrency of for each tasks
+    description: Default concurrency of for each tasks. Can be overridden during deployment.
     default: 16
 
 targets:
