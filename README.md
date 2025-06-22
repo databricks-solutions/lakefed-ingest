@@ -1,6 +1,6 @@
 # Lakehouse Federation Ingestion
 
-Provides a mechanism for ingesting large tables into Databricks via [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html). It works by dynamically generating N queries that each retrieve a range from the source table. The query ranges are contiguous and don't overlap. The queries are then executed N (Default is 8) at a time in a Databricks Job [foreach task](https://docs.databricks.com/en/jobs/for-each.html).
+Provides a mechanism for ingesting large tables into Databricks via [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html). It works by dynamically generating N queries that each retrieve a range from the source table. The query ranges are contiguous and don't overlap. The queries are then executed N (Default is 16) at a time in a Databricks Job [foreach task](https://docs.databricks.com/en/jobs/for-each.html).
 
 ![Lakehouse Federation ingest diagram](assets/lakefed_ingest_diagram.png "Lakehouse Federation ingest diagram")
 
