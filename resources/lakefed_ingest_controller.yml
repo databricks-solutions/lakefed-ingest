@@ -3,21 +3,44 @@ resources:
     lakefed_ingest_controller:
       name: "lakefed_ingest_controller"
       tasks:
-        - task_key: get_tasks
+        - task_key: get_copy_tasks
           sql_task:
             file:
               path: ../src/lakefed_ingest/get_task_ids.sql
+            parameters:
+              load_partitioned: "false"
             warehouse_id: ${var.warehouse_id}
-        - task_key: foreach_task_id
+        - task_key: foreach_copy_task
           depends_on:
-            - task_key: get_tasks
+            - task_key: get_copy_tasks
           for_each_task:
-            inputs: "{{tasks.get_tasks.output.rows}}"
+            inputs: "{{tasks.get_copy_tasks.output.rows}}"
             concurrency: ${var.concurrency}
             task:
-              task_key: run_task
+              task_key: run_copy_job
               run_job_task:
-                job_id: ${resources.jobs.lakefed_ingest.id}
+                job_id: ${resources.jobs.lakefed_ingest_copy.id}
+                job_parameters:
+                  task_id: "{{input.id}}"
+        - task_key: get_copy_partitioned_tasks
+          depends_on:
+            - task_key: foreach_copy_task
+          sql_task:
+            parameters:
+              load_partitioned: "true"
+            file:
+              path: ../src/lakefed_ingest/get_task_ids.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+        - task_key: foreach_copy_partitioned_task
+          depends_on:
+            - task_key: get_copy_partitioned_tasks
+          for_each_task:
+            inputs: "{{tasks.get_copy_partitioned_tasks.output.rows}}"
+            task:
+              task_key: run_copy_partitioned_job
+              run_job_task:
+                job_id: ${resources.jobs.lakefed_ingest_copy_partitioned.id}
                 job_parameters:
                   task_id: "{{input.id}}"
       tags:
@@ -32,4 +55,4 @@ resources:
         - name: ctrl_table
           default: control
         - name: task_collection
-          default: adventureworks
+          default: tpcds

@@ -1,0 +1,85 @@
+resources:
+  jobs:
+    lakefed_ingest_copy_partitioned:
+      name: "lakefed_ingest_copy_partitioned"
+      description: "Performs a partitioned copy using parameters returned from get_task"
+      tasks:
+        - task_key: get_task
+          description: "Returns parameters for the task_id provided as a job parameter"
+          sql_task:
+            file:
+              path: ../src/lakefed_ingest/get_task.sql
+            warehouse_id: ${var.warehouse_id}
+        - task_key: create_sink_table
+          depends_on:
+            - task_key: get_task
+          notebook_task:
+            notebook_path: ../src/lakefed_ingest/create_sink_table.ipynb
+            base_parameters:
+              src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
+              src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
+              src_table: "{{tasks.get_task.output.first_row.src_table}}"
+              select_list: "{{tasks.get_task.output.first_row.select_list}}"
+              tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
+              tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
+              tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
+              sink_cluster_cols: "{{tasks.get_task.output.first_row.sink_cluster_cols}}"
+            source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+        - task_key: get_partitions
+          description: "Gets partitions Sets taskValues used by foreach_partition"
+          depends_on:
+            - task_key: create_sink_table
+          notebook_task:
+            notebook_path: ../src/lakefed_ingest/get_partitions.ipynb
+            base_parameters:
+              src_type: "{{tasks.get_task.output.first_row.src_type}}"
+              src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
+              src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
+              src_table: "{{tasks.get_task.output.first_row.src_table}}"
+              partition_col: "{{tasks.get_task.output.first_row.partition_col}}"
+              partition_size_mb: "{{tasks.get_task.output.first_row.partition_size_mb}}"
+              tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
+              tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
+              tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
+            source: WORKSPACE
+          existing_cluster_id: ${var.cluster_id}
+          libraries:
+            - whl: ../dist/*.whl
+        - task_key: foreach_partition
+          description: "Iterates id_list set in get_partitions task"
+          depends_on:
+            - task_key: get_partitions
+          for_each_task:
+            inputs: "{{tasks.get_partitions.values.id_list}}"
+            concurrency: ${var.concurrency}
+            task:
+              task_key: copy_data
+              description: "Copies data based on provided parameters"
+              notebook_task:
+                notebook_path: ../src/lakefed_ingest/copy_data_partitioned.ipynb
+                source: WORKSPACE
+                warehouse_id: ${var.warehouse_id}
+                base_parameters:
+                  src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
+                  src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
+                  src_table: "{{tasks.get_task.output.first_row.src_table}}"
+                  tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
+                  tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
+                  tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
+                  partition_id: "{{input}}"
+              max_retries: 2
+              min_retry_interval_millis: 0
+      tags:
+        workload: lakefed_ingest
+      queue:
+        enabled: false
+      parameters:
+        - name: task_id
+          default: "1"
+        - name: ctrl_catalog
+          default: "lakefed_ingest"
+        - name: ctrl_schema
+          default: "default"
+        - name: ctrl_table
+          default: "control"
