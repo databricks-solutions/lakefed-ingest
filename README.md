@@ -1,6 +1,9 @@
 # Lakehouse Federation Ingestion
 
-Provides a mechanism for ingesting large tables into Databricks via [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html). It works by dynamically generating N queries that each retrieve a range from the source table. The query ranges are contiguous and don't overlap. The queries are then executed N (Default is 16) at a time in a Databricks Job [foreach task](https://docs.databricks.com/en/jobs/for-each.html).
+Metadata-driven framework for ingesting data into Databricks using [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html). Supports the following ingestion patterns:
+- **Full**: ingests entire table
+- **Incremental**: ingests incrementally using watermarks
+- **Partitioned**: spreads ingestion across many small queries, run N at a time. Used for large tables. See diagram below.
 
 ![Lakehouse Federation ingest diagram](assets/lakefed_ingest_diagram.png "Lakehouse Federation ingest diagram")
 
@@ -11,65 +14,128 @@ The following sources are currently supported:
 - Redshift
 - Synapse
 
-## Deploy Project as a Databricks Asset Bundle (DAB)
+## Prerequisites
 
-1. Install the Databricks CLI from https://docs.databricks.com/dev-tools/cli/databricks-cli.html
+### 1. Setup Lakehouse Federation
+Follow the [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html) instructions to create a connection and foreign catalog
 
-2. Authenticate to your Databricks workspace, if you have not done so already:
-    ```
-    $ databricks configure
-    ```
+### 2. Install the Databricks CLI
+Install the Databricks CLI from https://docs.databricks.com/dev-tools/cli/install.html
 
-3. To deploy a development copy of this project, type:
-    ```
-    $ databricks bundle deploy --target dev
-    ```
-    (Note that "dev" is the default target, so the `--target` parameter
-    is optional here.)
+### 3. Authenticate to your Databricks workspace
+Choose one of the following authentication methods:
 
-    This deploys everything that's defined for this project.
-    For example, the default template would deploy a job called
-    `[dev yourname] lakefed_ingest_job` to your workspace.
-    You can find that job by opening your workpace and clicking on **Workflows**.
+#### Option A: Personal Access Token (PAT)
 
-4. Similarly, to deploy a production copy, type:
+1. **Generate Personal Access Token:**
+   - Log into your Databricks workspace
+   - Click on your username in the top-right corner
+   - Select **User Settings** → **Developer** → **Access tokens**
+   - Click **Generate new token**
+   - Give it a name (e.g., "Local Development") and set expiration
+   - Copy the generated token
+
+2. **Configure CLI with PAT:**
+   ```bash
+   databricks configure --token --profile DEFAULT
    ```
-   $ databricks bundle deploy --target prod
-   ```
+   
+   You'll be prompted for:
+   - **Databricks Host**: `https://your-workspace.cloud.databricks.com`
+   - **Token**: Paste your generated token
 
-   Note that the default job from the template has a schedule that runs every day
-   (defined in resources/lakefed_ingest_job.yml). The schedule
-   is paused when deploying in development mode (see
-   https://docs.databricks.com/dev-tools/bundles/deployment-modes.html).
+    This will update DEFAULT profile in `~/.databrickscfg` 
 
-5. To run a job or pipeline, use the "run" command:
-   ```
-   $ databricks bundle run
-   ```
+#### Option B: OAuth Authentication
 
-6. Optionally, install developer tools such as the Databricks extension for Visual Studio Code from
-   https://docs.databricks.com/dev-tools/vscode-ext.html. Or read the "getting started" documentation for
-   **Databricks Connect** for instructions on running the included Python code from a different IDE.
+Configure OAuth:
 
-7. For documentation on the Databricks asset bundles format used
-   for this project, and for CI/CD configuration, see
-   https://docs.databricks.com/dev-tools/bundles/index.html.
+```bash
+databricks auth login --host https://your-workspace.cloud.databricks.com --profile PROD
+```
+
+This will:
+- Open your browser for authentication
+- Create a profile in `~/.databrickscfg`
+- Store OAuth credentials securely
+
+#### Verify Configuration
+
+Check your configuration:
+
+```bash
+# List all profiles
+cat ~/.databrickscfg
+```
+
+Your `~/.databrickscfg` should look like:
+
+```ini
+[DEFAULT]
+host = https://your-workspace.cloud.databricks.com
+token = dapi123abc...
+
+[DEV]
+host = https://dev-workspace.cloud.databricks.com
+token = dapi456def...
+
+[PROD]
+host = https://prod-workspace.cloud.databricks.com
+token = databricks-cli
+```
+
+### 4. Set up Python Virtual Environment
+Create and activate a [Python virtual environment](https://realpython.com/python-virtual-environments-a-primer/) to manage dependencies:
+
+```bash
+# Create virtual environment on macOS/Linux
+# See link above for Windows documentation
+$ python3 -m venv .venv
+
+# Activate virtual environment
+$ source .venv/bin/activate
+
+# Install required Python packages
+$ pip install -r requirements-dev.txt
+```
+
+### 5. Configure databricks.yml Variables
+Update the variables in `databricks.yml` to match your environment.
+
+- **workspace.host**: Your Databricks workspace URL
+- **cluster_id**: ID of your cluster for production deployment. For development, the bundle will lookup the ID based on the specified name (Eg, Shared Cluster).
+- **warehouse_id**: ID of your SQL warehouse for production deployment. For development, the bundle will lookup the ID based on the specified name (Eg, Shared Serverless).
+- **concurrency**: Concurrency of for each tasks. Can be overridden during deployment.
+
+Example configuration for dev target:
+```yaml
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://your-workspace.cloud.databricks.com
+    variables:
+      cluster_id: your_cluster_id
+      warehouse_id: your_warehouse_id
+      concurrency: 16
+```
 
 ## Getting Started
 
-**Setup Lakehouse Federation**  
-Follow the [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html) instructions to create a connection and foreign catalog.
-
-**Add Metadata to Control Table Table**  
+### 1. Add Metadata to Control Table
 The solution is driven by metadata stored in a control table. In this table you can specific sources and sinks, loading behavior (Full, incremental, partitioned), etc.
 1. Create the control table using the [_create_control_table](notebooks/_create_control_table.ipynb) notebook.
 2. Merge metadata into the control table. See the [load_metadata_tpcds](notebooks/load_metadata_tpcds.ipynb) notebook for an example.
 
-**Oracle Configuration**  
+### 2. Configure Sources
+Some sources require additional configuration in order to retrieve table sizes for partitioned ingestion:
+
+**Oracle**  
 Ingesting from Oracle requires permission to read the sys.dba_segments table. This is to obtain the source table size.
 
-**PostgreSQL Configuration**  
-The number of queries used for ingestion is determined in part by the size of the source table. Since Lakehouse Federation doesn't currently support PostgreSQL object size functions (E.g., pg_table_size), you need to create a view in the source database or use JDBC pushdown. **Creating a view in the source database is recommended.**
+**PostgreSQL**  
+The number of queries used for ingestion is determined in part by the size of the source table. Since Lakehouse Federation doesn't currently support PostgreSQL object size functions (E.g., pg_table_size), you need to create a view in the source database or use JDBC pushdown. **Creating a view in the source database is strongly recommended.**
 
 1. Database view - create a view in the source database using the statement below. Leave the `jdbc_config_file` job parameter blank, and the view will be queried using Lakehouse Federation.
 
@@ -86,33 +152,69 @@ where table_schema not in ('pg_catalog', 'information_schema')
 and table_type = 'BASE TABLE';
 ```
 
-2. JDBC pushdown - create a config file like [config/postgresql_jdbc.json](config/postgresql_jdbc.json). Use the path to the file as the value for the `jdbc_config_file` job parameter. [Secrets](https://learn.microsoft.com/en-us/azure/databricks/security/secrets/) must be used for JDBC credentials. See [notebooks/manage_secrets.ipynb](notebooks/manage_secrets.ipynb) for reference.
+2. JDBC pushdown - create a config file like [config/postgresql_jdbc.json](config/postgresql_jdbc.json). Use the path to the file as the value for the `jdbc_config_file` job parameter. [Secrets](https://docs.databricks.com/aws/en/security/secrets/) must be used for JDBC credentials. See [notebooks/manage_secrets.ipynb](notebooks/manage_secrets.ipynb) for reference.
 
-**Ingest Data**
-1. Run the lakefed_ingest_controller job and specify the desired task_collection.
-2. The lakefed_ingest_controller job will return ids belonging to the task_collection, and run the lakefed_ingest job for each one.
-3. The lakefed_ingest job will create the target table and perform a full or incremental load. If a full load is set to partitioned, it will run the lakefed_ingest_partitioned job.
+### 3. Run Controller Job
+1. Run the lakefed_ingest_controller job, providing the desired task_collection as a parameter.
+2. The lakefed_ingest_controller job will run all non-partitioned tasks, followed by all partitioned tasks. Non-partitioned tasks run concurrently, and partitioned tasks run sequentially. This is because partitioned tasks will spawn concurrent queries, and we want to maintain a consistent level of concurrency at the controller job (And source system) scope.
 
-## Recommendations
+### Recommendations
 - Use a partition column with a relatively even distribution. If the partition column is also used in an index, that is even better.
-- Number of cores in the Databricks job should match or exceed the concurrency of the foreach task.
+- Use a small all-purpose cluster if you have partitioned ingestion tasks. This cluster is used only for configuring partitions (Not heavy data processing), and we don't want to wait for a job cluster to spin up for each partitioned ingestion task.
 
-## Limitations
+### Limitations
 - Does not handle skew. The solution works best when the partition column has an even distribution.
 - Does not provide atomicity. Individual queries are not executed as a single transaction. One could fail while the rest succeed, or the source table could be altered before all ingestion queries are completed.
 
+## Deployment
+
+### Deploy to Development Environment
+```bash
+$ databricks bundle deploy --target dev --profile DEFAULT
+```
+Note: Since "dev" is specified as the default target in databricks.yml, you can omit the `--target dev` parameter. Similarly, `--profile DEFAULT` can be omitted if you only have one profile configured for your workspace.
+
+This deploys everything that's defined for this project, including:
+- Three jobs prefixed with `lakefed_ingest_`
+- main.py module for the partitioned ingest job
+- All associated resources
+
+You can find the deployed job by opening your workspace and clicking on **Workflows**.
+
+### Deploy to Production Environment
+```bash
+$ databricks bundle deploy --target prod --profile PROD
+```
+
+### Run a Job
+```bash
+$ databricks bundle run --target prod --profile PROD
+```
+
+## Development Tools
+
+For enhanced development experience, consider installing:
+- Databricks extension for Visual Studio Code: https://docs.databricks.com/dev-tools/vscode-ext.html
+
+## Documentation
+
+For comprehensive documentation on:
+- **Databricks Asset Bundles**: https://docs.databricks.com/dev-tools/bundles/index.html
+- **CI/CD configuration**: https://docs.databricks.com/dev-tools/bundles/index.html
+
+## Project Structure
+
+- `src/`: Source files including notebooks, SQL files, and Python modules
+- `resources/`: Bundle resource definitions (Jobs)
+- `databricks.yml`: Main bundle configuration file
+- `notebooks/`: Notebooks showing how to load metadata and work with Databricks Secrets
+
 ## Contributing
 
-**Create and Activate Virtual Environment**
-```
-$ python3 -m venv ./.venv
-```
+### 1. Create and Activate Virtual Environment
+Follow the instructions above in the "Set up Python Virtual Environment" section.
 
-```
-$ source .venv/bin/activate
-```
-
-**Run Unit Tests**
+### 2. Run Unit Tests
 
 Databricks Connect is required to run some of the unit tests. 
 
@@ -134,7 +236,7 @@ ERROR tests/main_test.py - Exception: Cluster id or serverless are required but 
 Add the cluster_id to your .databrickscfg file
 ```
 [DEFAULT]
-host       = https://adb-XXXXXXXXXXXXXXX.XX.azuredatabricks.net/
+host = https://your-workspace.cloud.databricks.com
 cluster_id = XXXX-XXXXXX-XXXXXXXX
 auth_type  = databricks-cli
 ```

@@ -25,18 +25,14 @@ wheel
 ## to install the package system-wide. Or uncomment the line below to install a
 ## version of db-connect that corresponds to the Databricks Runtime version used
 ## for this project.
-databricks-connect>=15.4,<15.5
-
-## Downgrade numpy due to issue below
-## AttributeError: `np.NaN` was removed in the NumPy 2.0 release. Use `np.nan` instead.
-numpy<2.0
+databricks-connect>=16.4,<16.5
 
 ## jsonschema used to validate json. Used locally for unit tests
 ## Included in DBR so doesn't need to be installed separately
 jsonschema==4.23.0
 
 ## Databricks SDK. Used for managing secrets in notebooks/manage_secrets.ipynb
-databricks-sdk==0.34.0
+databricks-sdk==0.60.0
 
 ## Databricks Labs data generator
 dbldatagen==0.4.0.post1
