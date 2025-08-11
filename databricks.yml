@@ -2,6 +2,7 @@
 # See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
 bundle:
   name: lakefed_ingest
+  uuid: 988e06fe-e6fb-4a5f-9c09-47ebf5ea2636
 
 include:
   - resources/*.yml
