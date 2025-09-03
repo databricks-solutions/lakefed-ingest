@@ -46,7 +46,6 @@ resources:
               src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
               src_table: "{{tasks.get_task.output.first_row.src_table}}"
               select_list: "{{tasks.get_task.output.first_row.select_list}}"
-              load_type: "{{tasks.get_task.output.first_row.load_type}}"
             source: WORKSPACE
             warehouse_id: ${var.warehouse_id}
         - task_key: get_new_watermark
@@ -67,7 +66,7 @@ resources:
           depends_on:
             - task_key: get_new_watermark
           notebook_task:
-            notebook_path: ../src/lakefed_ingest/copy_data.ipynb
+            notebook_path: ../src/lakefed_ingest/copy_data_incremental.ipynb
             base_parameters:
               sink_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
               sink_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
@@ -75,8 +74,8 @@ resources:
               src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
               src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
               src_table: "{{tasks.get_task.output.first_row.src_table}}"
+              primary_key: "{{tasks.get_task.output.first_row.primary_key}}"
               select_list: "{{tasks.get_task.output.first_row.select_list}}"
-              load_type: "{{tasks.get_task.output.first_row.load_type}}"
               watermark_col_type: "{{tasks.get_task.output.first_row.watermark_col_type}}"
               watermark_col_name: "{{tasks.get_task.output.first_row.watermark_col_name}}"
               watermark_col_start_value: "{{tasks.get_task.output.first_row.watermark_col_start_value}}"
