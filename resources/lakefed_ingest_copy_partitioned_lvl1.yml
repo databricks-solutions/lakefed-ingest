@@ -1,7 +1,7 @@
 resources:
   jobs:
-    lakefed_ingest_copy_partitioned:
-      name: "lakefed_ingest_copy_partitioned"
+    lakefed_ingest_copy_partitioned_lvl1:
+      name: "lakefed_ingest_copy_partitioned_lvl1"
       description: "Performs a partitioned copy using parameters returned from get_task"
       tasks:
         - task_key: get_task
@@ -26,19 +26,18 @@ resources:
               sink_cluster_cols: "{{tasks.get_task.output.first_row.sink_cluster_cols}}"
             source: WORKSPACE
             warehouse_id: ${var.warehouse_id}
-        - task_key: get_partitions
-          description: "Gets partitions Sets taskValues used by foreach_partition"
+        - task_key: generate_partitions
           depends_on:
             - task_key: create_sink_table
           notebook_task:
-            notebook_path: ../src/lakefed_ingest/get_partitions.ipynb
+            notebook_path: ../src/lakefed_ingest/generate_partitions.ipynb
             base_parameters:
-              src_type: "{{tasks.get_task.output.first_row.src_type}}"
+              partition_col: "{{tasks.get_task.output.first_row.partition_col}}"
+              partition_size_mb: "{{tasks.get_task.output.first_row.partition_size_mb}}"
               src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
               src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
               src_table: "{{tasks.get_task.output.first_row.src_table}}"
-              partition_col: "{{tasks.get_task.output.first_row.partition_col}}"
-              partition_size_mb: "{{tasks.get_task.output.first_row.partition_size_mb}}"
+              src_type: "{{tasks.get_task.output.first_row.src_type}}"
               tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
               tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
               tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
@@ -46,32 +45,30 @@ resources:
           existing_cluster_id: ${var.cluster_id}
           libraries:
             - whl: ../dist/*.whl
-        - task_key: foreach_partition
-          description: "Iterates id_list set in get_partitions task"
+          description: Gets partitions Sets taskValues used by foreach_partition
+        - task_key: foreach_batch
           depends_on:
-            - task_key: get_partitions
+            - task_key: generate_partitions
           for_each_task:
-            inputs: "{{tasks.get_partitions.values.id_list}}"
-            concurrency: ${var.concurrency}
+            inputs: "{{tasks.generate_partitions.values.batch_id_list}}"
+            concurrency: 1
             task:
-              task_key: copy_data
-              description: "Copies data based on provided parameters"
-              notebook_task:
-                notebook_path: ../src/lakefed_ingest/copy_data_partitioned.ipynb
-                source: WORKSPACE
-                warehouse_id: ${var.warehouse_id}
-                base_parameters:
-                  src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
+              task_key: copy_batch
+              run_job_task:
+                job_id: ${resources.jobs.lakefed_ingest_copy_partitioned_lvl2.id}
+                job_parameters:
                   src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
+                  src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
                   src_table: "{{tasks.get_task.output.first_row.src_table}}"
                   tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
                   tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
                   tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
-                  partition_id: "{{input}}"
-              max_retries: 2
-              min_retry_interval_millis: 0
+                  batch_id: "{{input}}"
+              description: Copies data based on provided parameters
+          description: Iterates id_list set in get_partitions task
       tags:
-        workload: lakefed_ingest
+        business_unit: ""
+        project: lakefed_ingest
       queue:
         enabled: false
       parameters:

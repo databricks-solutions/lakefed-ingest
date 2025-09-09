@@ -40,11 +40,12 @@ resources:
             task:
               task_key: run_copy_partitioned_job
               run_job_task:
-                job_id: ${resources.jobs.lakefed_ingest_copy_partitioned.id}
+                job_id: ${resources.jobs.lakefed_ingest_copy_partitioned_lvl1.id}
                 job_parameters:
                   task_id: "{{input.id}}"
       tags:
-        workload: lakefed_ingest
+        business_unit: ""
+        project: lakefed_ingest
       queue:
         enabled: false
       parameters:

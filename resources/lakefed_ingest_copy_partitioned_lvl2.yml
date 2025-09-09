@@ -1,0 +1,51 @@
+resources:
+  jobs:
+    lakefed_ingest_copy_partitioned_lvl2:
+      name: lakefed_ingest_copy_partitioned_lvl2
+      description: Copies a batch of partitioned copy tasks. This job is called from lakefed_ingest_copy_partitioned_lvl1 and not meant to be run directly.
+      tasks:
+        - task_key: get_partitions
+          sql_task:
+            file:
+              path: ../src/lakefed_ingest/get_partition_ids.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+          description: Gets partitions Sets taskValues used by foreach_partition
+        - task_key: foreach_partition
+          depends_on:
+            - task_key: get_partitions
+          for_each_task:
+            inputs: "{{tasks.get_partitions.output.rows}}"
+            concurrency: 32
+            task:
+              task_key: copy_data
+              notebook_task:
+                notebook_path: ../src/lakefed_ingest/copy_data_partitioned.ipynb
+                base_parameters:
+                  partition_id: "{{input.id}}"
+                source: WORKSPACE
+                warehouse_id: ${var.warehouse_id}
+              max_retries: 2
+              min_retry_interval_millis: 0
+              description: Copies data based on provided parameters
+          description: Iterates id_list set in get_partitions task
+      tags:
+        business_unit: ""
+        project: lakefed_ingest
+      queue:
+        enabled: false
+      parameters:
+        - name: batch_id
+          default: ""
+        - name: tgt_catalog
+          default: ""
+        - name: tgt_schema
+          default: ""
+        - name: tgt_table
+          default: ""
+        - name: src_catalog
+          default: ""
+        - name: src_schema
+          default: ""
+        - name: src_table
+          default: ""

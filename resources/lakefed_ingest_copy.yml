@@ -92,7 +92,8 @@ resources:
             parameters:
               watermark_col_end_value: "{{tasks.get_new_watermark.output.first_row.watermark}}"   
       tags:
-        workload: lakefed_ingest
+        business_unit: ""
+        project: lakefed_ingest
       queue:
         enabled: false
       parameters:

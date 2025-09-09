@@ -505,20 +505,19 @@ def get_partition_list(partition_col:str, lower_bound, upper_bound, num_partitio
         
     return partition_list
 
-def get_partition_df(partition_list:list[dict], num_partitions:int, batch_size:int = 500) -> DataFrame:
+def get_partition_df(partition_list:list[dict], num_partitions:int, batch_size:int = 1000) -> DataFrame:
     """Create dataframe from list of partitions
 
     Partitions are defined by a where clause that selects a range of data.
     A batch_id is assigned to each partition. This provides a way of
     dividing the full partition table into N size batches.
     
-    Batching is used to avoid exceeding the 48 KiB limit of taskValues.
-    https://docs.databricks.com/en/jobs/share-task-context.html
+    Batching is used to avoid exceeding the 1000 item limit of the for each task.
     
     Args:
         partition_list (list[dict]): List of dictionaries containing partition ranges
         num_partitions (int): Number of partitions is used to determing the number of batches
-        batch_size (int): Batch size. Defaults to 500.
+        batch_size (int): Batch size. Defaults to 1000.
     """
     
     # Calculate number of batches and round up
