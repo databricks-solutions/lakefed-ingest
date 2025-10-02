@@ -204,10 +204,12 @@ For comprehensive documentation on:
 
 ## Project Structure
 
-- `src/`: Source files including notebooks, SQL files, and Python modules
-- `resources/`: Bundle resource definitions (Jobs)
-- `databricks.yml`: Main bundle configuration file
+- `assets/`: Images for README
+- `config/`: Config for PostgreSQL JDBC pushdown
 - `notebooks/`: Notebooks showing how to load metadata and work with Databricks Secrets
+- `resources/`: Databricks Asset Bundle resource definitions
+- `src/`: Source files including notebooks, SQL files, and Python modules
+- `databricks.yml`: Main bundle configuration file
 
 ## Contributing
 
