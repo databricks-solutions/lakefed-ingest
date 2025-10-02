@@ -1,4 +1,4 @@
-# Lakehouse Federation Ingestion
+# Lakehouse Federation Ingestion Framework
 
 Metadata-driven framework for ingesting data into Databricks using [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html). Supports the following ingestion patterns:
 - **Full**: ingests entire table
@@ -240,3 +240,16 @@ host = https://your-workspace.cloud.databricks.com
 cluster_id = XXXX-XXXXXX-XXXXXXXX
 auth_type  = databricks-cli
 ```
+
+## How to get help
+Databricks support doesn't cover this content. For questions or bugs, please open a GitHub issue and the team will help on a best effort basis.
+
+## License
+&copy; 2025 Databricks, Inc. All rights reserved. The source in this notebook is provided subject to the [Databricks License](https://databricks.com/db-license-source). All included or referenced third party libraries are subject to the licenses set forth below.
+
+| library | description | license | source |
+|---------|-----------|-----------|------|
+| pytest | Testing framework | MIT | [GitHub](https://github.com/pytest-dev/pytest) |
+| setuptools | Build system | MIT | [GitHub](https://github.com/pypa/setuptools) |
+| wheel | CLI for manipulating wheel files | MIT | [GitHub](https://github.com/pypa/wheel) |
+| jsonschema | JSON schema validation | MIT | [GitHub](https://github.com/python-jsonschema/jsonschema) |
