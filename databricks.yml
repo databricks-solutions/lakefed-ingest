@@ -25,28 +25,24 @@ targets:
     mode: development
     default: true
     workspace:
-      host: https://e2-demo-field-eng.cloud.databricks.com
+      host: https://company-dev.cloud.databricks.com/
     variables:
       cluster_id:
         lookup:
           cluster: "Field Eng Shared UC LTS Cluster"
       warehouse_id:
         lookup:
-          warehouse: "Shared Unity Catalog Serverless"
+          warehouse: "Shared Endpoint"
       concurrency: 16
 
   prod:
     mode: production
     workspace:
-      host: https://e2-demo-field-eng.cloud.databricks.com
+      host: https://company-prd.cloud.databricks.com/
       # Use fixed location to make sure we only have a single copy.
       # If this path results in an error, please make sure you have a recent version of the CLI installed.
       root_path: /Workspace/${bundle.name}
-    run_as:
-      # Using a service principal is recommended
-      # See https://docs.databricks.com/dev-tools/bundles/permissions.html
-      user_name: chris.koester@databricks.com
     variables:
       cluster_id: 0709-132523-cnhxf2p6
       warehouse_id: 4b9b953939869799
-      concurrency: 32
+      concurrency: 16
