@@ -16,7 +16,7 @@ resources:
             - task_key: get_partitions
           for_each_task:
             inputs: "{{tasks.get_partitions.output.rows}}"
-            concurrency: 32
+            concurrency: ${var.concurrency}
             task:
               task_key: copy_data
               notebook_task:
