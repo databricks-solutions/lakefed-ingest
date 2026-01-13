@@ -49,3 +49,5 @@ resources:
           default: ""
         - name: src_table
           default: ""
+        - name: select_list
+          default: "*"

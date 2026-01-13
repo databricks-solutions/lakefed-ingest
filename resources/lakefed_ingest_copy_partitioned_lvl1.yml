@@ -74,6 +74,7 @@ resources:
                   src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
                   src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
                   src_table: "{{tasks.get_task.output.first_row.src_table}}"
+                  select_list: "{{tasks.get_task.output.first_row.select_list}}"
                   tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
                   tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
                   tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"

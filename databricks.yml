@@ -25,14 +25,14 @@ targets:
     mode: development
     default: true
     workspace:
-      host: https://company-dev.cloud.databricks.com/
+      host: https://e2-demo-field-eng.cloud.databricks.com/
     variables:
       cluster_id:
         lookup:
           cluster: "Field Eng Shared UC LTS Cluster"
       warehouse_id:
         lookup:
-          warehouse: "Shared Endpoint"
+          warehouse: "Shared Unity Catalog Serverless"
       concurrency: 16
 
   prod:
