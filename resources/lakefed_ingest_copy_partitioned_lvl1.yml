@@ -35,6 +35,7 @@ resources:
               tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
               tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
               tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
+              load_partitioned: "{{tasks.get_task.output.first_row.load_partitioned}}"
               enable_iceberg_reads: "{{tasks.get_task.output.first_row.enable_iceberg_reads}}"
               sink_cluster_cols: "{{tasks.get_task.output.first_row.sink_cluster_cols}}"
               src_tbl_metadata: "{{tasks.get_src_tbl_metadata.output.first_row.json_metadata}}"
