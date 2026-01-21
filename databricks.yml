@@ -32,7 +32,7 @@ targets:
           cluster: "Field Eng Shared UC LTS Cluster"
       warehouse_id:
         lookup:
-          warehouse: "Shared Endpoint"
+          warehouse: "Serverless Warehouse"
       concurrency: 16
 
   prod:

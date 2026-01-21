@@ -9,9 +9,21 @@ resources:
             file:
               path: ../src/lakefed_ingest/get_task.sql
             warehouse_id: ${var.warehouse_id}
-        - task_key: create_sink_table
+        - task_key: get_src_tbl_metadata
           depends_on:
             - task_key: get_task
+          sql_task:
+            file:
+              path: ../src/lakefed_ingest/get_src_tbl_metadata.sql
+            parameters:
+              src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
+              src_schema: "{{tasks.get_task.output.first_row.src_schema}}"
+              src_table: "{{tasks.get_task.output.first_row.src_table}}"
+              select_list: "{{tasks.get_task.output.first_row.select_list}}"
+            warehouse_id: ${var.warehouse_id}
+        - task_key: create_sink_table
+          depends_on:
+            - task_key: get_src_tbl_metadata
           notebook_task:
             notebook_path: ../src/lakefed_ingest/create_sink_table.ipynb
             base_parameters:
@@ -22,8 +34,10 @@ resources:
               tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
               tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
               tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
+              load_partitioned: "{{tasks.get_task.output.first_row.load_partitioned}}"
               enable_iceberg_reads: "{{tasks.get_task.output.first_row.enable_iceberg_reads}}"
               sink_cluster_cols: "{{tasks.get_task.output.first_row.sink_cluster_cols}}"
+              src_tbl_metadata: "{{tasks.get_src_tbl_metadata.output.first_row.json_metadata}}"
             source: WORKSPACE
             warehouse_id: ${var.warehouse_id}
         - task_key: if_incremental
