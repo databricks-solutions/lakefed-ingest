@@ -1,8 +1,0 @@
-{
-    "host": "badschema.postgres.database.azure.com",
-    "port": 5432,
-    "database": "postgres",
-    "secret_scope": "scope_name",
-    "secret_key_user": "jdbc_user",
-    "secret_key_pwd": "jdbc_pwd"
-}

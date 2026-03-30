@@ -42,23 +42,6 @@ resource "databricks_connection" "postgresql" {
   }
 }
 
-resource "databricks_volume" "this" {
-  name         = "init_scripts"
-  catalog_name = databricks_catalog.lakefed_ingest.name
-  schema_name  = databricks_schema.lakefed_ingest_default.name
-  volume_type  = "MANAGED"
-  comment      = "Transient volume for used for Lakehouse Federation Bulk Ingest integration tests"
-}
-
-resource "databricks_file" "init_script" {
-  content_base64 = base64encode(<<-EOT
-    #!/bin/bash
-    sudo apt-get update && apt-get install -y postgresql-client
-    EOT
-  )
-  path = "${databricks_volume.this.volume_path}/init_script.sh"
-}
-
 resource "databricks_secret_scope" "this" {
   name = "${random_pet.name_prefix.id}-scope"
 }

@@ -41,12 +41,24 @@ resources:
               src_tbl_metadata: "{{tasks.get_src_tbl_metadata.output.first_row.json_metadata}}"
             source: WORKSPACE
             warehouse_id: ${var.warehouse_id}
-        - task_key: generate_partitions
+        - task_key: create_partition_udtf
           depends_on:
             - task_key: create_sink_table
-          notebook_task:
-            notebook_path: ../src/lakefed_ingest/generate_partitions.ipynb
-            base_parameters:
+          sql_task:
+            file:
+              path: ../src/lakefed_ingest/create_partition_udtf.sql
+            parameters:
+              ctrl_catalog: "{{job.parameters.ctrl_catalog}}"
+              ctrl_schema: "{{job.parameters.ctrl_schema}}"
+            warehouse_id: ${var.warehouse_id}
+          description: Creates generate_partition_list UDTF in ctrl catalog/schema
+        - task_key: generate_partitions
+          depends_on:
+            - task_key: create_partition_udtf
+          sql_task:
+            file:
+              path: ../src/lakefed_ingest/generate_partitions.sql
+            parameters:
               partition_col: "{{tasks.get_task.output.first_row.partition_col}}"
               partition_size_mb: "{{tasks.get_task.output.first_row.partition_size_mb}}"
               src_catalog: "{{tasks.get_task.output.first_row.src_catalog}}"
@@ -56,16 +68,17 @@ resources:
               tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
               tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
               tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
-            source: WORKSPACE
-          existing_cluster_id: ${var.cluster_id}
-          libraries:
-            - whl: ../dist/*.whl
-          description: Gets partitions Sets taskValues used by foreach_partition
+              src_connection: "{{tasks.get_task.output.first_row.src_connection}}"
+              src_database: "{{tasks.get_task.output.first_row.src_database}}"
+              ctrl_catalog: "{{job.parameters.ctrl_catalog}}"
+              ctrl_schema: "{{job.parameters.ctrl_schema}}"
+            warehouse_id: ${var.warehouse_id}
+          description: Generates partition WHERE clauses and writes _partitions table
         - task_key: foreach_batch
           depends_on:
             - task_key: generate_partitions
           for_each_task:
-            inputs: "{{tasks.generate_partitions.values.batch_id_list}}"
+            inputs: "{{tasks.generate_partitions.output.first_row.batch_id_list}}"
             concurrency: 1
             task:
               task_key: copy_batch
