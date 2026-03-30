@@ -16,8 +16,13 @@ def _load_udtf_class():
     sql = sql_path.read_text()
     # re.DOTALL makes . match newlines so the pattern spans the entire class body
     match = re.search(r'\$\$(.*?)\$\$', sql, re.DOTALL)
+    if match is None:
+        raise ValueError(f"No python code block found in {sql_path}")
+    code = match.group(1).strip()
+    if not code:
+        raise ValueError(f"Empty python code block in {sql_path}")
     ns = {}
-    exec(match.group(1).strip(), ns)
+    exec(code, ns)
     return ns['GeneratePartitionList']
 
 
