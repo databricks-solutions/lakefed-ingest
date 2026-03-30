@@ -1,10 +1,6 @@
 -- Generate partition WHERE clauses for partitioned table ingestion.
 --
--- Replaces generate_partitions.ipynb (Python/PySpark) with pure SQL, eliminating
--- the cluster dependency. Requires the generate_partition_list UDTF to be registered
--- in the control catalog/schema first (see create_partition_udtf.sql).
---
--- Logic (mirrors Python notebook):
+-- Logic:
 --   1. Get partition column data type from information_schema
 --   2. Get MIN/MAX bounds from the source table via remote_query
 --   3. Get source table size via remote_query (source-type specific)
@@ -12,22 +8,13 @@
 --   5. Call generate_partition_list UDTF and write results to _partitions table
 --   6. Return batch_id_list for the downstream for_each_task
 --
--- Parameters:
---   src_connection  Unity Catalog connection name (e.g. 'my_sqlserver_conn')
---   src_database    Database name in the remote system (service name for Oracle)
---
--- remote_query is used for all source-type queries (sqlserver, oracle, postgresql,
--- redshift) to enable native SQL dialect passthrough and better performance.
+-- remote_query is used for all source-type queries (sqlserver, oracle, postgresql, redshift)
+-- to enable native SQL dialect passthrough and better performance.
 -- Synapse uses Lakehouse Federation (remote_query not supported).
--- Delta uses DESCRIBE DETAIL (no remote connection).
 --
 -- Output (task output first_row):
 --   batch_id_list  ARRAY<INT>  - Sorted distinct batch IDs for for_each_task
 --   cnt_partitions BIGINT      - Total number of partitions generated
---
--- Implementation note: all variables are session-scoped (DECLARE OR REPLACE outside
--- BEGIN...END) and assigned with SET VAR, matching the pattern in create_partition_udtf.sql.
--- IF/ELSEIF blocks are replaced with CASE expressions to avoid compound statement scope.
 
 DECLARE OR REPLACE partitions_tbl  STRING;
 DECLARE OR REPLACE conn_opts       STRING;
