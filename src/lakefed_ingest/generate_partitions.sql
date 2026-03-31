@@ -1,7 +1,7 @@
 -- Generate partition WHERE clauses for partitioned table ingestion.
 --
 -- Logic:
---   1. Get partition column data type from information_schema
+--   1. Get partition column data type from upstream src_tbl_metadata
 --   2. Get MIN/MAX bounds from the source table via remote_query
 --   3. Get source table size via remote_query (source-type specific)
 --   4. Calculate num_partitions = max(table_size_mb / partition_size_mb, 2)
@@ -38,17 +38,19 @@ SET VAR conn_opts =
        ELSE               ', database => '     || chr(39) || :src_database || chr(39)
      END;
 
--- 1. Partition column data type (Unity Catalog information_schema — not a remote query)
---    Uses inline quoting (not ? parameters) because src_catalog is a Lakehouse Federation
---    foreign catalog for remote sources; ? substitution does not quote values properly
---    when the query is pushed to the remote database, causing errors like
---    "Invalid column name 'dbo'" in SQL Server.
-EXECUTE IMMEDIATE
-  'SELECT data_type FROM ' || :src_catalog || '.information_schema.columns'
-  || ' WHERE table_schema = ' || chr(39) || :src_schema    || chr(39)
-  || ' AND table_name = '     || chr(39) || :src_table     || chr(39)
-  || ' AND column_name = '    || chr(39) || :partition_col || chr(39)
-  INTO col_type;
+-- 1. Partition column data type from upstream src_tbl_metadata JSON
+SET VAR col_type = (
+  SELECT col.type.name
+  FROM (
+    SELECT explode(
+      from_json(
+        :src_tbl_metadata,
+        'struct<columns: array<struct<name: string, type: struct<length: bigint, name: string, precision: bigint, scale: bigint>>>>'
+      ).columns
+    ) AS col
+  )
+  WHERE col.name = :partition_col
+);
 
 -- 2. Partition boundaries via remote_query (native passthrough)
 --    MIN/MAX are standard SQL; CAST to STRING is applied in the outer Databricks layer.

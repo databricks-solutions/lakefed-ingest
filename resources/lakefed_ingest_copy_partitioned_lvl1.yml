@@ -72,6 +72,7 @@ resources:
               src_database: "{{tasks.get_task.output.first_row.src_database}}"
               ctrl_catalog: "{{job.parameters.ctrl_catalog}}"
               ctrl_schema: "{{job.parameters.ctrl_schema}}"
+              src_tbl_metadata: "{{tasks.get_src_tbl_metadata.output.first_row.json_metadata}}"
             warehouse_id: ${var.warehouse_id}
           description: Generates partition WHERE clauses and writes _partitions table
         - task_key: foreach_batch
