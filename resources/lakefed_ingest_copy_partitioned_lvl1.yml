@@ -93,6 +93,10 @@ resources:
                   tgt_catalog: "{{tasks.get_task.output.first_row.sink_catalog}}"
                   tgt_schema: "{{tasks.get_task.output.first_row.sink_schema}}"
                   tgt_table: "{{tasks.get_task.output.first_row.sink_table}}"
+                  use_remote_query: "{{tasks.get_task.output.first_row.use_remote_query}}"
+                  src_type: "{{tasks.get_task.output.first_row.src_type}}"
+                  src_connection: "{{tasks.get_task.output.first_row.src_connection}}"
+                  src_database: "{{tasks.get_task.output.first_row.src_database}}"
                   batch_id: "{{input}}"
               description: Copies data based on provided parameters
           description: Iterates id_list set in get_partitions task

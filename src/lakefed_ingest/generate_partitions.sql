@@ -114,7 +114,8 @@ SET VAR qry = CASE :src_type
     ||   ' AND "table" = '    || chr(92) || chr(39) || :src_table  || chr(92) || chr(39)
     || chr(39) || ')'
   WHEN 'synapse' THEN
-    -- remote_query does not support Synapse; use Lakehouse Federation; may be less performant
+    -- remote_query does not support Synapse; use Lakehouse Federation
+    -- if better performance is needed, move this query to a view in Synapse; then query the view
     'WITH base AS ('
     ||   'SELECT ((nps.in_row_data_page_count + nps.row_overflow_used_page_count + nps.lob_used_page_count) * 8.0) / 1000 AS mb'
     ||   ' FROM ' || :src_catalog || '.sys.schemas s'
@@ -128,7 +129,7 @@ SET VAR qry = CASE :src_type
     ||   ' JOIN ' || :src_catalog || '.sys.dm_pdw_nodes_db_partition_stats nps'
     ||     ' ON nt.object_id = nps.object_id AND nt.pdw_node_id = nps.pdw_node_id'
     ||     ' AND nt.distribution_id = nps.distribution_id AND i.index_id = nps.index_id'
-    ||   ' WHERE pn.type = ''COMPUTE'' AND s.name = ''' || :src_schema || ''' AND t.name = ''' || :src_table || ''''
+    ||   ' WHERE pn.type = ' || chr(39) || 'COMPUTE' || chr(39) || ' AND s.name = ' || chr(39) || :src_schema || chr(39) || ' AND t.name = ' || chr(39) || :src_table || chr(39)
     || ') SELECT SUM(mb) FROM base'
   ELSE
     'SELECT raise_error(' || chr(39) || 'Unsupported src_type: ' || :src_type || chr(39) || ')'
@@ -148,8 +149,15 @@ EXECUTE IMMEDIATE
   || ' FROM ' || :ctrl_catalog || '.' || :ctrl_schema || '.generate_partition_list(?, ?, ?, ?, ' || num_partitions || ')'
   USING :partition_col, lower_bound_str, upper_bound_str, col_type;
 
--- 6. Return task output — batch_id_list is consumed by the downstream for_each_task
+-- 6. Return task output — batch_id_list is consumed by the downstream for_each_task.
+--    Extra columns are diagnostic and visible in the job run UI without affecting downstream.
 EXECUTE IMMEDIATE
   'SELECT sort_array(array_agg(DISTINCT batch_id)) AS batch_id_list,'
-  || ' COUNT(*) AS cnt_partitions'
-  || ' FROM ' || partitions_tbl;
+  || ' COUNT(*) AS cnt_partitions,'
+  || ' ? AS lower_bound,'
+  || ' ? AS upper_bound,'
+  || ' ? AS table_size_mb,'
+  || ' ? AS num_partitions,'
+  || ' ? AS num_batches'
+  || ' FROM ' || partitions_tbl
+  USING lower_bound_str, upper_bound_str, table_size_mb, num_partitions, num_batches;
