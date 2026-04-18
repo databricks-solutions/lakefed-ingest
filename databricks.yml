@@ -23,11 +23,11 @@ targets:
     mode: development
     default: true
     workspace:
-      host: https://company-dev.cloud.databricks.com/
+      host: https://fevm-serverless-stable-dvmvgw.cloud.databricks.com/
     variables:
       warehouse_id:
         lookup:
-          warehouse: "Serverless Warehouse"
+          warehouse: "Serverless Starter Warehouse"
       concurrency: 16
 
   prod:

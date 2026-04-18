@@ -13,11 +13,14 @@ The following sources are currently supported:
 - PostgreSQL
 - Redshift
 - Synapse
+- IBM Db2 LUW
 
 ## Prerequisites
 
 ### 1. Setup Lakehouse Federation
-Follow the [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html) instructions to create a connection and foreign catalog
+Follow the [Lakehouse Federation](https://docs.databricks.com/en/query-federation/index.html) instructions to create a connection and foreign catalog.
+
+> **IBM Db2 exception:** Db2 uses `use_remote_query = true` and only requires a JDBC connection — no foreign catalog is needed. See [docs/source_ibm_db2.md](docs/source_ibm_db2.md).
 
 ### 2. Install the Databricks CLI
 Install the Databricks CLI from https://docs.databricks.com/dev-tools/cli/install.html
@@ -134,9 +137,21 @@ Some sources require additional configuration in order to retrieve table sizes f
 **Oracle**  
 Ingesting from Oracle requires permission to read the sys.dba_segments table. This is to obtain the source table size.
 
-### 3. Run Controller Job
-1. Run the lakefed_ingest_controller job, providing the desired task_collection as a parameter.
-2. The lakefed_ingest_controller job will run all non-partitioned tasks, followed by all partitioned tasks. Non-partitioned tasks run concurrently, and partitioned tasks run sequentially. This is because partitioned tasks will spawn concurrent queries, and we want to maintain a consistent level of concurrency at the controller job (And source system) scope.
+**IBM Db2**  
+Db2 requires additional setup including enabling Databricks preview features and configuring a JDBC connection. See [docs/source_ibm_db2.md](docs/source_ibm_db2.md) for the full setup guide.
+
+### 3. Run Jobs
+
+The framework deploys four jobs. Use the controller for normal production runs; trigger the others directly only for testing or re-running individual tasks.
+
+| Job | Purpose | When to trigger directly |
+|-----|---------|--------------------------|
+| `lakefed_ingest_controller` | Orchestrates all tasks in a `task_collection`. Runs non-partitioned tasks concurrently, then partitioned tasks sequentially (each spawning concurrent partition queries). | **Normal production use** |
+| `lakefed_ingest_copy` | Full or incremental copy for one non-partitioned task (`task_id`). | Testing a single table, or re-running a failed task |
+| `lakefed_ingest_copy_partitioned_lvl1` | Partitioned full copy for one task: computes partition bounds, writes the `_partitions` table, then calls lvl2 per batch. | Testing a single large/partitioned table |
+| `lakefed_ingest_copy_partitioned_lvl2` | Executes one batch of partitions concurrently. Called automatically by lvl1. | Restarting a failed batch mid-run |
+
+Run the controller by providing `task_collection` as a parameter. Non-partitioned tasks run concurrently; partitioned tasks run sequentially at the controller level because each spawns its own concurrent partition queries — this keeps concurrency predictable at the source.
 
 ### Recommendations
 - Use a partition column with a relatively even distribution. If the partition column is also used in an index, that is even better.
@@ -155,8 +170,7 @@ $ databricks bundle deploy --target dev --profile DEFAULT
 Note: Since "dev" is specified as the default target in databricks.yml, you can omit the `--target dev` parameter. Similarly, `--profile DEFAULT` can be omitted if you only have one profile configured for your workspace.
 
 This deploys everything that's defined for this project, including:
-- Three jobs prefixed with `lakefed_ingest_`
-- main.py module for the partitioned ingest job
+- Four jobs prefixed with `lakefed_ingest_`
 - All associated resources
 
 You can find the deployed job by opening your workspace and clicking on **Workflows**.
