@@ -9,8 +9,6 @@ include:
 
 # Variable declarations. These variables are assigned in the dev/prod targets below.
 variables:
-  cluster_id:
-    description: Lookup ID of an existing cluster
   warehouse_id:
     description: Lookup ID of an existing warehouse
   concurrency:
@@ -27,9 +25,6 @@ targets:
     workspace:
       host: https://company-dev.cloud.databricks.com/
     variables:
-      cluster_id:
-        lookup:
-          cluster: "Field Eng Shared UC LTS Cluster"
       warehouse_id:
         lookup:
           warehouse: "Serverless Warehouse"

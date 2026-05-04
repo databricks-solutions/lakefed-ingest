@@ -134,26 +134,6 @@ Some sources require additional configuration in order to retrieve table sizes f
 **Oracle**  
 Ingesting from Oracle requires permission to read the sys.dba_segments table. This is to obtain the source table size.
 
-**PostgreSQL**  
-The number of queries used for ingestion is determined in part by the size of the source table. Since Lakehouse Federation doesn't currently support PostgreSQL object size functions (E.g., pg_table_size), you need to create a view in the source database or use JDBC pushdown. **Creating a view in the source database is strongly recommended.**
-
-1. Database view - create a view in the source database using the statement below. Leave the `jdbc_config_file` job parameter blank, and the view will be queried using Lakehouse Federation.
-
-```sql
-create or replace view public.vw_pg_table_size
- as
- select
-  table_schema,
-  table_name,
-  pg_table_size(quote_ident(table_name)),
-  pg_size_pretty(pg_table_size(quote_ident(table_name))) as pg_table_size_pretty
-from information_schema.tables
-where table_schema not in ('pg_catalog', 'information_schema')
-and table_type = 'BASE TABLE';
-```
-
-2. JDBC pushdown - create a config file like [config/postgresql_jdbc.json](config/postgresql_jdbc.json). Use the path to the file as the value for the `jdbc_config_file` job parameter. [Secrets](https://docs.databricks.com/aws/en/security/secrets/) must be used for JDBC credentials. See [notebooks/manage_secrets.ipynb](notebooks/manage_secrets.ipynb) for reference.
-
 ### 3. Run Controller Job
 1. Run the lakefed_ingest_controller job, providing the desired task_collection as a parameter.
 2. The lakefed_ingest_controller job will run all non-partitioned tasks, followed by all partitioned tasks. Non-partitioned tasks run concurrently, and partitioned tasks run sequentially. This is because partitioned tasks will spawn concurrent queries, and we want to maintain a consistent level of concurrency at the controller job (And source system) scope.
@@ -218,40 +198,13 @@ Follow the instructions above in the "Set up Python Virtual Environment" section
 
 ### 2. Run Unit Tests
 
-Databricks Connect is required to run some of the unit tests. 
-
-1. Install dependent packages:
-```
-$ pip install -r requirements-dev.txt
-```
-
-2. Run unit tests with pytest
+Run unit tests with pytest
 ```
 $ pytest
-```
-
-If you run into this error:
-```
-ERROR tests/main_test.py - Exception: Cluster id or serverless are required but were not specified.
-```
-
-Add the cluster_id to your .databrickscfg file
-```
-[DEFAULT]
-host = https://your-workspace.cloud.databricks.com
-cluster_id = XXXX-XXXXXX-XXXXXXXX
-auth_type  = databricks-cli
 ```
 
 ## How to get help
 Databricks support doesn't cover this content. For questions or bugs, please open a GitHub issue and the team will help on a best effort basis.
 
 ## License
-&copy; 2025 Databricks, Inc. All rights reserved. The source in this notebook is provided subject to the [Databricks License](https://databricks.com/db-license-source). All included or referenced third party libraries are subject to the licenses set forth below.
-
-| library | description | license | source |
-|---------|-----------|-----------|------|
-| pytest | Testing framework | MIT | [GitHub](https://github.com/pytest-dev/pytest) |
-| setuptools | Build system | MIT | [GitHub](https://github.com/pypa/setuptools) |
-| wheel | CLI for manipulating wheel files | MIT | [GitHub](https://github.com/pypa/wheel) |
-| jsonschema | JSON schema validation | MIT | [GitHub](https://github.com/python-jsonschema/jsonschema) |
+&copy; 2025 Databricks, Inc. All rights reserved. The source in this notebook is provided subject to the [Databricks License](https://databricks.com/db-license-source).

@@ -51,3 +51,11 @@ resources:
           default: ""
         - name: select_list
           default: "*"
+        - name: use_remote_query
+          default: "false"
+        - name: src_type
+          default: ""
+        - name: src_connection
+          default: ""
+        - name: src_database
+          default: ""

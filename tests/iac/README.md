@@ -1,9 +1,6 @@
 # Terraform Templates for Integration Testing
 
-The Terraform templates deploy the following resources in Azure for integration testing:
-- [PostgreSQL database](https://learn.microsoft.com/en-us/azure/developer/terraform/deploy-postgresql-flexible-server-database?tabs=azure-cli)
-- Databricks secret scope with credentials for PostgreSQL database
-- Databricks job that generates synthetic data and writes it to the PostgreSQL database
+The Terraform templates deploy resources for integration testing with Azure SQL DB, PostgreSQL, and Synapse.
 
 ## Deployment Instructions
 
