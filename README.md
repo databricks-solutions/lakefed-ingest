@@ -143,8 +143,6 @@ Db2 requires additional setup including enabling Databricks preview features and
 ### 3. Run Jobs
 
 The framework deploys four jobs. Use the controller for normal production runs; trigger the others directly only for testing or re-running individual tasks.
-1. Run the lakefed_ingest_controller job, providing the desired task_collection as a parameter.
-2. The lakefed_ingest_controller job will run all non-partitioned tasks, followed by all partitioned tasks. Non-partitioned tasks run concurrently, and partitioned tasks run sequentially. This is because partitioned tasks will spawn concurrent queries, and we want to maintain a consistent level of concurrency at the controller job (And source system) scope.
 
 | Job | Purpose | When to trigger directly |
 |-----|---------|--------------------------|
