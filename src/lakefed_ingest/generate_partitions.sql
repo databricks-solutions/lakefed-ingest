@@ -34,8 +34,9 @@ SET VAR partitions_tbl = :tgt_catalog || '.' || :tgt_schema || '.' || :tgt_table
 SET VAR conn_opts =
   chr(39) || :src_connection || chr(39)
   || CASE :src_type
-       WHEN 'oracle' THEN ', service_name => ' || chr(39) || :src_database || chr(39)
-       ELSE               ', database => '     || chr(39) || :src_database || chr(39)
+       WHEN 'oracle'  THEN ', service_name => ' || chr(39) || :src_database || chr(39)
+       WHEN 'db2_luw' THEN ''  -- database is embedded in the JDBC URL; cannot be passed externally
+       ELSE                ', database => '     || chr(39) || :src_database || chr(39)
      END;
 
 -- 1. Partition column data type from upstream src_tbl_metadata JSON
@@ -49,14 +50,22 @@ SET VAR col_type = (
       ).columns
     ) AS col
   )
-  WHERE col.name = :partition_col
+  WHERE LOWER(col.name) = LOWER(:partition_col)
 );
+
+-- Fail fast if partition column was not found in the metadata
+-- (prevents a cryptic NoneType error inside the UDTF)
+SELECT CASE WHEN col_type IS NULL
+  THEN raise_error(concat('partition_col "', :partition_col, '" not found in src_tbl_metadata. ',
+                          'Check the column name and case in the control table.'))
+  ELSE col_type
+END;
 
 -- 2. Partition boundaries via remote_query (native passthrough)
 --    MIN/MAX are standard SQL; CAST to STRING is applied in the outer Databricks layer.
 --    Synapse and delta fall back to Lakehouse Federation.
 SET VAR qry = CASE
-  WHEN :src_type IN ('sqlserver', 'oracle', 'postgresql', 'redshift') THEN
+  WHEN :src_type IN ('sqlserver', 'oracle', 'postgresql', 'redshift', 'db2_luw') THEN
     'SELECT CAST(min_val AS STRING), CAST(max_val AS STRING)'
     || ' FROM remote_query(' || conn_opts
     || ', query => ' || chr(39)
@@ -112,6 +121,17 @@ SET VAR qry = CASE :src_type
     ||   ' FROM pg_catalog.svv_table_info'
     ||   ' WHERE schema = '   || chr(92) || chr(39) || :src_schema || chr(92) || chr(39)
     ||   ' AND "table" = '    || chr(92) || chr(39) || :src_table  || chr(92) || chr(39)
+    || chr(39) || ')'
+  WHEN 'db2_luw' THEN
+    -- DB2 catalog stores schema/table names in uppercase
+    -- FPAGES = allocated pages; PAGESIZE = bytes per page (no special privileges required)
+    'SELECT table_size_mb FROM remote_query(' || conn_opts
+    || ', query => ' || chr(39)
+    ||   'SELECT FLOAT(t.FPAGES) * ts.PAGESIZE / 1024.0 / 1024.0 AS table_size_mb'
+    ||   ' FROM SYSCAT.TABLES t'
+    ||   ' JOIN SYSCAT.TABLESPACES ts ON t.TBSPACEID = ts.TBSPACEID'
+    ||   ' WHERE t.TABSCHEMA = UPPER(' || chr(92) || chr(39) || :src_schema || chr(92) || chr(39) || ')'
+    ||   ' AND t.TABNAME = UPPER(' || chr(92) || chr(39) || :src_table || chr(92) || chr(39) || ')'
     || chr(39) || ')'
   WHEN 'synapse' THEN
     -- remote_query does not support Synapse; use Lakehouse Federation
