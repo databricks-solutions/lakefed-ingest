@@ -1,0 +1,15 @@
+-- STUB — owned by Alex (workstream B: seed -> CT handoff / version capture).
+-- See multitenant/README.md "Work division".
+--
+-- Implement here: via remote_query against the SQL Server source, return a single row/column
+-- named `ct_version` = CHANGE_TRACKING_CURRENT_VERSION(). This is captured as the upper-bound
+-- version BEFORE the seed (seeding branch) and before each CT read (cdc branch); the checkpoint
+-- advances to it only after the bronze MERGE commits (at-least-once).
+--
+-- Parameters (from the ingest job): src_connection, src_database.
+-- Hardening (per the demo reconciliation): append a per-query uniqueness comment
+--   (e.g. ' /* ' || uuid() || ' */') to the remote_query string to defeat stale result caching —
+--   this query's text is otherwise identical every cycle.
+--
+-- Placeholder so job/file references resolve until implemented:
+SELECT CAST(0 AS BIGINT) AS ct_version;

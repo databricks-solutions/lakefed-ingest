@@ -1,0 +1,15 @@
+-- STUB — owned by Alex (workstream F: reseed detection).
+-- See multitenant/README.md "Work division".
+--
+-- Implement here: via remote_query against the SQL Server source, return a single row/column
+-- named `min_valid_version` = CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID('<schema>.<table>')).
+-- The ingest job compares it to the checkpoint (if min_valid_version > checkpoint.ct_version,
+-- CT retention has lapsed and the table is routed to mark_reseed).
+--
+-- Parameters (from the ingest job): src_connection, src_database, src_schema, src_table.
+-- Note: quote the OBJECT_ID argument carefully (the reference impl builds it with chr(39)).
+-- Hardening (per the demo reconciliation): append a per-query uniqueness comment
+--   (e.g. ' /* ' || uuid() || ' */') to the remote_query string to defeat stale result caching.
+--
+-- Placeholder so job/file references resolve until implemented (0 => never triggers a reseed):
+SELECT CAST(0 AS BIGINT) AS min_valid_version;

@@ -13,6 +13,9 @@ variables:
     description: Lookup ID of an existing warehouse
   concurrency:
     description: Concurrency of for each tasks. Can be overridden during deployment.
+  mt_cluster_id:
+    description: Existing all-purpose cluster id the multi-tenant jobs run their cluster tasks on. Set per target/deploy (like warehouse_id).
+    default: ""
 
 targets:
   dev:

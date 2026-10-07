@@ -1,0 +1,59 @@
+# Multi-tenant ingestion — automated prerequisites.
+# Provisions the Lakebase OLTP instance + its UC-registered database and the SQL Server secret
+# scope, and a one-time setup job that applies the Lakebase schema (control, ct_checkpoint,
+# reseed_queue).
+#
+# NOTE: deploying this file CREATES BILLABLE INFRASTRUCTURE (a Lakebase instance). The remaining
+# manual steps (can't be bundle resources): creating per-instance SQL Server UC connections (see
+# create_sqlserver_connection.sql) and enabling remote_query — are documented in
+# multitenant/README.md. Lakebase auth uses SDK-minted tokens, so no Lakebase password secret.
+resources:
+  database_instances:
+    mt_lakebase:
+      name: lakefed-ingest-mt
+      capacity: CU_1
+      # Enable Postgres role/password login for broad client compatibility; the cluster itself
+      # connects with a short-lived SDK-minted OAuth token (no stored password).
+      enable_pg_native_login: true
+
+  database_catalogs:
+    mt_lakebase_catalog:
+      name: lakefed_ingest_mt_pg
+      database_instance_name: ${resources.database_instances.mt_lakebase.name}
+      database_name: lakefed_ingest_mt
+      create_database_if_not_exists: true
+
+  secret_scopes:
+    mt_secret_scope:
+      # Holds SQL Server connection password(s) for create_sqlserver_connection.sql — referenced
+      # via the secret() function. (Lakebase needs no secret here: tokens are minted at runtime.)
+      #   databricks secrets put-secret lakefed_ingest_mt password
+      name: lakefed_ingest_mt
+
+  jobs:
+    lakefed_ingest_mt_setup:
+      name: "lakefed_ingest_mt_setup"
+      description: "One-time: apply the Lakebase schema (control + hot-state tables)."
+      tasks:
+        - task_key: apply_lakebase_schema
+          notebook_task:
+            notebook_path: ../multitenant/src/multitenant/apply_lakebase_schema.ipynb
+            base_parameters:
+              db_instance: "{{job.parameters.db_instance}}"
+              db_name: "{{job.parameters.db_name}}"
+          existing_cluster_id: ${var.mt_cluster_id}
+          libraries:
+            - pypi:
+                package: "psycopg[binary]"
+            - pypi:
+                package: "databricks-sdk==0.145.0"
+      tags:
+        business_unit: ""
+        project: lakefed_ingest_mt
+      queue:
+        enabled: false
+      parameters:
+        - name: db_instance
+          default: lakefed-ingest-mt
+        - name: db_name
+          default: lakefed_ingest_mt

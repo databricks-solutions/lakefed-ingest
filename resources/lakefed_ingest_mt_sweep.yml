@@ -1,0 +1,49 @@
+# Multi-tenant ingestion — consolidated sweep. TOP-LEVEL entry job (no controller / batching).
+# Sweeps an entire task_collection in one run: reads all enabled tasks for the collection from
+# `control` and ingests them in-process across a thread pool + Spark FAIR scheduler pools (see
+# copy_data_sweep.ipynb / parallel.py). This keeps the pipeline under the workspace job limits
+# that a task-per-table design hits (2,000 concurrent task runs; 10,000 run-submits/hour) —
+# throughput becomes compute-bound (cluster cores), the intended cost model. Run one sweep per
+# task_collection; shard via task_collection for horizontal scale.
+#
+# IMPORTANT: run this on a cluster configured for the FAIR scheduler (spark.scheduler.mode=FAIR)
+# so the per-table scheduler pools take effect. The Change-Tracking / source-touching work lives
+# in ct_engine.py (Alex, workstreams A/B/F) — until implemented, a run raises NotImplementedError
+# per table (isolated, recorded to the Lakebase checkpoint status).
+resources:
+  jobs:
+    lakefed_ingest_mt_sweep:
+      name: "lakefed_ingest_mt_sweep"
+      description: "Sweeps an entire task_collection in one task (threads + FAIR scheduler pools)."
+      tasks:
+        - task_key: sweep
+          notebook_task:
+            notebook_path: ../multitenant/src/multitenant/copy_data_sweep.ipynb
+            base_parameters:
+              task_collection: "{{job.parameters.task_collection}}"
+              db_instance: "{{job.parameters.db_instance}}"
+              db_name: "{{job.parameters.db_name}}"
+              parallelism: "{{job.parameters.parallelism}}"
+          existing_cluster_id: ${var.mt_cluster_id}
+          libraries:
+            - pypi:
+                package: "psycopg[binary]"
+            - pypi:
+                package: "databricks-sdk==0.145.0"
+            # When Alex's cluster-side CT read lands (Spark JDBC / pytds), add:
+            # - pypi: { package: "python-tds" }
+            # - pypi: { package: "certifi" }
+      tags:
+        business_unit: ""
+        project: lakefed_ingest_mt
+      queue:
+        enabled: false
+      parameters:
+        - name: task_collection
+          default: example_cohort
+        - name: db_instance
+          default: lakefed-ingest-mt
+        - name: db_name
+          default: lakefed_ingest_mt
+        - name: parallelism
+          default: "16"
