@@ -24,6 +24,8 @@ SCHEMA = "lakefed_ingest_mt"
 CONTROL_TABLE = f"{SCHEMA}.control"
 CHECKPOINT_TABLE = f"{SCHEMA}.ct_checkpoint"
 RESEED_TABLE = f"{SCHEMA}.reseed_queue"
+SWEEP_TABLE = f"{SCHEMA}.sweep_run"       # observability: one row per sweep run
+EVENT_TABLE = f"{SCHEMA}.ingest_event"    # observability: one row per (sweep, table)
 
 SEEDING = "seeding"
 CDC = "cdc"
@@ -144,6 +146,62 @@ def enqueue_reseed_sql() -> str:
 
 
 # --------------------------------------------------------------------------------------
+# Observability / telemetry builders. The consolidated sweep ingests many tables in one job
+# task, so there is no per-table Jobs-UI task; these record per-table progress to Lakebase
+# (concurrent point writes), queryable live and syncable to Delta.
+# --------------------------------------------------------------------------------------
+def start_sweep_sql() -> str:
+    """Open a sweep_run row (status 'running'); returns the new sweep_id."""
+    return (
+        f"insert into {SWEEP_TABLE} "
+        "(task_collection, job_run_id, cluster_id, parallelism, status) "
+        "values (%s, %s, %s, %s, 'running') returning sweep_id"
+    )
+
+
+def record_event_start_sql() -> str:
+    """Open an ingest_event row for one (sweep, table), status 'running'; returns id."""
+    return (
+        f"insert into {EVENT_TABLE} "
+        "(sweep_id, task_collection, control_id, src_database, src_schema, src_table, "
+        "sink_fqn, action, phase, pool, status) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'running') returning id"
+    )
+
+
+def record_event_finish_sql() -> str:
+    """Finalize an ingest_event row: finished_at/duration + outcome + metrics."""
+    return (
+        f"update {EVENT_TABLE} set "
+        "finished_at = now(), "
+        "duration_ms = (extract(epoch from (now() - started_at)) * 1000)::bigint, "
+        "status = %s, stage = %s, rows_read = %s, rows_merged = %s, "
+        "ct_version_from = %s, ct_version_to = %s, error = %s "
+        "where id = %s"
+    )
+
+
+def touch_last_success_sql() -> str:
+    """Stamp ct_checkpoint.last_success_at from a successful ingest_event (freshness/lag)."""
+    return (
+        f"update {CHECKPOINT_TABLE} cc set last_success_at = now() "
+        f"from {EVENT_TABLE} e "
+        "where e.id = %s and cc.src_database = e.src_database "
+        "and cc.src_schema = e.src_schema and cc.src_table = e.src_table"
+    )
+
+
+def finish_sweep_sql() -> str:
+    """Finalize a sweep_run row with roll-up counts."""
+    return (
+        f"update {SWEEP_TABLE} set "
+        "finished_at = now(), status = %s, total = %s, ok = %s, failed = %s, "
+        "skipped = %s, reseeded = %s, detail = %s "
+        "where sweep_id = %s"
+    )
+
+
+# --------------------------------------------------------------------------------------
 # Lakebase accessor — thin psycopg wrapper. Runs on cluster/job compute only.
 # --------------------------------------------------------------------------------------
 class StateStore:
@@ -252,3 +310,41 @@ class StateStore:
                 upsert_checkpoint_sql(),
                 (db, schema, table, 0, SEEDING, "reseed_queued", reason),
             )
+
+    # ---- Observability / telemetry -----------------------------------------------------
+    def start_sweep(self, task_collection, job_run_id, cluster_id, parallelism) -> int:
+        """Open a sweep_run row; returns its sweep_id."""
+        with self._conn.cursor() as cur:
+            cur.execute(start_sweep_sql(),
+                        (task_collection, job_run_id, cluster_id, int(parallelism)))
+            return int(cur.fetchone()[0])
+
+    def record_event_start(self, sweep_id, cfg, action, phase, pool) -> int:
+        """Open an ingest_event row for one (sweep, table) from a control-row dict; returns id."""
+        sink_fqn = f"{cfg.get('sink_catalog')}.{cfg.get('sink_schema')}.{cfg.get('sink_table')}"
+        with self._conn.cursor() as cur:
+            cur.execute(record_event_start_sql(), (
+                int(sweep_id), cfg.get("task_collection"), cfg.get("id"),
+                cfg.get("src_database"), cfg.get("src_schema"), cfg.get("src_table"),
+                sink_fqn, action, phase, pool,
+            ))
+            return int(cur.fetchone()[0])
+
+    def record_event_finish(self, event_id, status, stage=None, rows_read=None, rows_merged=None,
+                            ct_version_from=None, ct_version_to=None, error=None) -> None:
+        """Finalize an ingest_event row; on success also stamp ct_checkpoint.last_success_at."""
+        with self._conn.cursor() as cur:
+            cur.execute(record_event_finish_sql(), (
+                status, stage, rows_read, rows_merged, ct_version_from, ct_version_to,
+                (error[:2000] if isinstance(error, str) else error), int(event_id),
+            ))
+            if status == "ok":
+                cur.execute(touch_last_success_sql(), (int(event_id),))
+
+    def finish_sweep(self, sweep_id, total, ok, failed, skipped=0, reseeded=0,
+                     status="completed", detail=None) -> None:
+        """Finalize a sweep_run row with roll-up counts."""
+        with self._conn.cursor() as cur:
+            cur.execute(finish_sweep_sql(), (
+                status, total, ok, failed, skipped, reseeded, detail, int(sweep_id),
+            ))

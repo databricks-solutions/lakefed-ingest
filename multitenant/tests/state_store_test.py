@@ -117,3 +117,50 @@ def test_decide_action_cdc_valid_increments():
 def test_decide_action_cdc_missing_min_valid_reseeds():
     # CT not enabled / unknown object (min_valid None) -> reseed.
     assert ss.decide_action(ss.CDC, 10, None) == "reseed"
+
+
+# ---- observability / telemetry builders --------------------------------------
+# One sweep_run row per run, one ingest_event row per (sweep, table): INSERT at start,
+# UPDATE at finish. These re-create per-table visibility that the single-task sweep hides.
+
+def test_start_sweep_sql_inserts_running_and_returns_id():
+    sql = ss.start_sweep_sql()
+    assert ss.SWEEP_TABLE in sql
+    assert "'running'" in sql
+    assert "returning sweep_id" in sql
+    assert sql.count("%s") == 4  # task_collection, job_run_id, cluster_id, parallelism
+
+
+def test_record_event_start_sql_inserts_running_and_returns_id():
+    sql = ss.record_event_start_sql()
+    assert ss.EVENT_TABLE in sql
+    assert "'running'" in sql
+    assert "returning id" in sql
+    # sweep_id, task_collection, control_id, src_database, src_schema, src_table,
+    # sink_fqn, action, phase, pool
+    assert sql.count("%s") == 10
+
+
+def test_record_event_finish_sql_updates_event_by_id():
+    sql = ss.record_event_finish_sql()
+    assert sql.startswith(f"update {ss.EVENT_TABLE} set")
+    assert "finished_at = now()" in sql and "duration_ms" in sql
+    assert "where id = %s" in sql
+    # status, stage, rows_read, rows_merged, ct_version_from, ct_version_to, error, id
+    assert sql.count("%s") == 8
+
+
+def test_touch_last_success_sql_stamps_checkpoint_from_event():
+    sql = ss.touch_last_success_sql()
+    assert ss.CHECKPOINT_TABLE in sql and ss.EVENT_TABLE in sql
+    assert "last_success_at = now()" in sql
+    assert sql.count("%s") == 1  # event_id
+
+
+def test_finish_sweep_sql_updates_sweep_by_id():
+    sql = ss.finish_sweep_sql()
+    assert sql.startswith(f"update {ss.SWEEP_TABLE} set")
+    assert "finished_at = now()" in sql
+    assert "where sweep_id = %s" in sql
+    # status, total, ok, failed, skipped, reseeded, detail, sweep_id
+    assert sql.count("%s") == 8

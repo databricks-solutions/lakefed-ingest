@@ -86,6 +86,73 @@ create index if not exists reseed_queue_unprocessed_idx
     on lakefed_ingest_mt.reseed_queue (enqueued_at)
     where processed = false;
 
+-- Freshness/lag: when did this table last ingest successfully. ADD COLUMN IF NOT EXISTS so
+-- re-applying the schema backfills the column onto an already-created ct_checkpoint.
+alter table lakefed_ingest_mt.ct_checkpoint add column if not exists last_success_at timestamptz;
+
+-- ---------------------------------------------------------------------------------------
+-- Observability / telemetry. App-ready: a future Databricks App reads these for live status.
+-- The consolidated sweep ingests many tables inside ONE job task, so per-table progress is not
+-- visible in the Jobs UI. These tables re-create that visibility via concurrent point writes
+-- (one ingest_event row per (sweep, table): INSERT at start, UPDATE at finish) and can be
+-- synced to Delta (sync_telemetry_to_delta.ipynb).
+-- ---------------------------------------------------------------------------------------
+
+-- One row per sweep run (one lakefed_ingest_mt_sweep run over a task_collection).
+create table if not exists lakefed_ingest_mt.sweep_run (
+    sweep_id        bigserial   primary key,
+    task_collection text        not null,
+    job_run_id      text,
+    cluster_id      text,
+    parallelism     int,
+    started_at      timestamptz not null default now(),
+    finished_at     timestamptz,
+    status          text        not null default 'running',   -- running | completed | failed
+    total           int,
+    ok              int,
+    failed          int,
+    skipped         int,
+    reseeded        int,
+    detail          text
+);
+
+create index if not exists sweep_run_collection_idx
+    on lakefed_ingest_mt.sweep_run (task_collection, started_at);
+
+-- One row per (sweep, table): per-table telemetry for a sweep.
+create table if not exists lakefed_ingest_mt.ingest_event (
+    id              bigserial   primary key,
+    sweep_id        bigint,                                   -- -> sweep_run.sweep_id
+    task_collection text,
+    control_id      bigint,                                   -- -> control.id
+    src_database    text,
+    src_schema      text,
+    src_table       text,
+    sink_fqn        text,
+    action          text,                                     -- seed | increment | reseed | skip
+    phase           text,
+    stage           text,                                     -- ensure_sink | read | merge | checkpoint | seed
+    status          text        not null default 'running',   -- running | ok | failed | skipped
+    started_at      timestamptz not null default now(),
+    finished_at     timestamptz,
+    duration_ms     bigint,
+    rows_read       bigint,
+    rows_merged     bigint,
+    ct_version_from bigint,
+    ct_version_to   bigint,
+    pool            text,
+    error           text,
+    retry_count     int         not null default 0
+);
+
+create index if not exists ingest_event_sweep_idx
+    on lakefed_ingest_mt.ingest_event (sweep_id);
+create index if not exists ingest_event_failed_idx
+    on lakefed_ingest_mt.ingest_event (sweep_id)
+    where status = 'failed';
+create index if not exists ingest_event_collection_idx
+    on lakefed_ingest_mt.ingest_event (task_collection, finished_at);
+
 -- NOTE: the two-level controller/batching was removed — the consolidated sweep ingests a whole
 -- task_collection in one task (see copy_data_sweep.ipynb), so there is no `task_batch` table.
 -- A `task_batch` left over from an earlier deploy is harmless/orphaned; we don't drop it here.
