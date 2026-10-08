@@ -30,9 +30,12 @@ resources:
                 package: "psycopg[binary]"
             - pypi:
                 package: "databricks-sdk==0.145.0"
-            # When Alex's cluster-side CT read lands (Spark JDBC / pytds), add:
-            # - pypi: { package: "python-tds" }
-            # - pypi: { package: "certifi" }
+            # ct_engine (A/B/F) reads the source via Spark JDBC. The Microsoft SQL Server JDBC
+            # driver (com.microsoft.sqlserver.jdbc.SQLServerDriver) ships with Databricks Runtime,
+            # so NO library install is needed. This also avoids the UC shared/standard-access-mode
+            # Maven/JAR allowlist (which gates user-installed jars behind a metastore admin).
+            # If a given runtime lacks the driver: allowlist com.microsoft.sqlserver:mssql-jdbc,
+            # use a single-user (dedicated) cluster, or fall back to the python-tds PyPI driver.
       tags:
         business_unit: ""
         project: lakefed_ingest_mt
