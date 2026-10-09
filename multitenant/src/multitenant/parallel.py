@@ -49,8 +49,21 @@ class WorkSlots:
             self._free.put(i)
         self._set_pool = set_pool
         self._mu = threading.Lock()
+        self._local = threading.local()   # per-thread list of pools used (see start_tracking)
         self.in_flight = 0
         self.peak = 0
+
+    def start_tracking(self) -> None:
+        """Start recording, for the CURRENT thread, the FAIR pools its units acquire."""
+        self._local.pools = []
+
+    def tracked_pools(self) -> List[str]:
+        """Pools the current thread's units used since start_tracking (in order, de-duplicated);
+        stops tracking. Units run on other threads (e.g. a partitioned seed's partitions on the
+        shared executor) are not included."""
+        pools = getattr(self._local, "pools", None) or []
+        self._local.pools = None
+        return pools
 
     @contextlib.contextmanager
     def acquire(self):
@@ -60,8 +73,12 @@ class WorkSlots:
             self.in_flight += 1
             self.peak = max(self.peak, self.in_flight)
         try:
+            pool = f"pool{slot}"
+            tracked = getattr(self._local, "pools", None)
+            if tracked is not None and pool not in tracked:
+                tracked.append(pool)
             if self._set_pool is not None:
-                self._set_pool(f"pool{slot}")
+                self._set_pool(pool)
             yield slot
         finally:
             with self._mu:

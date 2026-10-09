@@ -192,7 +192,7 @@ def record_event_finish_sql() -> str:
         "duration_ms = (extract(epoch from (now() - started_at)) * 1000)::bigint, "
         "status = %s, stage = %s, rows_read = %s, rows_merged = %s, "
         "ct_version_from = %s, ct_version_to = %s, error = %s, "
-        "action = coalesce(%s, action) "
+        "action = coalesce(%s, action), pool = coalesce(%s, pool) "
         "where id = %s"
     )
 
@@ -373,13 +373,14 @@ class StateStore:
 
     def record_event_finish(self, event_id, status, stage=None, rows_read=None, rows_merged=None,
                             ct_version_from=None, ct_version_to=None, error=None,
-                            action=None) -> None:
+                            action=None, pool=None) -> None:
         """Finalize an ingest_event row; on 'ok' also stamp ct_checkpoint.last_success_at.
-        ``action`` (optional) corrects the provisional action set at start (e.g. 'reseed')."""
+        ``action`` (optional) corrects the provisional action set at start (e.g. 'reseed');
+        ``pool`` (optional) records the FAIR pool(s) the table's units ran in."""
         with self._conn.cursor() as cur:
             cur.execute(record_event_finish_sql(), (
                 status, stage, rows_read, rows_merged, ct_version_from, ct_version_to,
-                (error[:2000] if isinstance(error, str) else error), action, int(event_id),
+                (error[:2000] if isinstance(error, str) else error), action, pool, int(event_id),
             ))
             if status == "ok":
                 cur.execute(touch_last_success_sql(), (int(event_id),))

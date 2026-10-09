@@ -93,11 +93,14 @@ def merge_on(primary_key: str) -> str:
 
 
 def merge_set(select_list: str, primary_key: str) -> str:
-    """UPDATE SET of the non-PK columns; degenerate all-PK table -> harmless no-op SET on the PK."""
+    """UPDATE SET of the non-PK columns; degenerate all-PK table -> harmless no-op SET on the PK.
+
+    Targets are UNQUALIFIED (`` `c` = s.`c` ``): under ``MERGE WITH SCHEMA EVOLUTION`` a column the
+    target doesn't have yet only resolves unqualified (``tgt.`c` `` fails on DBR 18)."""
     pk = set(_split(primary_key))
     non_pk = [c for c in _split(select_list) if c not in pk]
     cols = non_pk or _split(primary_key)
-    return ", ".join(f"tgt.`{c}` = s.`{c}`" for c in cols)
+    return ", ".join(f"`{c}` = s.`{c}`" for c in cols)
 
 
 def merge_insert_cols(select_list: str) -> str:
@@ -284,6 +287,10 @@ def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
         empty = _read(spark, cfg,
                       f"SELECT {cols} FROM [{cfg['src_schema']}].[{cfg['src_table']}] WHERE 1=0")
         empty.write.format("delta").mode("ignore").saveAsTable(sink_fqn)
+        # Type widening lets schema-evolving writes apply safe widenings (int->bigint, float->double,
+        # decimal precision) when a client's column type is wider. New sinks only; existing sinks:
+        # ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true').
+        spark.sql(f"ALTER TABLE {sink_fqn} SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')")
 
 
 def _select_cols(cfg: dict) -> str:
@@ -295,21 +302,29 @@ def _is_partitioned(cfg: dict) -> bool:
     return v is True or str(v).lower() == "true"
 
 
-def insert_sql(verb: str, target: str, cols: List[str], source: str) -> str:
-    """``<verb> <target> (`a`, `b`) SELECT `a`, `b` FROM <source>`` — columns named explicitly so they map
-    BY NAME (a reordered/edited select_list can never shift values into the wrong columns)."""
+def insert_sql(mode: str, target: str, cols: List[str], source: str, evolve: bool = False) -> str:
+    """``INSERT [WITH SCHEMA EVOLUTION] {INTO|OVERWRITE} <target> BY NAME SELECT `a`, `b` FROM <source>``.
+
+    BY NAME maps columns by name, so a reordered/edited select_list can never shift values into the
+    wrong columns; with ``evolve`` the target gains any select_list column it lacks (spike-validated
+    on DBR 18 — an explicit column list instead would require the columns to already exist)."""
     collist = ", ".join(f"`{c}`" for c in cols)
-    return f"{verb} {target} ({collist}) SELECT {collist} FROM {source}"
+    evo = "WITH SCHEMA EVOLUTION " if evolve else ""
+    return f"INSERT {evo}{mode} {target} BY NAME SELECT {collist} FROM {source}"
 
 
 def insert_overwrite_sql(sink_fqn: str, cols: List[str], source: str) -> str:
-    return insert_sql("INSERT OVERWRITE", sink_fqn, cols, source)
+    """Data-only atomic replace of the target with schema evolution. Consolidated bronze (future,
+    spike-validated): ``INSERT WITH SCHEMA EVOLUTION INTO <sink> REPLACE WHERE client_id = ...``."""
+    return insert_sql("OVERWRITE", sink_fqn, cols, source, evolve=True)
 
 
-def missing_columns(target_cols: List[str], cols: List[str]) -> List[str]:
-    """select_list columns absent from the target (case-insensitive) — pure, unit-tested."""
-    have = {c.lower() for c in target_cols}
-    return [c for c in cols if c.lower() not in have]
+def missing_sink_columns(select_list: str, sink_columns: List[str]) -> List[str]:
+    """select_list columns absent from the sink (case-insensitive) — pure, unit-tested. A non-empty
+    result in the cdc phase means the source table gained a column: the sweep reseeds that table so
+    historical rows get the new column (CT only returns changed rows)."""
+    have = {c.lower() for c in sink_columns}
+    return [c for c in _split(select_list) if c.lower() not in have]
 
 
 def _insert_overwrite(spark, sink_fqn: str, source: str, cols: List[str]) -> int:
@@ -318,12 +333,8 @@ def _insert_overwrite(spark, sink_fqn: str, source: str, cols: List[str]) -> int
     ``INSERT OVERWRITE`` is data-only: unlike ``saveAsTable(mode="overwrite")`` — which commits as
     ``CREATE OR REPLACE TABLE AS SELECT`` — it leaves the table definition alone (liquid clustering
     keys, table properties, grants, row filters/column masks), which consolidated bronze depends on.
-    Columns are named explicitly from select_list; if the target lacks any of them the write fails
-    loudly instead of silently NULLing or shifting values (schema drift is handled separately)."""
-    missing = missing_columns(spark.table(sink_fqn).columns, cols)
-    if missing:
-        raise ValueError(f"sink {sink_fqn} is missing select_list column(s) {missing}; "
-                         "add them to the sink (or fix select_list) before re-seeding")
+    Columns map BY NAME from select_list, and ``WITH SCHEMA EVOLUTION`` adds any the target lacks
+    (a client/table whose schema gained columns); existing columns are never dropped."""
     row = spark.sql(insert_overwrite_sql(sink_fqn, cols, source)).first()
     d = row.asDict() if row is not None else {}
     return int(d.get("num_inserted_rows", d.get("num_affected_rows", 0)) or 0)
@@ -341,8 +352,8 @@ def seed(spark, cfg: dict, sink_fqn: str, slots=None, executor=None, guard=None)
       then swap into the target atomically — see ``_partitioned_seed``.
     No ``.cache()``/``count()``: every source range is read exactly once.
 
-    Consolidated bronze (future): the overwrite becomes ``INSERT INTO sink REPLACE WHERE
-    client_id = ...`` so only this tenant's slice is replaced."""
+    Consolidated bronze (future, spike-validated): the overwrite becomes ``INSERT WITH SCHEMA
+    EVOLUTION INTO sink REPLACE WHERE client_id = ...`` so only this tenant's slice is replaced."""
     if _is_partitioned(cfg):
         return _partitioned_seed(spark, cfg, sink_fqn, slots, executor, guard)
     with _unit(slots):
@@ -371,7 +382,8 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
        replaces the staging table and starts over;
     6. on success, swap as one unit: overwrite the target from staging in ONE atomic Delta commit
        (same table — grants, row filters and lineage are preserved; never rename tables), then drop
-       staging. Consolidated bronze (future): ``INSERT INTO sink REPLACE WHERE client_id = ...``.
+       staging. Consolidated bronze (future): ``INSERT WITH SCHEMA EVOLUTION INTO sink REPLACE WHERE
+       client_id = ...``.
     Returns rows in the target after the swap."""
     from concurrent.futures import ThreadPoolExecutor, as_completed, wait
     import partitions
@@ -410,7 +422,7 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
             view = f"seed_part_{uuid.uuid4().hex}"
             df.createOrReplaceTempView(view)
             try:
-                row = spark.sql(insert_sql("INSERT INTO", staging, cols, view)).first()
+                row = spark.sql(insert_sql("INTO", staging, cols, view)).first()
             finally:
                 spark.catalog.dropTempView(view)
         d = row.asDict() if row is not None else {}
@@ -447,9 +459,14 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
 
 
 def merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
-    """Idempotent I/U/D MERGE of the staged CT rows (temp view ``view``) into the sink, by PK."""
+    """Idempotent I/U/D MERGE of the staged CT rows (temp view ``view``) into the sink, by PK.
+
+    ``WITH SCHEMA EVOLUTION`` (per statement — never the session-wide autoMerge conf, which the
+    threaded sweep would share): select_list columns the sink lacks are added, and with type widening
+    enabled on the sink, safe widenings (int->bigint, ...) apply. Explicit column lists keep the CT
+    ``op`` column out of bronze. ON keeps tgt./s. qualifiers; SET/INSERT targets are unqualified."""
     return (
-        f"MERGE INTO {sink_fqn} AS tgt USING {view} AS s ON {merge_on(cfg['primary_key'])} "
+        f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s ON {merge_on(cfg['primary_key'])} "
         "WHEN MATCHED AND s.op = 'D' THEN DELETE "
         f"WHEN MATCHED THEN UPDATE SET {merge_set(cfg['select_list'], cfg['primary_key'])} "
         "WHEN NOT MATCHED AND s.op <> 'D' THEN "

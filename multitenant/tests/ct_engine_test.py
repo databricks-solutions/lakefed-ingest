@@ -41,11 +41,11 @@ def test_ct_read_query_shape():
 
 def test_merge_set_excludes_pk():
     assert (ce.merge_set("order_id, amount, status", "order_id")
-            == "tgt.`amount` = s.`amount`, tgt.`status` = s.`status`")
+            == "`amount` = s.`amount`, `status` = s.`status`")      # unqualified targets (evolution)
 
 
 def test_merge_set_all_pk_is_noop_safe():
-    assert ce.merge_set("a, b", "a, b") == "tgt.`a` = s.`a`, tgt.`b` = s.`b`"
+    assert ce.merge_set("a, b", "a, b") == "`a` = s.`a`, `b` = s.`b`"
 
 
 def test_merge_insert_cols_and_vals():
@@ -119,6 +119,11 @@ def test_merge_sql_uses_given_view_and_handles_deletes():
     assert "USING ct_staged_abc AS s" in q
     assert "WHEN MATCHED AND s.op = 'D' THEN DELETE" in q
     assert "WHEN NOT MATCHED AND s.op <> 'D' THEN" in q
+    assert q.startswith("MERGE WITH SCHEMA EVOLUTION INTO c.s.orders AS tgt")
+    assert "ON tgt.`order_id` = s.`order_id`" in q                  # ON stays qualified
+    assert "UPDATE SET `amount` = s.`amount`" in q                  # SET target unqualified
+    assert "INSERT (`order_id`, `amount`) VALUES (s.`order_id`, s.`amount`)" in q
+    assert "`op`" not in q                                          # CT op never lands in bronze
 
 
 def test_engine_source_has_no_cache_or_persist():
@@ -167,16 +172,17 @@ def test_target_writes_are_data_only_insert_overwrite():
 
 # ---- explicit-column writes (columns map by NAME) ----------------------------------------
 
-def test_insert_overwrite_sql_names_columns_explicitly():
+def test_insert_overwrite_sql_by_name_with_schema_evolution():
     sql = ce.insert_overwrite_sql("c.s.t", ["id", "name"], "v")
-    assert sql == "INSERT OVERWRITE c.s.t (`id`, `name`) SELECT `id`, `name` FROM v"
-    assert ce.insert_sql("INSERT INTO", "c.s.t_stage", ["id"], "v") == \
-        "INSERT INTO c.s.t_stage (`id`) SELECT `id` FROM v"
+    assert sql == "INSERT WITH SCHEMA EVOLUTION OVERWRITE c.s.t BY NAME SELECT `id`, `name` FROM v"
+    assert ce.insert_sql("INTO", "c.s.t_stage", ["id"], "v") == \
+        "INSERT INTO c.s.t_stage BY NAME SELECT `id` FROM v"
 
 
-def test_missing_columns_is_case_insensitive():
-    assert ce.missing_columns(["ID", "Name"], ["id", "name"]) == []
-    assert ce.missing_columns(["id"], ["id", "city"]) == ["city"]
+def test_missing_sink_columns_is_case_insensitive():
+    assert ce.missing_sink_columns("id, name", ["ID", "Name"]) == []
+    assert ce.missing_sink_columns("id, city, updated_at", ["id"]) == ["city", "updated_at"]
+    assert ce.missing_sink_columns("id", ["id", "extra"]) == []     # extra sink cols are fine
 
 
 # ---- host/port resolution precedence (never send a tenant's creds to the wrong server) ----
@@ -226,6 +232,9 @@ class _Writer:
         self.spark = spark
 
     def mode(self, *_):
+        return self
+
+    def format(self, *_):
         return self
 
     def option(self, *_):
@@ -297,15 +306,16 @@ def test_partitioned_seed_failure_leaves_target_untouched(monkeypatch):
     spark = _FakeSpark(fail_where="[id] >= 37 ")      # one middle partition fails (stride 9)
     with pytest.raises(RuntimeError, match="target untouched"):
         _seed(monkeypatch, spark)
-    assert not any(s.startswith("INSERT OVERWRITE c.s.big ") for s in spark.statements)
+    assert not any(s.startswith("INSERT WITH SCHEMA EVOLUTION OVERWRITE c.s.big ") for s in spark.statements)
     assert not any(s.startswith("DROP TABLE") for s in spark.statements)   # staging kept
 
 
 def test_partitioned_seed_success_swaps_once_then_drops_staging(monkeypatch):
     spark = _FakeSpark()
     _seed(monkeypatch, spark)
-    swaps = [s for s in spark.statements if s.startswith("INSERT OVERWRITE c.s.big ")]
-    assert swaps == ["INSERT OVERWRITE c.s.big (`id`, `v`) SELECT `id`, `v` FROM c.s.big__seed_staging"]
+    swaps = [s for s in spark.statements if s.startswith("INSERT WITH SCHEMA EVOLUTION OVERWRITE c.s.big ")]
+    assert swaps == ["INSERT WITH SCHEMA EVOLUTION OVERWRITE c.s.big BY NAME SELECT `id`, `v` "
+                     "FROM c.s.big__seed_staging"]
     assert spark.statements[-1] == "DROP TABLE IF EXISTS c.s.big__seed_staging"
     assert spark.statements.index(swaps[0]) < len(spark.statements) - 1
 
@@ -320,7 +330,7 @@ def test_partitioned_seed_empty_bounds_falls_back_to_single_read_seed(monkeypatc
     cfg = {"id": 1, "src_schema": "dbo", "src_table": "big", "select_list": "id, v",
            "load_partitioned": True, "partition_col": "id", "partition_size_mb": 1}
     ce.seed(spark, cfg, "c.s.big")
-    overwrites = [s for s in spark.statements if s.startswith("INSERT OVERWRITE c.s.big ")]
+    overwrites = [s for s in spark.statements if s.startswith("INSERT WITH SCHEMA EVOLUTION OVERWRITE c.s.big ")]
     assert len(overwrites) == 1 and "__seed_staging" not in overwrites[0]
     assert not any("__seed_staging" in s for s in spark.statements)
 
@@ -343,7 +353,7 @@ class _MergeSpark(_FakeSpark):
 
     def sql(self, stmt):
         self.statements.append(stmt)
-        if stmt.startswith("MERGE INTO"):
+        if stmt.startswith("MERGE WITH SCHEMA EVOLUTION INTO"):
             if self.fail:
                 raise RuntimeError("merge failed")
             return type("R", (), {"first": lambda s_: self.result})()
@@ -359,7 +369,7 @@ def test_read_and_merge_ct_returns_affected_rows_and_drops_view(monkeypatch):
     spark = _MergeSpark(result=_Row(num_affected_rows=7))
     assert ce.read_and_merge_ct(spark, _MERGE_CFG, "c.s.t", 5) == 7
     assert spark.views == {}                                   # view dropped
-    merges = [s for s in spark.statements if s.startswith("MERGE INTO c.s.t")]
+    merges = [s for s in spark.statements if s.startswith("MERGE WITH SCHEMA EVOLUTION INTO c.s.t")]
     assert len(merges) == 1 and "ct_staged_" in merges[0]
 
 
@@ -368,7 +378,7 @@ def test_read_and_merge_ct_unique_view_per_call(monkeypatch):
     spark = _MergeSpark(result=_Row(num_affected_rows=0))
     ce.read_and_merge_ct(spark, _MERGE_CFG, "c.s.t", 5)
     ce.read_and_merge_ct(spark, _MERGE_CFG, "c.s.t", 5)
-    views = [s.split(" USING ")[1].split()[0] for s in spark.statements if s.startswith("MERGE INTO")]
+    views = [s.split(" USING ")[1].split()[0] for s in spark.statements if s.startswith("MERGE WITH SCHEMA EVOLUTION INTO")]
     assert len(set(views)) == 2
 
 
@@ -402,4 +412,22 @@ def test_partitioned_seed_guard_failure_leaves_target_untouched(monkeypatch):
 
     with ThreadPoolExecutor(max_workers=4) as ex, pytest.raises(RuntimeError):
         ce.seed(spark, cfg, "c.s.big", slots=parallel.WorkSlots(4), executor=ex, guard=lost)
-    assert not any(s.startswith("INSERT OVERWRITE c.s.big ") for s in spark.statements)
+    assert not any(s.startswith("INSERT WITH SCHEMA EVOLUTION OVERWRITE c.s.big ") for s in spark.statements)
+
+
+
+def test_ensure_sink_table_enables_type_widening_on_new_sinks(monkeypatch):
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q: _DF(sp, q))
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: False                 # sink does not exist yet
+    ce.ensure_sink_table(spark, {"src_schema": "dbo", "src_table": "t", "select_list": "id, v"}, "c.s.t")
+    assert "SAVE c.s.t" in spark.statements
+    assert any("ALTER TABLE c.s.t SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')" in x
+               for x in spark.statements)
+
+
+def test_ensure_sink_table_is_noop_when_sink_exists(monkeypatch):
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: True
+    ce.ensure_sink_table(spark, {"src_schema": "dbo", "src_table": "t", "select_list": "id"}, "c.s.t")
+    assert spark.statements == []

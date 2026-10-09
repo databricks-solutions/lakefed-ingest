@@ -200,9 +200,9 @@ def test_record_event_finish_sql_updates_event_by_id():
     assert sql.startswith(f"update {ss.EVENT_TABLE} set")
     assert "finished_at = now()" in sql and "duration_ms" in sql
     assert "where id = %s" in sql
-    # status, stage, rows_read, rows_merged, ct_version_from, ct_version_to, error, action, id
-    assert sql.count("%s") == 9
-    assert "action = coalesce(%s, action)" in sql
+    # status, stage, rows_read, rows_merged, ct_version_from, ct_version_to, error, action, pool, id
+    assert sql.count("%s") == 10
+    assert "action = coalesce(%s, action)" in sql and "pool = coalesce(%s, pool)" in sql
 
 
 def test_touch_last_success_sql_stamps_checkpoint_from_event():
@@ -352,7 +352,7 @@ def test_record_event_finish_ok_stamps_last_success():
     ss.StateStore(conn).record_event_finish(9, "ok", stage="merge", rows_merged=3,
                                             ct_version_from=1, ct_version_to=2, action="increment")
     assert conn.calls == [
-        (ss.record_event_finish_sql(), ("ok", "merge", None, 3, 1, 2, None, "increment", 9)),
+        (ss.record_event_finish_sql(), ("ok", "merge", None, 3, 1, 2, None, "increment", None, 9)),
         (ss.touch_last_success_sql(), (9,)),
     ]
 
@@ -368,3 +368,9 @@ def test_record_event_finish_skipped_reseed_does_not_stamp():
     conn = FakeConn()
     ss.StateStore(conn).record_event_finish(9, "skipped", stage="checkpoint", action="reseed")
     assert len(conn.calls) == 1 and conn.calls[0][1][7] == "reseed"
+
+
+def test_record_event_finish_records_pool():
+    conn = FakeConn()
+    ss.StateStore(conn).record_event_finish(9, "ok", stage="merge", pool="pool3,pool17")
+    assert conn.calls[0][1][8] == "pool3,pool17" and conn.calls[0][1][9] == 9

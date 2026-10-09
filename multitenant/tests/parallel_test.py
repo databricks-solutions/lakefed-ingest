@@ -144,3 +144,33 @@ def test_workslots_nested_fanout_does_not_deadlock():
     inner.shutdown(wait=True)
     assert results == [10] * 6
     assert slots.peak <= cap
+
+
+def test_workslots_tracks_pools_per_thread():
+    import threading
+    slots = parallel.WorkSlots(4)
+    slots.start_tracking()
+    with slots.acquire():
+        pass
+    with slots.acquire():
+        pass
+    mine = slots.tracked_pools()
+    assert mine and all(p.startswith("pool") for p in mine) and len(mine) == len(set(mine))
+    assert slots.tracked_pools() == []              # tracking stops after reading
+
+    slots.start_tracking()                          # another thread's units aren't mixed in
+
+    def other_thread():
+        with slots.acquire():
+            pass
+    t = threading.Thread(target=other_thread)
+    t.start(); t.join()
+    assert slots.tracked_pools() == []
+    assert slots.in_flight == 0
+
+
+def test_workslots_without_tracking_records_nothing():
+    slots = parallel.WorkSlots(2)
+    with slots.acquire():
+        pass
+    assert slots.tracked_pools() == []

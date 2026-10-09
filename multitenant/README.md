@@ -171,6 +171,14 @@ their own. Peak units are reported in the sweep summary and `sweep_run.detail`.
 
 ## Deploy & run
 
+Step-by-step setup for a new workspace (target template, adopting existing resources with
+`bundle deployment bind`, network/Postgres-role/secret steps): [docs/deploy.md](docs/deploy.md).
+
+**Schema changes:** writes use schema evolution — adding a column to `select_list` adds it to the
+sink and the sweep reseeds that table (CT alone would leave historical rows NULL). New sinks get
+`delta.enableTypeWidening`; for existing sinks run
+`ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')`.
+
 ```bash
 # From repo root (single bundle). Compute vars default to Azure node types; override per target.
 databricks bundle deploy -t <target> -p <profile> --var warehouse_id=<id>   # warehouse_id is for the original (non-MT) jobs
