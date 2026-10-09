@@ -2,7 +2,7 @@
 
 The consolidated sweep ingests many tables inside **one** job task (thread pool + FAIR scheduler
 pools), so there is no per-table task in the Jobs UI to watch. Visibility is re-created by writing
-per-table telemetry to **Lakebase** (concurrent point writes). The Lakebase database is already
+per-table telemetry to **Lakebase**. The Lakebase database is already
 registered as a Unity Catalog catalog (`lakefed_ingest_mt_pg`, via the `database_catalogs` resource
 in `lakefed_ingest_mt_setup.yml`), so you query the telemetry **directly from DBSQL** — no sync job,
 no copy. Writes go to Lakebase (point writes from the sweep); reads go through UC federation.

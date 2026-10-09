@@ -4,9 +4,10 @@
 # reseed_queue).
 #
 # NOTE: deploying this file CREATES BILLABLE INFRASTRUCTURE (a Lakebase instance). The remaining
-# manual steps (can't be bundle resources): creating per-instance SQL Server UC connections (see
-# create_sqlserver_connection.sql) and enabling remote_query — are documented in
-# multitenant/README.md. Lakebase auth uses SDK-minted tokens, so no Lakebase password secret.
+# manual step is loading per-database SQL Server credentials into the secret scope (or pointing the
+# sweep's `secret_scope` parameter at an Azure Key Vault-backed scope) — see multitenant/README.md.
+# No UC connections or SQL warehouse are needed. Lakebase auth uses SDK-minted tokens, so there is
+# no Lakebase password secret.
 resources:
   database_instances:
     mt_lakebase:
@@ -25,15 +26,30 @@ resources:
 
   secret_scopes:
     mt_secret_scope:
-      # Holds SQL Server connection password(s) for create_sqlserver_connection.sql — referenced
-      # via the secret() function. (Lakebase needs no secret here: tokens are minted at runtime.)
-      #   databricks secrets put-secret lakefed_ingest_mt password
+      # Holds per-database SQL Server credentials for the JDBC reads: one JSON secret per tenant DB,
+      # named by control.secret_key. For Azure Key Vault, use an AKV-backed scope instead and pass
+      # its name as the sweep's `secret_scope` parameter (AKV names: alphanumerics + dashes only).
+      #   databricks secrets put-secret lakefed_ingest_mt <secret_key> --string-value '{"user":"..","password":".."}'
       name: lakefed_ingest_mt
 
   jobs:
     lakefed_ingest_mt_setup:
       name: "lakefed_ingest_mt_setup"
-      description: "One-time: apply the Lakebase schema (control + hot-state tables)."
+      description: "Apply / migrate the Lakebase schema (control, hot state, telemetry). Idempotent."
+      job_clusters:
+        # Small single-node cluster: the setup task only runs DDL against Lakebase.
+        - job_cluster_key: setup_cluster
+          new_cluster:
+            spark_version: 18.x-scala2.13
+            data_security_mode: SINGLE_USER
+            node_type_id: ${var.mt_node_type_id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            custom_tags:
+              ResourceClass: SingleNode
+              project: lakefed_ingest_mt
       tasks:
         - task_key: apply_lakebase_schema
           notebook_task:
@@ -41,7 +57,7 @@ resources:
             base_parameters:
               db_instance: "{{job.parameters.db_instance}}"
               db_name: "{{job.parameters.db_name}}"
-          existing_cluster_id: ${var.mt_cluster_id}
+          job_cluster_key: setup_cluster
           libraries:
             - pypi:
                 package: "psycopg[binary]"

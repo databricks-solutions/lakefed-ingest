@@ -3,20 +3,53 @@
 # `control` and ingests them in-process across a thread pool + Spark FAIR scheduler pools (see
 # copy_data_sweep.ipynb / parallel.py). This keeps the pipeline under the workspace job limits
 # that a task-per-table design hits (2,000 concurrent task runs; 10,000 run-submits/hour) —
-# throughput becomes compute-bound (cluster cores), the intended cost model. Run one sweep per
-# task_collection; shard via task_collection for horizontal scale.
+# throughput becomes compute-bound, the intended cost model.
 #
-# IMPORTANT: run this on a cluster configured for the FAIR scheduler (spark.scheduler.mode=FAIR)
-# so the per-table scheduler pools take effect. The Change-Tracking / source-touching work lives
-# in ct_engine.py (Alex, workstreams A/B/F) — until implemented, a run raises NotImplementedError
-# per table (isolated, recorded to the Lakebase checkpoint status).
+# Warehouse-free: everything runs on the job cluster below — source reads via Spark JDBC
+# (ct_engine.py; the SQL Server JDBC driver ships with Databricks Runtime, so no library install
+# and no UC connection), Lakebase state + telemetry via psycopg.
+#
+# Compute: the sweep is DRIVER-bound (each per-table MERGE costs driver-side planning + a Delta
+# commit), so size the driver up and keep workers modest. FAIR scheduling is required for the
+# per-table scheduler pools to take effect.
+#
+# Scale pattern: shard tenants/tables into task_collections and run them CONCURRENTLY (one run per
+# collection, each on its own cluster). Runs of different collections don't conflict; a per-collection
+# Lakebase lock skips a duplicate run of the same collection. Trigger per collection via the API
+# (`run-now` with job_parameters); the job's schedule can only sweep its default collection, so
+# scheduled multi-collection runs need a launcher over collections (planned).
 resources:
   jobs:
     lakefed_ingest_mt_sweep:
       name: "lakefed_ingest_mt_sweep"
       description: "Sweeps an entire task_collection in one task (threads + FAIR scheduler pools)."
+      # Concurrent runs are the horizontal-scale pattern: one run per task_collection, each on its
+      # own job cluster. Overlap of the SAME collection is prevented inside the sweep by a
+      # per-collection Lakebase advisory lock (a duplicate run exits as 'skipped'), so this limit
+      # only caps total parallel sweeps — raise it (Jobs max is 1000) as collections are added.
+      max_concurrent_runs: 100
+      schedule:
+        # Paused by default (15-minute cadence). Job schedules can't pass parameters, so this schedule
+        # only ever sweeps the job's DEFAULT task_collection. Per-collection cadence needs a job per
+        # collection (or a target-level override of the default) or a launcher over collections (planned).
+        quartz_cron_expression: "0 0/15 * * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED
+      job_clusters:
+        - job_cluster_key: sweep_cluster
+          new_cluster:
+            spark_version: 18.x-scala2.13
+            data_security_mode: SINGLE_USER
+            node_type_id: ${var.mt_node_type_id}
+            driver_node_type_id: ${var.mt_driver_node_type_id}
+            num_workers: ${var.mt_num_workers}
+            spark_conf:
+              spark.scheduler.mode: FAIR
+            custom_tags:
+              project: lakefed_ingest_mt
       tasks:
         - task_key: sweep
+          job_cluster_key: sweep_cluster
           notebook_task:
             notebook_path: ../multitenant/src/multitenant/copy_data_sweep.ipynb
             base_parameters:
@@ -24,18 +57,13 @@ resources:
               db_instance: "{{job.parameters.db_instance}}"
               db_name: "{{job.parameters.db_name}}"
               parallelism: "{{job.parameters.parallelism}}"
-          existing_cluster_id: ${var.mt_cluster_id}
+              secret_scope: "{{job.parameters.secret_scope}}"
+              trust_server_certificate: "{{job.parameters.trust_server_certificate}}"
           libraries:
             - pypi:
                 package: "psycopg[binary]"
             - pypi:
                 package: "databricks-sdk==0.145.0"
-            # ct_engine (A/B/F) reads the source via Spark JDBC. The Microsoft SQL Server JDBC
-            # driver (com.microsoft.sqlserver.jdbc.SQLServerDriver) ships with Databricks Runtime,
-            # so NO library install is needed. This also avoids the UC shared/standard-access-mode
-            # Maven/JAR allowlist (which gates user-installed jars behind a metastore admin).
-            # If a given runtime lacks the driver: allowlist com.microsoft.sqlserver:mssql-jdbc,
-            # use a single-user (dedicated) cluster, or fall back to the python-tds PyPI driver.
       tags:
         business_unit: ""
         project: lakefed_ingest_mt
@@ -48,5 +76,16 @@ resources:
           default: lakefed-ingest-mt
         - name: db_name
           default: lakefed_ingest_mt
+        # ONE concurrency knob: max units of query work running at once in this run (CT read+MERGE,
+        # a seed, one partition of a partitioned seed, a small source query, the staging swap) —
+        # across all tables. Per run: concurrent collections on separate clusters each get their own.
+        # 32 captured most of the gain in load tests on a 16-core driver (sweep is driver-bound); raise
+        # per collection once tenant SQL Server capacity is measured.
         - name: parallelism
-          default: "16"
+          default: "32"
+        # Per-DB SQL Server credentials (JSON {user, password}); may be Azure Key Vault-backed.
+        - name: secret_scope
+          default: lakefed_ingest_mt
+        # Production: "false" with a trusted server certificate.
+        - name: trust_server_certificate
+          default: "true"

@@ -19,8 +19,54 @@ This module imports no Spark/dbutils symbols so it stays unit-testable off-clust
 
 from __future__ import annotations
 
+import contextlib
+import queue
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterable, List, Optional
+
+
+class WorkSlots:
+    """One concurrency budget for a whole sweep run: at most ``capacity`` units of query work run
+    at once, whatever their type (CT read+MERGE, a non-partitioned seed, ONE partition of a
+    partitioned seed, a small source query, the staging->target swap).
+
+    Threads vs slots: threads are cheap and may outnumber slots (table workers + partition
+    workers); a thread does Spark/JDBC work only while it HOLDS a slot. Rule: never hold a slot
+    while waiting on other work (e.g. a table waiting for its partitions) — that is what keeps
+    nested fan-out deadlock-free.
+
+    Each slot has a stable id; ``acquire()`` calls ``set_pool(f"pool{id}")`` on the current
+    thread so the unit's Spark jobs land in that slot's FAIR scheduler pool (``capacity`` pools,
+    one per concurrent unit). ``peak`` records the most units ever in flight (for telemetry).
+    Pure Python — no Spark/dbutils imports.
+    """
+
+    def __init__(self, capacity: int, set_pool: Optional[Callable[[str], None]] = None):
+        self.capacity = max(1, int(capacity))
+        self._free: "queue.Queue[int]" = queue.Queue()
+        for i in range(self.capacity):
+            self._free.put(i)
+        self._set_pool = set_pool
+        self._mu = threading.Lock()
+        self.in_flight = 0
+        self.peak = 0
+
+    @contextlib.contextmanager
+    def acquire(self):
+        """Block until a slot is free; yield its id; always return it (even on exception)."""
+        slot = self._free.get()
+        with self._mu:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+        try:
+            if self._set_pool is not None:
+                self._set_pool(f"pool{slot}")
+            yield slot
+        finally:
+            with self._mu:
+                self.in_flight -= 1
+            self._free.put(slot)
 
 
 def run_parallel(
