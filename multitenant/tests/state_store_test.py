@@ -86,7 +86,8 @@ def test_upsert_checkpoint_conflicts_on_control_id():
     sql = ss.upsert_checkpoint_sql()
     assert "on conflict (control_id) do update" in sql
     assert "src_database, src_schema, src_table" in sql   # readable identity still written
-    assert sql.count("%s") == 8  # control_id, db, schema, table, version, phase, status, detail
+    assert sql.count("%s") == 9  # control_id, db, schema, table, version, phase, status, detail, select_list
+    assert "select_list = coalesce(excluded.select_list, ct_checkpoint.select_list)" in sql
 
 
 def test_enqueue_reseed_targets_reseed_table():
@@ -283,8 +284,17 @@ class FakeCursor:
             raise RuntimeError("connection lost")
         self.conn.calls.append((sql, params))
 
+    def executemany(self, sql, seq):
+        if self.conn.raise_on_execute:
+            raise RuntimeError("connection lost")
+        self.conn.calls.append((sql, list(seq)))
+
     def fetchone(self):
         return self.conn.fetch.pop(0) if self.conn.fetch else None
+
+    def fetchall(self):
+        rows, self.conn.fetch = list(self.conn.fetch), []
+        return rows
 
 
 class FakeConn:
@@ -306,7 +316,7 @@ CFG = {"id": 7, "src_database": "d", "src_schema": "s", "src_table": "t"}
 
 def test_advance_version_binds_identity_then_checkpoint():
     conn = FakeConn(); ss.StateStore(conn).advance_version(CFG, 42)
-    assert conn.calls == [(ss.upsert_checkpoint_sql(), (7, "d", "s", "t", 42, "cdc", "ok", None))]
+    assert conn.calls == [(ss.upsert_checkpoint_sql(), (7, "d", "s", "t", 42, "cdc", "ok", None, None))]
 
 
 def test_set_status_binds_identity_then_status():
@@ -318,7 +328,7 @@ def test_enqueue_reseed_queues_then_flips_phase_to_seeding():
     conn = FakeConn(); ss.StateStore(conn).enqueue_reseed(CFG)
     assert conn.calls == [
         (ss.enqueue_reseed_sql(), (7, "d", "s", "t", "retention_miss")),
-        (ss.upsert_checkpoint_sql(), (7, "d", "s", "t", 0, "seeding", "reseed_queued", "retention_miss")),
+        (ss.upsert_checkpoint_sql(), (7, "d", "s", "t", 0, "seeding", "reseed_queued", "retention_miss", None)),
     ]
 
 
@@ -374,3 +384,59 @@ def test_record_event_finish_records_pool():
     conn = FakeConn()
     ss.StateStore(conn).record_event_finish(9, "ok", stage="merge", pool="pool3,pool17")
     assert conn.calls[0][1][8] == "pool3,pool17" and conn.calls[0][1][9] == 9
+
+
+# ---- skip-no-change: bulk checkpoint load, select_list recording, bulk advance -------------
+
+def test_get_checkpoints_one_query_any_array():
+    sql = ss.get_checkpoints_sql()
+    assert "control_id = any(%s)" in sql and "select_list" in sql and sql.count("%s") == 1
+
+
+def test_get_checkpoints_maps_rows_by_control_id():
+    conn = FakeConn(fetch=[(7, 100, "cdc", "ok", "a, b"), (8, None, "seeding", "ok", None)])
+    got = ss.StateStore(conn).get_checkpoints(["7", 8])
+    assert conn.calls == [(ss.get_checkpoints_sql(), ([7, 8],))]
+    assert got == {7: {"ct_version": 100, "phase": "cdc", "status": "ok", "select_list": "a, b"},
+                   8: {"ct_version": 0, "phase": "seeding", "status": "ok", "select_list": None}}
+    assert ss.StateStore(FakeConn()).get_checkpoints([]) == {}
+
+
+def test_advance_version_records_select_list():
+    conn = FakeConn(); ss.StateStore(conn).advance_version(CFG, 42, select_list="a, b")
+    assert conn.calls[0][1][-1] == "a, b"
+
+
+def test_bulk_advance_never_moves_backwards_and_only_cdc():
+    sql = ss.bulk_advance_unchanged_sql()
+    assert "ct_version = greatest(ct_version, %s)" in sql
+    assert "where control_id = %s and phase = 'cdc'" in sql
+    assert "last_success_at = now()" in sql and "select_list = coalesce(%s, select_list)" in sql
+    assert sql.count("%s") == 3
+
+
+def test_bulk_advance_binds_each_rows_own_version():
+    # Rows from two databases carry their OWN database's version (CT versions are per database).
+    conn = FakeConn()
+    n = ss.StateStore(conn).bulk_advance_unchanged([(7, 500, None), (9, 12, "a, b")])
+    assert n == 2
+    assert conn.calls == [(ss.bulk_advance_unchanged_sql(), [(500, None, 7), (12, "a, b", 9)])]
+    assert ss.StateStore(FakeConn()).bulk_advance_unchanged([]) == 0
+
+
+def test_select_list_added_columns():
+    assert ss.select_list_added_columns("a, b", None) is None                 # legacy: not recorded
+    assert ss.select_list_added_columns("b,A", "a, b") == []                  # reorder/case: no reseed
+    assert ss.select_list_added_columns("a, b, C", "a,b") == ["c"]            # added -> reseed
+    assert ss.select_list_added_columns("a", "a, b") == []                    # removed: no reseed
+
+
+def test_record_failed_tables_bulk_events_and_status():
+    conn = FakeConn()
+    cfg = dict(CFG, task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
+    n = ss.StateStore(conn).record_failed_tables(3, [(cfg, {"phase": "cdc"}, "db unreachable")])
+    assert n == 1
+    (ev_sql, ev_rows), (st_sql, st_rows) = conn.calls
+    assert ev_sql == ss.record_event_failed_sql() and "'failed'" in ev_sql
+    assert ev_rows == [(3, "tc", 7, "d", "s", "t", "c.s.t", "increment", "cdc", "detect", "db unreachable")]
+    assert st_sql == ss.set_status_sql() and st_rows == [(7, "d", "s", "t", "failed", "db unreachable")]

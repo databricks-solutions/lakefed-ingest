@@ -146,6 +146,11 @@ create index if not exists reseed_queue_unprocessed_idx
 -- re-applying the schema backfills the column onto an already-created ct_checkpoint.
 alter table lakefed_ingest_mt.ct_checkpoint add column if not exists last_success_at timestamptz;
 
+-- The select_list the sink was last written with. The sweep compares it with control.select_list:
+-- a column ADDED to the control row means the table is reseeded (CT returns changed rows only, so
+-- history needs a backfill). NULL = not recorded yet (legacy rows: the sweep checks the sink once).
+alter table lakefed_ingest_mt.ct_checkpoint add column if not exists select_list text;
+
 -- ---------------------------------------------------------------------------------------
 -- Observability / telemetry. App-ready: a future Databricks App reads these for live status.
 -- The consolidated sweep ingests many tables inside ONE job task, so per-table progress is not

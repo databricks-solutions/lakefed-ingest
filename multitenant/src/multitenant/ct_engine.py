@@ -327,6 +327,92 @@ def missing_sink_columns(select_list: str, sink_columns: List[str]) -> List[str]
     return [c for c in _split(select_list) if c.lower() not in have]
 
 
+# ======================================================================================
+# Skip-no-change: database-level change detection (pure builders + one JDBC call per chunk).
+# ======================================================================================
+DEFAULT_DETECTION_CHUNK = 200
+
+
+def quote_ident(name: str) -> str:
+    """SQL Server bracket-quoted identifier (``]`` doubled)."""
+    return "[" + str(name).replace("]", "]]") + "]"
+
+
+def quote_nstr(value: str) -> str:
+    """SQL Server N'...' unicode string literal (``'`` doubled)."""
+    return "N'" + str(value).replace("'", "''") + "'"
+
+
+def source_group_key(cfg: dict) -> tuple:
+    """Tables that share a source database (host, port, database, credential) — the unit for one
+    CHANGE_TRACKING_CURRENT_VERSION() capture and batched change detection."""
+    host = (cfg.get("src_host") or cfg.get("src_connection") or "").lower()
+    key = cfg.get("secret_key") or cfg.get("src_connection") or ""
+    return (host, int(cfg.get("src_port") or 1433), cfg.get("src_database"), key)
+
+
+def chunked(items: list, size: int) -> List[list]:
+    size = max(1, int(size))
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def all_current(checkpoint_versions, cur: int) -> bool:
+    """Fast exit: every checkpoint already at/after the database's current version -> nothing
+    in this database changed since the last cycle (CT versions are database-wide)."""
+    return all(int(v) >= int(cur) for v in checkpoint_versions)
+
+
+def detection_sql(items) -> str:
+    """ONE statement that classifies many tables of the same database.
+
+    ``items`` = [(control_id, schema, table, checkpoint_version), ...]. Per table it returns the CT
+    min valid version and whether CHANGETABLE has any row since the checkpoint. ``changed`` is only
+    evaluated when the checkpoint is still valid (mv NOT NULL and checkpoint >= mv) — an invalid
+    checkpoint is classified reseed from ``mv`` alone. EXISTS stops at the first change row, so a
+    busy table costs the same as a quiet one. A table without CT makes the whole statement fail at
+    compile time; the caller then falls back to the per-table path for that chunk only."""
+    parts = []
+    for cid, schema, table, cp in items:
+        full = f"{quote_ident(schema)}.{quote_ident(table)}"
+        v = int(cp)
+        parts.append(
+            f"SELECT CAST({int(cid)} AS BIGINT) AS control_id, x.mv AS mv, "
+            f"CASE WHEN x.mv IS NULL OR {v} < x.mv THEN NULL "
+            f"WHEN EXISTS (SELECT 1 FROM CHANGETABLE(CHANGES {full}, {v}) AS ct) THEN 1 ELSE 0 END AS changed "
+            f"FROM (SELECT CAST(CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID({quote_nstr(f'{full}')})) "
+            "AS BIGINT) AS mv) AS x"
+        )
+    return " UNION ALL ".join(parts)
+
+
+def classify(checkpoint_version, min_valid, changed) -> str:
+    """'reseed' (CT disabled/unknown or retention lapsed) | 'changed' | 'unchanged'. Pure."""
+    if min_valid is None or int(checkpoint_version) < int(min_valid):
+        return "reseed"
+    return "changed" if changed in (1, True, "1") else "unchanged"
+
+
+def detect_changes(spark, cfg: dict, items, slots=None, chunk_size: int = DEFAULT_DETECTION_CHUNK):
+    """Batched change detection for tables of ONE source database (``cfg`` = any of its rows; used
+    for the connection). Each chunk is one source query (one unit). Returns
+    ``(results, failed_ids, queries)`` — results {control_id: (mv, changed)}; failed_ids are the
+    tables of chunks whose query failed (caller falls back to the per-table path for them)."""
+    results, failed, queries = {}, [], 0
+    for chunk in chunked(list(items), chunk_size):
+        queries += 1
+        try:
+            with _unit(slots):
+                rows = _read(spark, cfg, detection_sql(chunk)).collect()
+            for r in rows:
+                mv = r["mv"]
+                results[int(r["control_id"])] = (None if mv is None else int(mv), r["changed"])
+        except Exception as e:
+            print(f"[detect] {cfg.get('src_database')}: chunk of {len(chunk)} failed "
+                  f"({str(e).splitlines()[0][:200]}) -> per-table fallback")
+            failed.extend(int(c[0]) for c in chunk)
+    return results, failed, queries
+
+
 def _insert_overwrite(spark, sink_fqn: str, source: str, cols: List[str]) -> int:
     """Atomically replace the target's DATA from ``source`` (a view or table) in one Delta commit.
 

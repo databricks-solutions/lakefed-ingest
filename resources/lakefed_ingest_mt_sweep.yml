@@ -59,6 +59,7 @@ resources:
               parallelism: "{{job.parameters.parallelism}}"
               secret_scope: "{{job.parameters.secret_scope}}"
               trust_server_certificate: "{{job.parameters.trust_server_certificate}}"
+              detection_chunk: "{{job.parameters.detection_chunk}}"
           libraries:
             - pypi:
                 package: "psycopg[binary]"
@@ -89,3 +90,6 @@ resources:
         # Production: "false" with a trusted server certificate.
         - name: trust_server_certificate
           default: "true"
+        # Skip-no-change: tables per batched change-detection statement (one source query per chunk).
+        - name: detection_chunk
+          default: "200"

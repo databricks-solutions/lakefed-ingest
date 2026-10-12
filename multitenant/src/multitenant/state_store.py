@@ -20,7 +20,7 @@ phase) is specific to the CT strategy.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 SCHEMA = "lakefed_ingest_mt"
 CONTROL_TABLE = f"{SCHEMA}.control"
@@ -88,6 +88,26 @@ def decide_action(phase: str, checkpoint_version: Optional[int],
     return "reseed" if is_reseed_needed(checkpoint_version, min_valid_version) else "increment"
 
 
+def select_list_columns(select_list: Optional[str]) -> List[str]:
+    """Normalized (lower-case, trimmed) column names of a comma-separated select_list."""
+    return [c.strip().lower() for c in (select_list or "").split(",") if c.strip()]
+
+
+def select_list_added_columns(control_select_list: str,
+                              recorded_select_list: Optional[str]) -> Optional[List[str]]:
+    """Columns the control row's select_list has that the checkpoint's recorded select_list lacks.
+
+    Returns None when nothing was recorded yet (legacy checkpoint -> caller falls back to checking
+    the sink's columns once). Only ADDED columns matter: CT returns changed rows only, so a new
+    column needs a reseed to backfill history; reordering is harmless (writes map BY NAME) and a
+    removed column just stops being written (bronze keeps it; existing columns are never dropped).
+    """
+    if recorded_select_list is None:
+        return None
+    have = set(select_list_columns(recorded_select_list))
+    return [c for c in select_list_columns(control_select_list) if c not in have]
+
+
 def task_identity(cfg: dict) -> tuple:
     """(control_id, src_database, src_schema, src_table) for a control-row dict — the key + the
     readable source identity written alongside every checkpoint/status/reseed row."""
@@ -123,18 +143,46 @@ def get_checkpoint_sql() -> str:
     return f"select ct_version, phase, status from {CHECKPOINT_TABLE} where control_id = %s"
 
 
-def upsert_checkpoint_sql() -> str:
-    """Insert-or-update a checkpoint (keyed by control_id): advance version, set phase/status.
+def get_checkpoints_sql() -> str:
+    """Checkpoints for MANY control tasks in one round trip (the sweep's planning phase).
+    Param: list of control ids (bound as a Postgres array)."""
+    return (f"select control_id, ct_version, phase, status, select_list from {CHECKPOINT_TABLE} "
+            "where control_id = any(%s)")
 
-    Params: control_id, src_database, src_schema, src_table, ct_version, phase, status, detail.
+
+def upsert_checkpoint_sql() -> str:
+    """Insert-or-update a checkpoint (keyed by control_id): advance version, set phase/status, and
+    record the select_list the sink was written with (kept when NULL is passed).
+
+    Params: control_id, src_database, src_schema, src_table, ct_version, phase, status, detail,
+    select_list.
     """
     return (
         f"insert into {CHECKPOINT_TABLE} "
         "(control_id, src_database, src_schema, src_table, ct_version, phase, status, detail, "
-        "updated_at) values (%s, %s, %s, %s, %s, %s, %s, %s, now()) "
+        "select_list, updated_at) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
         "on conflict (control_id) do update set "
         "ct_version = excluded.ct_version, phase = excluded.phase, "
-        "status = excluded.status, detail = excluded.detail, updated_at = now()"
+        "status = excluded.status, detail = excluded.detail, "
+        f"select_list = coalesce(excluded.select_list, ct_checkpoint.select_list), "
+        "updated_at = now()"
+    )
+
+
+def bulk_advance_unchanged_sql() -> str:
+    """Skip-no-change bookkeeping for ONE unchanged table (run via executemany over all of them).
+
+    Advances the checkpoint to the database's version captured BEFORE change detection, never
+    backwards (greatest), only for cdc-phase rows, and stamps freshness. Advancing quiet tables
+    matters: CT cleanup keeps raising each table's min valid version even when the table never
+    changes, so a checkpoint left behind would trigger a false reseed once retention passes.
+    Params: ct_version (captured), select_list (or NULL to keep), control_id.
+    """
+    return (
+        f"update {CHECKPOINT_TABLE} set "
+        "ct_version = greatest(ct_version, %s), status = 'ok', detail = null, "
+        "select_list = coalesce(%s, select_list), last_success_at = now(), updated_at = now() "
+        "where control_id = %s and phase = 'cdc'"
     )
 
 
@@ -194,6 +242,19 @@ def record_event_finish_sql() -> str:
         "ct_version_from = %s, ct_version_to = %s, error = %s, "
         "action = coalesce(%s, action), pool = coalesce(%s, pool) "
         "where id = %s"
+    )
+
+
+def record_event_failed_sql() -> str:
+    """Insert an already-FINISHED failed ingest_event row (bulk, via executemany) — used when a whole
+    source database fails change detection, so its tables are visible as failed without per-table
+    work. Params: sweep_id, task_collection, control_id, src_database, src_schema, src_table,
+    sink_fqn, action, phase, stage, error."""
+    return (
+        f"insert into {EVENT_TABLE} "
+        "(sweep_id, task_collection, control_id, src_database, src_schema, src_table, sink_fqn, "
+        "action, phase, stage, error, status, finished_at, duration_ms) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'failed', now(), 0)"
     )
 
 
@@ -334,12 +395,36 @@ class StateStore:
             return {"ct_version": 0, "phase": SEEDING, "status": "ok"}
         return {"ct_version": int(row[0]), "phase": row[1], "status": row[2]}
 
-    def advance_version(self, cfg: dict, ct_version, phase=CDC, status="ok", detail=None):
+    def get_checkpoints(self, control_ids) -> dict:
+        """{control_id: {'ct_version', 'phase', 'status', 'select_list'}} for every id that has a
+        checkpoint, in ONE query (ids without one are simply absent -> seed)."""
+        ids = [int(i) for i in control_ids]
+        if not ids:
+            return {}
+        with self._conn.cursor() as cur:
+            cur.execute(get_checkpoints_sql(), (ids,))
+            rows = cur.fetchall()
+        return {int(r[0]): {"ct_version": int(r[1] or 0), "phase": r[2], "status": r[3],
+                            "select_list": r[4]} for r in rows}
+
+    def advance_version(self, cfg: dict, ct_version, phase=CDC, status="ok", detail=None,
+                        select_list=None):
         """Persist a new checkpoint for control row ``cfg``. Call ONLY after the bronze MERGE has
-        committed (cross-system at-least-once: re-reading one window on crash is harmless)."""
+        committed (cross-system at-least-once: re-reading one window on crash is harmless).
+        ``select_list`` records the columns the sink was written with (None keeps the old value)."""
         with self._conn.cursor() as cur:
             cur.execute(upsert_checkpoint_sql(),
-                        (*task_identity(cfg), int(ct_version), phase, status, detail))
+                        (*task_identity(cfg), int(ct_version), phase, status, detail, select_list))
+
+    def bulk_advance_unchanged(self, rows) -> int:
+        """Advance many unchanged tables in one executemany: rows = [(control_id, ct_version,
+        select_list_or_None), ...]. Returns the number of rows submitted."""
+        params = [(int(v), sl, int(cid)) for cid, v, sl in rows]
+        if not params:
+            return 0
+        with self._conn.cursor() as cur:
+            cur.executemany(bulk_advance_unchanged_sql(), params)
+        return len(params)
 
     def set_status(self, cfg: dict, status, detail=None):
         with self._conn.cursor() as cur:
@@ -350,7 +435,7 @@ class StateStore:
         ident = task_identity(cfg)
         with self._conn.cursor() as cur:
             cur.execute(enqueue_reseed_sql(), (*ident, reason))
-            cur.execute(upsert_checkpoint_sql(), (*ident, 0, SEEDING, "reseed_queued", reason))
+            cur.execute(upsert_checkpoint_sql(), (*ident, 0, SEEDING, "reseed_queued", reason, None))
 
     # ---- Observability / telemetry -----------------------------------------------------
     def start_sweep(self, task_collection, job_run_id, cluster_id, parallelism) -> int:
@@ -384,6 +469,25 @@ class StateStore:
             ))
             if status == "ok":
                 cur.execute(touch_last_success_sql(), (int(event_id),))
+
+    def record_failed_tables(self, sweep_id, items, stage="detect") -> int:
+        """Bulk-record tables that failed before per-table work (e.g. their source database was
+        unreachable during change detection): one finished 'failed' ingest_event row each and the
+        checkpoint status set to 'failed' (phase/version untouched). items = [(cfg, cp, error)]."""
+        if not items:
+            return 0
+        events, statuses = [], []
+        for cfg, cp, err in items:
+            sink = f"{cfg.get('sink_catalog')}.{cfg.get('sink_schema')}.{cfg.get('sink_table')}"
+            e = (err or "")[:2000]
+            events.append((int(sweep_id), cfg.get("task_collection"), cfg.get("id"),
+                           cfg.get("src_database"), cfg.get("src_schema"), cfg.get("src_table"),
+                           sink, "increment", (cp or {}).get("phase"), stage, e))
+            statuses.append((*task_identity(cfg), "failed", e[:500]))
+        with self._conn.cursor() as cur:
+            cur.executemany(record_event_failed_sql(), events)
+            cur.executemany(set_status_sql(), statuses)
+        return len(items)
 
     def finish_sweep(self, sweep_id, total, ok, failed, skipped=0, reseeded=0,
                      status="completed", detail=None) -> None:

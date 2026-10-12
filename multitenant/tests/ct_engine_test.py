@@ -431,3 +431,55 @@ def test_ensure_sink_table_is_noop_when_sink_exists(monkeypatch):
     spark.catalog.tableExists = lambda name: True
     ce.ensure_sink_table(spark, {"src_schema": "dbo", "src_table": "t", "select_list": "id"}, "c.s.t")
     assert spark.statements == []
+
+
+# ---- skip-no-change: detection builders ---------------------------------------------------
+
+def test_quoting_doubles_closing_bracket_and_quote():
+    assert ce.quote_ident("a]b") == "[a]]b]"
+    assert ce.quote_nstr("o'k") == "N'o''k'"
+
+
+def test_detection_sql_one_branch_per_table_mv_guard_first():
+    sql = ce.detection_sql([(1, "dbo", "a", 10), (2, "dbo", "b]x", 20)])
+    assert sql.count(" UNION ALL ") == 1
+    assert "CAST(1 AS BIGINT) AS control_id" in sql and "CAST(2 AS BIGINT) AS control_id" in sql
+    assert "CHANGETABLE(CHANGES [dbo].[a], 10)" in sql and "[dbo].[b]]x]" in sql
+    assert "OBJECT_ID(N'[dbo].[a]')" in sql
+    # invalid checkpoint is decided from mv alone, before CHANGETABLE is consulted
+    assert sql.index("x.mv IS NULL OR 10 < x.mv THEN NULL") < sql.index("CHANGETABLE(CHANGES [dbo].[a]")
+
+
+def test_classify():
+    assert ce.classify(10, None, None) == "reseed"      # CT disabled / unknown object
+    assert ce.classify(5, 10, 1) == "reseed"            # retention lapsed
+    assert ce.classify(10, 10, 1) == "changed"
+    assert ce.classify(10, 3, 0) == "unchanged"
+
+
+def test_all_current_and_chunked():
+    assert ce.all_current([5, 7], 5) and not ce.all_current([5, 4], 5)
+    assert ce.chunked(list(range(5)), 2) == [[0, 1], [2, 3], [4]]
+
+
+def test_source_group_key_separates_databases_and_credentials():
+    a = {"src_host": "H", "src_port": 1433, "src_database": "d1", "secret_key": "k1"}
+    assert ce.source_group_key(a) == ce.source_group_key(dict(a, src_host="h"))
+    assert ce.source_group_key(a) != ce.source_group_key(dict(a, src_database="d2"))
+    assert ce.source_group_key(a) != ce.source_group_key(dict(a, secret_key="k2"))
+
+
+def test_detect_changes_chunk_failure_falls_back_for_that_chunk_only(monkeypatch):
+    class _Rows:
+        def __init__(self, q): self.q = q
+        def collect(self):
+            if "[bad]" in self.q:
+                raise RuntimeError("Change tracking is not enabled on table 'bad'")
+            ids = [int(x.split(" AS BIGINT")[0]) for x in self.q.split("CAST(")[1:] if " AS BIGINT) AS control_id" in x]
+            return [{"control_id": i, "mv": 1, "changed": 1 if i == 1 else 0} for i in ids]
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q: _Rows(q))
+    items = [(1, "dbo", "a", 5), (2, "dbo", "b", 5), (3, "dbo", "bad", 5), (4, "dbo", "c", 5)]
+    res, failed, queries = ce.detect_changes(None, {"src_database": "d"}, items, chunk_size=2)
+    assert queries == 2
+    assert res == {1: (1, 1), 2: (1, 0)}
+    assert sorted(failed) == [3, 4]

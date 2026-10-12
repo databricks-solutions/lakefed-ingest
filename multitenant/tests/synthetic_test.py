@@ -83,3 +83,46 @@ def test_change_tracking_sql():
     assert ps.enable_ct_database_sql("mydb") == (
         "ALTER DATABASE [mydb] SET CHANGE_TRACKING = ON (CHANGE_RETENTION = 3 DAYS, AUTO_CLEANUP = ON)")
     assert ps.enable_ct_table_sql(CAT[0]).endswith("ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = OFF)")
+
+
+# ---- change generator + reconcile builders ---------------------------------------------------
+import synth_changes as ch  # noqa: E402
+
+
+def test_pick_tables_deterministic_non_empty_fraction():
+    cat = pc.build_catalog(42)
+    a = ch.pick_tables(cat, 0.1, 0.05, seed=1)
+    assert a == ch.pick_tables(cat, 0.1, 0.05, seed=1)
+    assert a != ch.pick_tables(cat, 0.1, 0.05, seed=2)
+    non_empty = [t for t in cat if t.rows(0.1) > 0]
+    assert len(a) == round(0.05 * len(non_empty)) and all(t.rows(0.1) > 0 for t in a)
+
+
+def test_change_statements_shapes():
+    cat = pc.build_catalog(42)
+    single = next(t for t in cat if t.pk == ("id",) and t.rows(0.1) > 0)
+    comp = next(t for t in cat if len(t.pk) > 1 and t.rows(0.1) > 0)
+    stmts = dict(ch.change_statements(single, 10, 5, 2))
+    assert set(stmts) == {"insert", "update", "delete"}
+    assert "GENERATE_SERIES(CAST(0 AS bigint), CAST(9 AS bigint))" in stmts["insert"]
+    assert "SELECT ISNULL(MAX([id]), 0) FROM" in stmts["insert"]
+    assert stmts["update"].startswith("UPDATE TOP (5) ") and stmts["delete"].startswith("DELETE TOP (2) FROM")
+    col = ch.check_column(single)
+    assert col.name not in single.pk and f"[{col.name}] =" in stmts["update"]
+    assert f"ISNULL(MAX([{comp.pk[0]}]), 0) * 10" in dict(ch.change_statements(comp, 3, 0, 0))["insert"]
+    assert [k for k, _ in ch.change_statements(single, 0, 0, 1)] == ["delete"]
+
+
+def test_check_sql_same_aggregates_both_sides():
+    t = next(t for t in pc.build_catalog(42) if t.rows(0.1) > 0)
+    src, bz = ch.source_check_sql(t), ch.bronze_check_sql(t, "c.s." + t.name)
+    for s in (src, bz):
+        assert " AS n," in s and " AS pk_sum," in s and " AS col_agg FROM" in s
+    assert f"[{t.pk[0]}]" in src and f"`{t.pk[0]}`" in bz
+
+
+def test_compare_checks_normalizes_numbers():
+    assert ch.compare_checks({"n": "5", "pk_sum": "15", "col_agg": "12.5000"},
+                             {"n": 5, "pk_sum": 15, "col_agg": 12.5}) == []
+    assert ch.compare_checks({"n": "5", "pk_sum": "15", "col_agg": "1"},
+                             {"n": 4, "pk_sum": 15, "col_agg": 2}) == ["n", "col_agg"]
