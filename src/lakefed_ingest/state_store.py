@@ -47,6 +47,7 @@ CONTROL_COLUMNS = [
     "partition_col", "partition_size_mb",
     "select_list", "use_remote_query", "ct_enabled", "cursor_column", "cdc_capture_instance",
     "jdbc_options", "source_instance_group", "tier", "priority", "warehouse_id", "task_enabled",
+    "client_id",
 ]
 
 
@@ -187,6 +188,13 @@ def task_identity(cfg: dict) -> tuple:
 # --------------------------------------------------------------------------------------
 # SQL builders (parameterized, %s placeholders) — unit-tested for shape, no DB needed.
 # --------------------------------------------------------------------------------------
+def mixed_sinks_sql() -> str:
+    """Sinks (lower-cased catalog, schema, table) claimed by a dedicated row (client_id NULL) AND
+    other rows — across ALL collections, enabled or not (a disabled row still owns its data)."""
+    return (f"select lower(sink_catalog), lower(sink_schema), lower(sink_table) from {CONTROL_TABLE} "
+            "group by 1, 2, 3 having count(*) filter (where client_id is null) > 0 and count(*) > 1")
+
+
 def list_task_configs_sql() -> str:
     """Full control rows for a collection's enabled tasks, ordered by tier then priority.
 
@@ -467,6 +475,12 @@ class StateStore:
         with self._conn.cursor() as cur:
             cur.execute(list_task_configs_sql(), (task_collection,))
             return [dict(zip(CONTROL_COLUMNS, row)) for row in cur.fetchall()]
+
+    def mixed_sinks(self) -> set:
+        """{(catalog, schema, table)} lower-cased — see ``mixed_sinks_sql``."""
+        with self._conn.cursor() as cur:
+            cur.execute(mixed_sinks_sql())
+            return {tuple(r) for r in cur.fetchall()}
 
     def get_checkpoint(self, control_id) -> dict:
         """Return {'position', 'phase', 'status', 'strategy'} for a control task, or seeding

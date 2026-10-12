@@ -55,10 +55,32 @@ def position_from(plan: dict):
     return ct_position(cp)
 
 
-def route_tables(configs: List[dict], checkpoints: Dict[int, dict]):
+def sink_key(cfg: dict) -> tuple:
+    return tuple(str(cfg.get(k) or "").lower() for k in ("sink_catalog", "sink_schema", "sink_table"))
+
+
+def config_error(cfg: dict, mixed_sinks=frozenset()) -> Optional[str]:
+    """Sink-ownership problems that would let one row overwrite another's data — checked per table
+    before any work: an invalid client_id, a consolidated row whose select_list already has a
+    client_id column, or a sink shared by a dedicated row and consolidated rows."""
+    try:
+        cid = ct_engine.client_id(cfg)
+    except ValueError as e:
+        return str(e)
+    if cid is not None and ct_engine.CLIENT_COLUMN in {c.lower() for c in ct_engine._split(cfg.get("select_list"))}:
+        return (f"select_list includes '{ct_engine.CLIENT_COLUMN}', which a consolidated sink (client_id set) "
+                "adds itself; remove it from select_list")
+    if mixed_sinks and sink_key(cfg) in mixed_sinks:
+        return ("sink {}.{}.{} is claimed by a dedicated row (client_id NULL) and by other rows; a sink is "
+                "either dedicated to one source table or shared by client_id".format(*sink_key(cfg)))
+    return None
+
+
+def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=frozenset()):
     """Returns ``(plans, candidates, legacy)``.
 
-    plans      — unsupported (pair not in the support matrix; carries ``error``), full (reload),
+    plans      — unsupported (pair not in the support matrix, or a sink-ownership problem — see
+                 ``config_error``; carries ``error``), full (reload),
                  seed (no CT checkpoint / phase seeding) and schema_reseed (select_list gained
                  columns vs the recorded one) routes, plus cursor_seed / cursor (carries the
                  decoded ``position``) for load_type cursor, ready for the worker;
@@ -68,7 +90,7 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict]):
     plans, candidates, legacy = [], [], []
     for cfg in configs:
         cp = checkpoints.get(int(cfg["id"]))
-        reason = ls.unsupported_reason(cfg.get("src_type"), cfg.get("load_type"))
+        reason = config_error(cfg, mixed_sinks) or ls.unsupported_reason(cfg.get("src_type"), cfg.get("load_type"))
         if reason:
             plans.append({"cfg": cfg, "route": "unsupported", "cp": cp, "error": reason})
             continue

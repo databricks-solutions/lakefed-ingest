@@ -6,6 +6,8 @@ idempotent PK MERGE — the part that must be exactly right — without a SQL Se
 DB-touching functions (current_version, min_valid_version, read_and_merge_ct, seed,
 ensure_sink_table) are exercised end-to-end in the Tier-3 validation, not here.
 """
+import pytest
+
 import ct_engine as ce
 
 
@@ -421,9 +423,9 @@ def test_ensure_sink_table_enables_type_widening_on_new_sinks(monkeypatch):
     spark = _FakeSpark()
     spark.catalog.tableExists = lambda name: False                 # sink does not exist yet
     ce.ensure_sink_table(spark, {"src_schema": "dbo", "src_table": "t", "select_list": "id, v"}, "c.s.t")
-    assert "SAVE c.s.t" in spark.statements
-    assert any("ALTER TABLE c.s.t SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')" in x
-               for x in spark.statements)
+    creates = [x for x in spark.statements if x.startswith("CREATE TABLE IF NOT EXISTS c.s.t ")]
+    assert len(creates) == 1 and "TBLPROPERTIES ('delta.enableTypeWidening' = 'true') AS SELECT * FROM sink_schema_" in creates[0]
+    assert spark.views == {}                                       # the 0-row view is dropped
 
 
 def test_ensure_sink_table_is_noop_when_sink_exists(monkeypatch):
@@ -633,3 +635,102 @@ def test_single_table_ct_lookups_bracket_quote_object_id(monkeypatch):
     assert ce.min_valid_version(cfg) == 7 and ce.ct_begin_version(cfg) == 4
     for q in seen:
         assert "OBJECT_ID(N'[dbo].[odd.name]]x]')" in q
+
+
+# ---- consolidated sinks ----------------------------------------------------------------------------
+
+_CONS = {"id": 1, "src_schema": "dbo", "src_table": "t", "select_list": "id, v", "primary_key": "id",
+         "client_id": "tenant-001"}
+
+
+def test_client_id_validation():
+    assert ce.client_id({"client_id": " tenant-001 "}) == "tenant-001"
+    assert ce.client_id({"client_id": None}) is None and ce.client_id({"client_id": ""}) is None and ce.client_id({}) is None
+    for bad in ("it's", "a b", "x" * 129, "a`b"):
+        with pytest.raises(ValueError, match="invalid client_id"):
+            ce.client_id({"client_id": bad})
+
+
+def test_consolidated_columns_and_keys():
+    assert ce.write_columns(_CONS) == ["id", "v", "client_id"]
+    assert ce.merge_keys(_CONS) == ["client_id", "id"]
+    ded = dict(_CONS, client_id=None)
+    assert ce.write_columns(ded) == ["id", "v"] and ce.merge_keys(ded) == ["id"]
+
+
+def test_consolidated_ct_merge_matches_on_client_and_pk():
+    sql = ce.merge_sql(_CONS, "c.s.t", "v")
+    assert "ON tgt.`client_id` = s.`client_id` AND tgt.`id` = s.`id` " in sql
+    assert "UPDATE SET `v` = s.`v` " in sql                         # never rewrites the keys
+    assert "INSERT (`id`, `v`, `client_id`) VALUES (s.`id`, s.`v`, s.`client_id`)" in sql
+    assert "WHEN MATCHED AND s.op = 'D' THEN DELETE" in sql           # scoped by the ON keys
+
+
+def test_consolidated_overwrite_replaces_only_this_client():
+    sql = ce.insert_overwrite_sql("c.s.t", ce.write_columns(_CONS), "src", _CONS)
+    assert sql == ("INSERT WITH SCHEMA EVOLUTION INTO c.s.t BY NAME REPLACE WHERE `client_id` = 'tenant-001' "
+                   "SELECT `id`, `v`, `client_id` FROM src")
+    assert ce.insert_overwrite_sql("c.s.t", ["id"], "src", dict(_CONS, client_id=None)).startswith(
+        "INSERT WITH SCHEMA EVOLUTION OVERWRITE c.s.t BY NAME")
+
+
+def test_staging_table_is_per_client():
+    a = ce.staging_table_name("c.s.t", _CONS)
+    b = ce.staging_table_name("c.s.t", dict(_CONS, client_id="tenant_001"))   # same slug, other client
+    assert a.startswith("c.s.t__seed_staging__tenant_001_") and a != b
+    assert ce.staging_table_name("c.s.t", dict(_CONS, client_id=None)) == "c.s.t__seed_staging"
+
+
+def test_sink_mode_mismatch_is_refused():
+    ce.check_sink_mode(_CONS, "c.s.t", ["id", "v", "client_id"])
+    ce.check_sink_mode(dict(_CONS, client_id=None), "c.s.t", ["id", "v"])
+    with pytest.raises(ValueError, match="has a 'client_id' column but this control row is not consolidated"):
+        ce.check_sink_mode(dict(_CONS, client_id=None), "c.s.t", ["id", "Client_Id"])
+    with pytest.raises(ValueError, match="has no 'client_id' column but this control row is consolidated"):
+        ce.check_sink_mode(_CONS, "c.s.t", ["id", "v"])
+
+
+# ---- write-conflict retry ---------------------------------------------------------------------------
+
+class ConcurrentAppendException(Exception):
+    pass
+
+
+def test_write_retry_backs_off_on_conflicts_then_succeeds():
+    calls, sleeps = [], []
+
+    def fn():
+        calls.append(1)
+        if len(calls) < 3:
+            raise ConcurrentAppendException("Files were added to the table by a concurrent update")
+        return "done"
+    assert ce.with_write_retry(fn, attempts=5, sleep=sleeps.append, rand=lambda: 1.0) == "done"
+    assert len(calls) == 3 and sleeps == [ce.WRITE_RETRY_BASE_S, ce.WRITE_RETRY_BASE_S * 2]
+
+
+def test_write_retry_gives_up_and_ignores_other_errors():
+    sleeps = []
+    with pytest.raises(RuntimeError, match="DELTA_CONCURRENT_APPEND"):
+        ce.with_write_retry(lambda: (_ for _ in ()).throw(RuntimeError("[DELTA_CONCURRENT_APPEND] x")),
+                            attempts=3, sleep=sleeps.append, rand=lambda: 0.5)
+    assert len(sleeps) == 2
+    calls = []
+    with pytest.raises(ValueError):
+        ce.with_write_retry(lambda: calls.append(1) or (_ for _ in ()).throw(ValueError("bad column")),
+                            attempts=3, sleep=sleeps.append)
+    assert calls == [1]
+
+
+def test_backoff_is_capped_full_jitter():
+    assert ce.backoff_delay(0, base=1, cap=60, rand=lambda: 1.0) == 1
+    assert ce.backoff_delay(3, base=1, cap=60, rand=lambda: 1.0) == 8
+    assert ce.backoff_delay(10, base=1, cap=60, rand=lambda: 1.0) == 60
+    assert ce.backoff_delay(10, base=1, cap=60, rand=lambda: 0.0) == 0
+
+
+def test_sink_created_in_one_statement_clustered_by_client():
+    assert ce.create_sink_sql("c.s.t", "v", _CONS) == (
+        "CREATE TABLE IF NOT EXISTS c.s.t CLUSTER BY (`client_id`) "
+        "TBLPROPERTIES ('delta.enableTypeWidening' = 'true') AS SELECT * FROM v")
+    assert ce.create_sink_sql("c.s.t", "v", dict(_CONS, client_id=None)) == (
+        "CREATE TABLE IF NOT EXISTS c.s.t TBLPROPERTIES ('delta.enableTypeWidening' = 'true') AS SELECT * FROM v")

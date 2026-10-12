@@ -55,7 +55,9 @@ JDBC with per-database credentials (JSON `{user,password}`) from a secret scope 
   `sqlserver` | `oracle` | `postgresql` | `mysql`), `src_host`/`src_port`, `src_database`, `src_schema`,
   `src_table`, `secret_key`, `primary_key`, `select_list` (explicit columns), sink, `load_type` (load
   strategy: `ct` | `full` | `cursor` (SQL Server; placeholder elsewhere); `cdc` is a placeholder), partitioned-seed settings,
-  `cursor_column`, `cdc_capture_instance`, `jdbc_options` (JSON). CHECK constraints enforce valid combos.
+  `cursor_column`, `cdc_capture_instance`, `jdbc_options` (JSON), `client_id` (optional: consolidated
+  sink shared by many source DBs). CHECK constraints enforce valid combos; a unique index allows one
+  row per (sink, client_id).
 - `checkpoint` — generic: `strategy` + `position` (text; CT version for `ct`, JSON {col,type,value} for
   `cursor`), phase (`seeding → cdc` for ct and cursor, `loaded` for full), status, freshness,
   `ct_begin_version`. `reseed_queue` (ct, cursor).
@@ -109,6 +111,10 @@ JDBC with per-database credentials (JSON `{user,password}`) from a secret scope 
   source itself).
 - No SQL warehouse dependency in the default version.
 - Checkpoints advance only after the Delta commit (at-least-once + idempotent MERGE).
+- Every sink write must be client-scoped when `client_id` is set: tag rows (`ct_engine._tag`), write
+  `write_columns(cfg)`, MERGE on `merge_keys(cfg)`, overwrite via `insert_overwrite_sql(..., cfg)`
+  (REPLACE WHERE client_id), stage via `staging_table_name(sink, cfg)`. Wrap writes in
+  `with_write_retry` (Delta conflict retry, exponential backoff).
 
 ## Job orchestration version (`job_orchestration/`)
 

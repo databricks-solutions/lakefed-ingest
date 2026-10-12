@@ -138,13 +138,15 @@ def read_where(cfg: dict, typ: str, lo: Optional[str], hi: str) -> str:
 
 
 def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
-    """Idempotent upsert MERGE by PK (a watermark read carries no deletes), with schema evolution."""
+    """Idempotent upsert MERGE by PK — (client_id, PK) for a consolidated sink — with schema
+    evolution. A watermark read carries no deletes."""
+    sl, keys = ", ".join(ct_engine.write_columns(cfg)), ", ".join(ct_engine.merge_keys(cfg))
     return (
         f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s "
-        f"ON {ct_engine.merge_on(cfg['primary_key'])} "
-        f"WHEN MATCHED THEN UPDATE SET {ct_engine.merge_set(cfg['select_list'], cfg['primary_key'])} "
-        f"WHEN NOT MATCHED THEN INSERT ({ct_engine.merge_insert_cols(cfg['select_list'])}) "
-        f"VALUES ({ct_engine.merge_insert_vals(cfg['select_list'])})"
+        f"ON {ct_engine.merge_on(keys)} "
+        f"WHEN MATCHED THEN UPDATE SET {ct_engine.merge_set(sl, keys)} "
+        f"WHEN NOT MATCHED THEN INSERT ({ct_engine.merge_insert_cols(sl)}) "
+        f"VALUES ({ct_engine.merge_insert_vals(sl)})"
     )
 
 
@@ -173,14 +175,16 @@ def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str],
     """Read (lo, hi] and upsert-MERGE it into the sink — ONE source read feeding the MERGE (no
     ``.cache()``/``count()``). Returns rows affected from the MERGE metrics (None if unavailable)."""
     query = source_adapters.for_cfg(cfg).select_sql(cfg, where=read_where(cfg, typ, lo, hi))
-    with ct_engine._unit(slots):
-        df = ct_engine._read(spark, cfg, query)
-        view = f"cursor_staged_{uuid.uuid4().hex}"
-        df.createOrReplaceTempView(view)
-        try:
-            result = spark.sql(upsert_merge_sql(cfg, sink_fqn, view)).first()
-        finally:
-            spark.catalog.dropTempView(view)
+    def once():
+        with ct_engine._unit(slots):
+            df = ct_engine._tag(ct_engine._read(spark, cfg, query), cfg)
+            view = f"cursor_staged_{uuid.uuid4().hex}"
+            df.createOrReplaceTempView(view)
+            try:
+                return spark.sql(upsert_merge_sql(cfg, sink_fqn, view)).first()
+            finally:
+                spark.catalog.dropTempView(view)
+    result = ct_engine.with_write_retry(once, what=f"merge {sink_fqn}")
     if result is not None and "num_affected_rows" in result.asDict():
         return int(result["num_affected_rows"] or 0)
     return None

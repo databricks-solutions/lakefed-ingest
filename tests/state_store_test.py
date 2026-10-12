@@ -555,3 +555,14 @@ def test_record_ct_begin_version():
     assert conn.calls == [(ss.record_ct_begin_version_sql(), (495, int(CFG["id"])))]
     conn = FakeConn(); ss.StateStore(conn).record_ct_begin_version(CFG, None)
     assert conn.calls == []
+
+
+def test_mixed_sinks_query_counts_every_row_and_maps_tuples():
+    sql = ss.mixed_sinks_sql()
+    assert "task_enabled" not in sql and "where client_id is null) > 0 and count(*) > 1" in sql
+    conn = FakeConn(fetch=[("main", "bronze", "orders")])
+    assert ss.StateStore(conn).mixed_sinks() == {("main", "bronze", "orders")}
+
+
+def test_control_columns_include_client_id():
+    assert "client_id" in ss.CONTROL_COLUMNS

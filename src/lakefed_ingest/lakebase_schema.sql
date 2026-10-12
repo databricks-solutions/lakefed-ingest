@@ -38,6 +38,7 @@ create table if not exists lakefed_ingest.control (
     sink_catalog          text        not null,
     sink_schema           text        not null,
     sink_table            text        not null,
+    client_id             text,                               -- set: consolidated sink shared by client_id
     enable_iceberg_reads  boolean     not null default false,
     primary_key           text,                               -- comma-separated; required for ct/cursor/cdc
     sink_cluster_cols     text,                               -- comma-separated or NULL
@@ -73,6 +74,9 @@ alter table lakefed_ingest.control add column if not exists cursor_column text;
 alter table lakefed_ingest.control add column if not exists cdc_capture_instance text;
 alter table lakefed_ingest.control add column if not exists jdbc_options text;
 alter table lakefed_ingest.control alter column primary_key drop not null;
+-- Consolidated sinks (optional): rows with client_id set share one sink table, each writing only its
+-- own client's rows (MERGE on client_id + PK, REPLACE WHERE client_id for seeds / full reloads).
+alter table lakefed_ingest.control add column if not exists client_id text;
 
 -- Constraints are (re-)declared here so re-applying the file updates existing tables. Older
 -- deploys had an inline load_type check (auto-named) and `mt_`-prefixed names; drop those too.
@@ -115,6 +119,18 @@ alter table lakefed_ingest.control drop constraint if exists valid_jdbc_options;
 alter table lakefed_ingest.control add constraint valid_jdbc_options check (
     jdbc_options is null or jsonb_typeof(jdbc_options::jsonb) = 'object'
 );
+
+-- client_id becomes a Delta predicate literal: a restricted character set (same rule as ct_engine).
+alter table lakefed_ingest.control drop constraint if exists valid_client_id;
+alter table lakefed_ingest.control add constraint valid_client_id check (
+    client_id is null or client_id ~ '^[A-Za-z0-9_.:-]{1,128}$'
+);
+-- One writer per sink slice: a dedicated sink (client_id NULL) has exactly one control row, and a
+-- consolidated sink at most one row per client. (A sink mixing a dedicated row with consolidated
+-- rows is rejected at plan time, per table.) Fails to apply if existing rows already collide.
+create unique index if not exists control_sink_client_uq
+    on lakefed_ingest.control (lower(sink_catalog), lower(sink_schema), lower(sink_table),
+                               coalesce(client_id, ''));
 
 create index if not exists control_collection_idx
     on lakefed_ingest.control (task_collection)

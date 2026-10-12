@@ -300,3 +300,26 @@ def test_position_from_never_decodes_another_strategys_checkpoint():
     assert planner.position_from({"route": "full", "cp": _cp(5)}) is None
     assert planner.position_from({"route": "merge", "cp": _cp(5)}) == 5
     assert planner.position_from({"route": "seed", "cp": None}) == 0
+
+
+# ---- consolidated sinks: sink-ownership checks before any work -------------------------------------
+
+def _sink(cfg, table="orders", client=None):
+    return dict(cfg, sink_catalog="Main", sink_schema="Bronze", sink_table=table, client_id=client)
+
+
+def test_mixed_sink_rows_fail_at_plan_others_proceed():
+    cfgs = [_sink(_cfg(1, "d1", "a"), client="c1"), _sink(_cfg(2, "d2", "a"), table="other")]
+    plans, candidates, _ = planner.route_tables(cfgs, {}, mixed_sinks={("main", "bronze", "orders")})
+    routes = {p["cfg"]["id"]: p["route"] for p in plans}
+    assert routes == {1: "unsupported", 2: "seed"}
+    assert "claimed by a dedicated row" in plans[0]["error"]
+
+
+def test_consolidated_row_must_not_select_client_id_and_must_be_valid():
+    bad_sl = _sink(_cfg(1, "d1", "a", sl="id, Client_ID, v"), client="c1")
+    bad_id = _sink(_cfg(2, "d1", "b"), client="c 1; drop")
+    ok = _sink(_cfg(3, "d1", "c", sl="id, client_id, v"))         # dedicated: a native client_id is fine
+    plans, _, _ = planner.route_tables([bad_sl, bad_id, ok], {})
+    errs = {p["cfg"]["id"]: p.get("error") for p in plans}
+    assert "remove it from select_list" in errs[1] and "invalid client_id" in errs[2] and errs[3] is None

@@ -157,3 +157,9 @@ def test_read_and_merge_failure_propagates_and_drops_view(monkeypatch):
 def test_read_and_merge_without_metrics_returns_none(monkeypatch):
     assert _merge(monkeypatch, _Spark(result=_Result({})))[0] is None
     assert _merge(monkeypatch, _Spark(result=None))[0] is None
+
+
+def test_consolidated_cursor_merge_matches_on_client_and_pk():
+    sql = cur.upsert_merge_sql(dict(CFG, client_id="t1"), "c.s.orders", "v")
+    assert "ON tgt.`client_id` = s.`client_id` AND tgt.`id` = s.`id` " in sql
+    assert "INSERT (`id`, `amount`, `updated_at`, `client_id`)" in sql

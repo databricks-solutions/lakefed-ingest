@@ -183,6 +183,35 @@ when every partition succeeds is the target replaced from staging in one atomic 
 grants, row filters, and lineage are kept and readers never see a partial table. A failed seed
 leaves the target untouched; the next attempt rebuilds staging.
 
+### Consolidated sinks (optional)
+
+By default each control row owns its sink table — typically one schema per source database. To
+avoid one table per client per source table, set `control.client_id` and point the rows of many
+source databases at the **same** sink (e.g. every client's `dbo.orders` → `main.bronze.orders`):
+
+- Every row written carries a `client_id` column; the sink is created with liquid clustering on it.
+- MERGEs match on (`client_id`, PK), so clients with the same key values never touch each other's
+  rows, and a CT delete removes only that client's row.
+- Seeds and full reloads replace only that client's rows
+  (`INSERT WITH SCHEMA EVOLUTION INTO <sink> BY NAME REPLACE WHERE client_id = '<id>' ...`). A
+  partitioned seed stages in a per-client table, so clients can seed the same sink at once.
+- Schema drift between clients is absorbed by schema evolution: a column one client has and
+  another lacks is added to the sink and is NULL for the others.
+- Checkpoints stay per control row, so each client's CT version / watermark is independent.
+- `client_id` is per row, so consolidated and dedicated sinks can coexist (for different sink
+  tables). It must match `^[A-Za-z0-9_.:-]{1,128}$` and `client_id` must not be in `select_list`.
+
+**Guards.** A unique index allows one row per (sink, `client_id`) — one row per dedicated sink.
+A sink claimed by a dedicated row *and* consolidated rows fails those rows at stage `plan`, and a
+write into an existing sink whose mode doesn't match (a dedicated row into a table with a
+`client_id` column, or the reverse) fails that table — so no row can overwrite another's data.
+
+**Write conflicts.** Clients (or jobs) writing the same sink at once can hit Delta concurrency
+conflicts. A conflict retries the whole unit (re-read + write) with exponential backoff and full
+jitter: 6 attempts, 1 s base, 60 s cap (env `LAKEFED_WRITE_RETRY_ATTEMPTS`, `_BASE_S`, `_MAX_S`). No
+slot is held while waiting. Retries are logged (`[retry]`); if they become frequent, stagger the
+collections writing the same sinks.
+
 ### Concurrency — one knob
 
 The job's `parallelism` parameter is the maximum number of units of query work running at once in
@@ -215,6 +244,17 @@ different names and a different bundle, so follow
 [Upgrading a preview deployment](docs/deploy.md#1-add-a-target) first; the defaults would create a new,
 empty instance.
 
+The setup also creates the one-row-per-sink unique index. If existing control rows already write
+the same sink, it fails with `could not create unique index "control_sink_client_uq"`; those rows
+were overwriting each other's data. Find them, point each at its own sink (or set `client_id` to
+consolidate), and re-run the setup:
+
+```sql
+select lower(sink_catalog), lower(sink_schema), lower(sink_table), array_agg(id order by id)
+from lakefed_ingest.control group by 1, 2, 3
+having count(*) filter (where client_id is null) > 1;
+```
+
 The Lakebase database is registered in Unity Catalog (default catalog `lakefed_ingest_lakebase`),
 so control and telemetry tables can be queried from DBSQL. See [docs/monitoring.md](docs/monitoring.md).
 
@@ -224,7 +264,8 @@ Key columns: `task_collection`, `src_type`, `src_host` / `src_port` (NULL port =
 default), `src_database`, `src_schema`, `src_table`, `secret_key`, `primary_key` (comma-separated;
 required for `ct`, `cursor` and `cdc`), `select_list` (explicit columns — `*` isn't supported),
 `sink_catalog` / `sink_schema` / `sink_table`, `load_type` (`ct` | `full` | `cursor` | `cdc`), the
-optional partitioned-seed settings, `cursor_column` (required for `cursor`), and `jdbc_options`.
+optional partitioned-seed settings, `cursor_column` (required for `cursor`), `client_id`
+(consolidated sinks), and `jdbc_options`.
 `cdc_capture_instance` is reserved for the placeholder `cdc` strategy. Check constraints reject invalid combinations (e.g.
 `ct` on a non-SQL Server source). See `notebooks/load_control_example.ipynb`.
 
@@ -298,5 +339,4 @@ Unit tests need no cluster. `tests/validation_test.py` runs against a live SQL S
 ## Not yet supported
 
 The `cdc` load strategy (placeholder with a documented contract in `load_strategies.py`),
-`cursor` and `cdc` for sources other than SQL Server (placeholders), consolidated bronze
-tables across source databases, and production alerting.
+`cursor` and `cdc` for sources other than SQL Server (placeholders), and production alerting.

@@ -45,10 +45,13 @@ import without those installed — mirrors ``state_store.py``.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
+import random
 import re
 import threading
+import time
 import uuid
 from typing import List, Optional, Tuple
 
@@ -258,9 +261,121 @@ def _unit(slots):
     return slots.acquire() if slots is not None else contextlib.nullcontext()
 
 
-def staging_table_name(sink_fqn: str) -> str:
-    """Staging table a partitioned seed loads into before the atomic swap (same catalog.schema)."""
-    return f"{sink_fqn}__seed_staging"
+def staging_table_name(sink_fqn: str, cfg: Optional[dict] = None) -> str:
+    """Staging table a partitioned seed loads into before the atomic swap (same catalog.schema).
+    Consolidated sinks get one per client — several clients may seed the same sink at once."""
+    cid = client_id(cfg) if cfg else None
+    if cid is None:
+        return f"{sink_fqn}__seed_staging"
+    slug = re.sub(r"[^a-z0-9_]", "_", cid.lower())[:40]
+    return f"{sink_fqn}__seed_staging__{slug}_{hashlib.sha1(cid.encode()).hexdigest()[:8]}"
+
+
+# ======================================================================================
+# Consolidated sinks (optional, per control row): many source databases -> one sink table.
+# A row with ``control.client_id`` set writes into a shared sink: every row it writes carries
+# ``client_id``; MERGEs match on (client_id, PK); seeds and full reloads replace only that client's
+# rows (``INSERT ... BY NAME REPLACE WHERE client_id = ...``). Rows with client_id NULL own their
+# sink outright (the default). Mixing the two on one sink is rejected (planner + ensure_sink_table).
+# ======================================================================================
+CLIENT_COLUMN = "client_id"
+_CLIENT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")   # same rule as the control CHECK constraint
+
+
+def client_id(cfg: dict) -> Optional[str]:
+    """The row's client_id (consolidated sink), or None for a dedicated sink."""
+    v = cfg.get("client_id")
+    if v is None or str(v).strip() == "":
+        return None
+    v = str(v).strip()
+    if not _CLIENT_ID.match(v):
+        raise ValueError(f"invalid client_id {v!r}: use 1-128 of A-Z a-z 0-9 _ . : -")
+    return v
+
+
+def write_columns(cfg: dict) -> List[str]:
+    """Columns written to the sink: select_list, plus client_id for a consolidated sink."""
+    cols = _split(cfg["select_list"])
+    return cols + [CLIENT_COLUMN] if client_id(cfg) else cols
+
+
+def merge_keys(cfg: dict) -> List[str]:
+    """MERGE match keys: (client_id, PK) for a consolidated sink, else the PK."""
+    pk = _split(cfg["primary_key"])
+    return [CLIENT_COLUMN] + pk if client_id(cfg) else pk
+
+
+def client_predicate(cfg: dict) -> str:
+    """Delta predicate selecting this client's rows (the value is validated by ``client_id``)."""
+    return f"`{CLIENT_COLUMN}` = '{client_id(cfg)}'"
+
+
+def _tag(df, cfg: dict):
+    """Prepend the client_id literal to a source DataFrame (no-op for a dedicated sink). FIRST, so
+    a new sink has it within Delta's stats columns (first 32 by default) — liquid clustering on
+    client_id requires stats; wide tables would otherwise fail to cluster."""
+    cid = client_id(cfg)
+    if cid is None:
+        return df
+    from pyspark.sql import functions as F
+    return df.select(F.lit(cid).alias(CLIENT_COLUMN), *df.columns)
+
+
+def create_sink_sql(sink_fqn: str, view: str, cfg: dict) -> str:
+    """ONE atomic statement creating the sink from a 0-row view: type widening on, and — consolidated
+    sink — liquid clustering on client_id. A single CTAS means a sink can never exist half-configured
+    (two clients racing to create it: one wins, the other sees it exists)."""
+    cluster = f"CLUSTER BY (`{CLIENT_COLUMN}`) " if client_id(cfg) else ""
+    # Type widening lets schema-evolving writes apply safe widenings (int->bigint, float->double,
+    # decimal precision) when a client's column type is wider. Existing sinks:
+    # ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true').
+    return (f"CREATE TABLE IF NOT EXISTS {sink_fqn} {cluster}"
+            f"TBLPROPERTIES ('delta.enableTypeWidening' = 'true') AS SELECT * FROM {view}")
+
+
+# ======================================================================================
+# Delta write-conflict retry: several clients (or jobs) may write one sink concurrently. A Delta
+# concurrency conflict retries the whole unit (re-read + write) with exponential backoff and full
+# jitter, holding NO slot while it waits. Re-reading is safe: writes are idempotent (MERGE by key,
+# client-scoped replace) and checkpoints advance only after the commit.
+# ======================================================================================
+WRITE_RETRY_ATTEMPTS = int(os.environ.get("LAKEFED_WRITE_RETRY_ATTEMPTS", "6"))
+WRITE_RETRY_BASE_S = float(os.environ.get("LAKEFED_WRITE_RETRY_BASE_S", "1"))
+WRITE_RETRY_MAX_S = float(os.environ.get("LAKEFED_WRITE_RETRY_MAX_S", "60"))
+_CONFLICT_MARKERS = (
+    "ConcurrentAppendException", "ConcurrentDeleteReadException", "ConcurrentDeleteDeleteException",
+    "ConcurrentTransactionException", "MetadataChangedException", "ProtocolChangedException",
+    "DELTA_CONCURRENT_", "DELTA_METADATA_CHANGED", "DELTA_PROTOCOL_CHANGED",
+    "TABLE_OR_VIEW_ALREADY_EXISTS",            # two clients creating the same consolidated sink
+)
+
+
+def is_write_conflict(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}"
+    return any(m in text for m in _CONFLICT_MARKERS)
+
+
+def backoff_delay(attempt: int, base: float = None, cap: float = None, rand=random.random) -> float:
+    """Full-jitter exponential backoff for retry ``attempt`` (0-based)."""
+    base = WRITE_RETRY_BASE_S if base is None else base
+    cap = WRITE_RETRY_MAX_S if cap is None else cap
+    return rand() * min(cap, base * (2 ** attempt))
+
+
+def with_write_retry(fn, what: str = "write", attempts: int = None, sleep=time.sleep, rand=random.random):
+    """Run ``fn()``; on a Delta write conflict retry up to ``attempts`` times in total. Other errors
+    (and the last conflict) propagate unchanged."""
+    attempts = WRITE_RETRY_ATTEMPTS if attempts is None else attempts
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if not is_write_conflict(e) or i == attempts - 1:
+                raise
+            delay = backoff_delay(i, rand=rand)
+            print(f"[retry] {what}: write conflict (attempt {i + 1}/{attempts}), retrying in {delay:.1f}s: "
+                  f"{str(e)[:160]}")
+            sleep(delay)
 
 
 # ======================================================================================
@@ -336,18 +451,46 @@ def min_valid_version(cfg: dict, slots=None) -> Optional[int]:
     return int(row["v"]) if row and row["v"] is not None else None
 
 
+SINK_MODE_MISMATCH_MSG = (
+    "sink {sink} {has} '{col}' column but this control row {is_} consolidated (client_id {cid}); "
+    "a sink is either dedicated to one source table or shared by client_id — never both. Point the "
+    "row at another sink or fix client_id.")
+
+
+def check_sink_mode(cfg: dict, sink_fqn: str, sink_columns: List[str]) -> None:
+    """Refuse to write a dedicated row into a consolidated sink (its overwrite/MERGE would hit every
+    client's rows) or a consolidated row into a dedicated sink (rows without client_id)."""
+    has = CLIENT_COLUMN in {c.lower() for c in sink_columns}
+    cid = client_id(cfg)
+    if has and cid is None:
+        raise ValueError(SINK_MODE_MISMATCH_MSG.format(sink=sink_fqn, has="has a", col=CLIENT_COLUMN,
+                                                       is_="is not", cid="NULL"))
+    if not has and cid is not None:
+        raise ValueError(SINK_MODE_MISMATCH_MSG.format(sink=sink_fqn, has="has no", col=CLIENT_COLUMN,
+                                                       is_="is", cid=repr(cid)))
+
+
 def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
     """Create the Delta bronze sink if absent, typed from the source via a 0-row JDBC read (so the
-    JDBC dialect infers the Spark schema natively). Idempotent. The 0-row read is one unit."""
-    if spark.catalog.tableExists(sink_fqn):
-        return
-    with _unit(slots):
-        empty = _read(spark, cfg, source_adapters.for_cfg(cfg).select_sql(cfg, where="1=0"))
-        empty.write.format("delta").mode("ignore").saveAsTable(sink_fqn)
-        # Type widening lets schema-evolving writes apply safe widenings (int->bigint, float->double,
-        # decimal precision) when a client's column type is wider. New sinks only; existing sinks:
-        # ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true').
-        spark.sql(f"ALTER TABLE {sink_fqn} SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')")
+    JDBC dialect infers the Spark schema natively), then check the sink's mode (dedicated vs
+    consolidated) matches the row. Idempotent. The 0-row read is one unit.
+
+    A consolidated sink is created with a ``client_id`` column and liquid clustering on it, so
+    each client's slice is cheap to find and concurrent clients' writes touch separate files."""
+    if not spark.catalog.tableExists(sink_fqn):
+        def create():
+            with _unit(slots):
+                if spark.catalog.tableExists(sink_fqn):      # another client created it meanwhile
+                    return
+                empty = _tag(_read(spark, cfg, source_adapters.for_cfg(cfg).select_sql(cfg, where="1=0")), cfg)
+                view = f"sink_schema_{uuid.uuid4().hex}"
+                empty.createOrReplaceTempView(view)
+                try:
+                    spark.sql(create_sink_sql(sink_fqn, view, cfg))
+                finally:
+                    spark.catalog.dropTempView(view)
+        with_write_retry(create, what=f"create {sink_fqn}")
+    check_sink_mode(cfg, sink_fqn, spark.table(sink_fqn).columns)
 
 
 def _is_partitioned(cfg: dict) -> bool:
@@ -366,9 +509,15 @@ def insert_sql(mode: str, target: str, cols: List[str], source: str, evolve: boo
     return f"INSERT {evo}{mode} {target} BY NAME SELECT {collist} FROM {source}"
 
 
-def insert_overwrite_sql(sink_fqn: str, cols: List[str], source: str) -> str:
-    """Data-only atomic replace of the target with schema evolution. Consolidated bronze (future,
-    spike-validated): ``INSERT WITH SCHEMA EVOLUTION INTO <sink> REPLACE WHERE client_id = ...``."""
+def insert_overwrite_sql(sink_fqn: str, cols: List[str], source: str, cfg: Optional[dict] = None) -> str:
+    """Data-only atomic replace with schema evolution: the whole target, or — consolidated sink —
+    only this client's rows (``INSERT WITH SCHEMA EVOLUTION INTO <sink> BY NAME REPLACE WHERE
+    client_id = '<id>' SELECT ...``; validated on DBR: other clients untouched, BY NAME mapping,
+    new columns added. BY NAME must precede REPLACE WHERE)."""
+    if cfg is not None and client_id(cfg):
+        collist = ", ".join(f"`{c}`" for c in cols)
+        return (f"INSERT WITH SCHEMA EVOLUTION INTO {sink_fqn} BY NAME REPLACE WHERE {client_predicate(cfg)} "
+                f"SELECT {collist} FROM {source}")
     return insert_sql("OVERWRITE", sink_fqn, cols, source, evolve=True)
 
 
@@ -489,7 +638,7 @@ def detect_changes(spark, cfg: dict, items, slots=None, chunk_size: int = DEFAUL
     return results, failed, queries
 
 
-def _insert_overwrite(spark, sink_fqn: str, source: str, cols: List[str]) -> int:
+def _insert_overwrite(spark, sink_fqn: str, source: str, cols: List[str], cfg: Optional[dict] = None) -> int:
     """Atomically replace the target's DATA from ``source`` (a view or table) in one Delta commit.
 
     ``INSERT OVERWRITE`` is data-only: unlike ``saveAsTable(mode="overwrite")`` — which commits as
@@ -497,7 +646,7 @@ def _insert_overwrite(spark, sink_fqn: str, source: str, cols: List[str]) -> int
     keys, table properties, grants, row filters/column masks), which consolidated bronze depends on.
     Columns map BY NAME from select_list, and ``WITH SCHEMA EVOLUTION`` adds any the target lacks
     (a client/table whose schema gained columns); existing columns are never dropped."""
-    row = spark.sql(insert_overwrite_sql(sink_fqn, cols, source)).first()
+    row = spark.sql(insert_overwrite_sql(sink_fqn, cols, source, cfg)).first()
     d = row.asDict() if row is not None else {}
     return int(d.get("num_inserted_rows", d.get("num_affected_rows", 0)) or 0)
 
@@ -519,14 +668,17 @@ def seed(spark, cfg: dict, sink_fqn: str, slots=None, executor=None, guard=None)
     EVOLUTION INTO sink REPLACE WHERE client_id = ...`` so only this tenant's slice is replaced."""
     if _is_partitioned(cfg):
         return _partitioned_seed(spark, cfg, sink_fqn, slots, executor, guard)
-    with _unit(slots):
-        df = _read(spark, cfg, source_adapters.for_cfg(cfg).select_sql(cfg))
-        view = f"seed_full_{uuid.uuid4().hex}"
-        df.createOrReplaceTempView(view)
-        try:
-            return _insert_overwrite(spark, sink_fqn, view, _split(cfg["select_list"]))  # ONE read, ONE commit
-        finally:
-            spark.catalog.dropTempView(view)
+
+    def once():
+        with _unit(slots):
+            df = _tag(_read(spark, cfg, source_adapters.for_cfg(cfg).select_sql(cfg)), cfg)
+            view = f"seed_full_{uuid.uuid4().hex}"
+            df.createOrReplaceTempView(view)
+            try:
+                return _insert_overwrite(spark, sink_fqn, view, write_columns(cfg), cfg)  # ONE read, ONE commit
+            finally:
+                spark.catalog.dropTempView(view)
+    return with_write_retry(once, what=f"seed {sink_fqn}")
 
 
 def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=None) -> int:
@@ -545,8 +697,8 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
        replaces the staging table and starts over;
     6. on success, swap as one unit: overwrite the target from staging in ONE atomic Delta commit
        (same table — grants, row filters and lineage are preserved; never rename tables), then drop
-       staging. Consolidated bronze (future): ``INSERT WITH SCHEMA EVOLUTION INTO sink REPLACE WHERE
-       client_id = ...``.
+       staging. A consolidated sink replaces only this client's rows (``REPLACE WHERE client_id``)
+       and stages in a per-client table.
     Returns rows in the target after the swap."""
     from concurrent.futures import ThreadPoolExecutor, as_completed, wait
     import partitions
@@ -568,20 +720,20 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
     n = partitions.num_partitions_for(size_mb, cfg.get("partition_size_mb"))
     n = partitions.effective_num_partitions(lb, ub, n)
     plist = partitions.get_partition_list(pcol, lb, ub, n, adapter)
-    staging = staging_table_name(sink_fqn)
+    staging = staging_table_name(sink_fqn, cfg)
     print(f"[seed] {schema}.{table}: size={size_mb} MB, partition_size_mb={cfg.get('partition_size_mb')}, "
           f"{pcol} in [{lb}, {ub}], num_partitions={len(plist)}, staging={staging}")
 
-    cols = _split(cfg["select_list"])
+    cols = write_columns(cfg)
     with _unit(slots):
-        _read(spark, cfg, adapter.select_sql(cfg, where="1=0")).write.mode("overwrite") \
+        _tag(_read(spark, cfg, adapter.select_sql(cfg, where="1=0")), cfg).write.mode("overwrite") \
             .option("overwriteSchema", "true").saveAsTable(staging)
 
     def load_partition(part):
         if guard is not None:
             guard()                                # e.g. raises if the sweep lost its collection lock
         with _unit(slots):
-            df = _read(spark, cfg, adapter.select_sql(cfg, where=part["where_clause"]))
+            df = _tag(_read(spark, cfg, adapter.select_sql(cfg, where=part["where_clause"])), cfg)
             view = f"seed_part_{uuid.uuid4().hex}"
             df.createOrReplaceTempView(view)
             try:
@@ -615,8 +767,11 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
 
     if guard is not None:
         guard()                                    # don't swap if the sweep lost its lock
-    with _unit(slots):                             # atomic swap: ONE data-only Delta commit
-        rows = _insert_overwrite(spark, sink_fqn, staging, cols)
+    def swap():
+        with _unit(slots):                         # atomic swap: ONE data-only Delta commit
+            return _insert_overwrite(spark, sink_fqn, staging, cols, cfg)
+    rows = with_write_retry(swap, what=f"seed swap {sink_fqn}")
+    with _unit(slots):
         spark.sql(f"DROP TABLE IF EXISTS {staging}")
     return int(rows or 0)
 
@@ -628,13 +783,14 @@ def merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
     threaded sweep would share): select_list columns the sink lacks are added, and with type widening
     enabled on the sink, safe widenings (int->bigint, ...) apply. Explicit column lists keep the CT
     ``op`` column out of bronze. ON keeps tgt./s. qualifiers; SET/INSERT targets are unqualified."""
+    sl, keys = ", ".join(write_columns(cfg)), ", ".join(merge_keys(cfg))
     return (
-        f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s ON {merge_on(cfg['primary_key'])} "
+        f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s ON {merge_on(keys)} "
         "WHEN MATCHED AND s.op = 'D' THEN DELETE "
-        f"WHEN MATCHED THEN UPDATE SET {merge_set(cfg['select_list'], cfg['primary_key'])} "
+        f"WHEN MATCHED THEN UPDATE SET {merge_set(sl, keys)} "
         "WHEN NOT MATCHED AND s.op <> 'D' THEN "
-        f"INSERT ({merge_insert_cols(cfg['select_list'])}) "
-        f"VALUES ({merge_insert_vals(cfg['select_list'])})"
+        f"INSERT ({merge_insert_cols(sl)}) "
+        f"VALUES ({merge_insert_vals(sl)})"
     )
 
 
@@ -650,15 +806,17 @@ def read_and_merge_ct(spark, cfg: dict, sink_fqn: str, from_version: int,
     The staging temp view gets a unique name per call: the sweep runs many tables concurrently in
     one SparkSession, and temp views are session-scoped, so a shared name would let threads
     overwrite each other's change sets."""
-    with _unit(slots):                             # read -> MERGE is ONE unit of work
-        df = _read(spark, cfg, ct_read_query(cfg, from_version),
-                   session_init=ct_retention_guard_sql(cfg, from_version))
-        view = f"ct_staged_{uuid.uuid4().hex}"
-        df.createOrReplaceTempView(view)
-        try:
-            result = spark.sql(merge_sql(cfg, sink_fqn, view)).first()
-        finally:
-            spark.catalog.dropTempView(view)
+    def once():
+        with _unit(slots):                         # read -> MERGE is ONE unit of work
+            df = _tag(_read(spark, cfg, ct_read_query(cfg, from_version),
+                            session_init=ct_retention_guard_sql(cfg, from_version)), cfg)
+            view = f"ct_staged_{uuid.uuid4().hex}"
+            df.createOrReplaceTempView(view)
+            try:
+                return spark.sql(merge_sql(cfg, sink_fqn, view)).first()
+            finally:
+                spark.catalog.dropTempView(view)
+    result = with_write_retry(once, what=f"merge {sink_fqn}")
     if result is not None and "num_affected_rows" in result.asDict():
         return int(result["num_affected_rows"] or 0)
     # Runtime without MERGE result metrics: don't guess from DESCRIBE HISTORY (an empty MERGE may
