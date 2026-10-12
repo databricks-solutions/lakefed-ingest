@@ -602,3 +602,34 @@ def test_require_table_ct_refuses_tables_without_ct(monkeypatch):
         ce.require_table_ct({"src_schema": "dbo", "src_table": "t"})
     monkeypatch.setattr(ce, "min_valid_version", lambda cfg, slots=None: 467)
     assert ce.require_table_ct({"src_schema": "dbo", "src_table": "t"}) == 467
+
+
+# ---- per-table CT status (drives ct_disabled / retention_miss / ct_reenabled reseeds) --------------
+
+class _Rows:
+    def __init__(self, rows): self._rows = rows
+    def collect(self): return self._rows
+    def first(self): return self._rows[0] if self._rows else None
+
+
+def _fake_read(monkeypatch, rows):
+    seen = []
+    monkeypatch.setattr(ce, "_spark", lambda: None)
+    monkeypatch.setattr(ce, "_read", lambda spark, cfg, q, **kw: (seen.append(q), _Rows(rows))[1])
+    return seen
+
+
+def test_ct_table_status_lowercases_keys_and_maps_mv_bv(monkeypatch):
+    seen = _fake_read(monkeypatch, [{"sch": "DBO", "tbl": "MixedCase", "mv": 5, "bv": 3},
+                                    {"sch": "s", "tbl": "t", "mv": None, "bv": None}])
+    got = ce.ct_table_status({"src_schema": "dbo", "src_table": "x"})
+    assert got == {("dbo", "mixedcase"): (5, 3), ("s", "t"): (None, None)}
+    assert seen == [ce.CT_TABLE_STATUS_SQL]
+
+
+def test_single_table_ct_lookups_bracket_quote_object_id(monkeypatch):
+    cfg = {"src_schema": "dbo", "src_table": "odd.name]x"}
+    seen = _fake_read(monkeypatch, [{"v": 7, "bv": 4}])
+    assert ce.min_valid_version(cfg) == 7 and ce.ct_begin_version(cfg) == 4
+    for q in seen:
+        assert "OBJECT_ID(N'[dbo].[odd.name]]x]')" in q

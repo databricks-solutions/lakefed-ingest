@@ -328,10 +328,10 @@ def require_table_ct(cfg: dict, slots=None) -> int:
 def min_valid_version(cfg: dict, slots=None) -> Optional[int]:
     """(F) CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID('<schema>.<table>')). None when CT is not
     enabled on the table -> state_store.is_reseed_needed treats None as 'reseed'."""
-    name = f"{cfg['src_schema']}.{cfg['src_table']}".replace("'", "''")
+    obj = quote_nstr(f"{quote_ident(cfg['src_schema'])}.{quote_ident(cfg['src_table'])}")
     with _unit(slots):
         row = _read(_spark(), cfg,
-                    f"SELECT CAST(CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID('{name}')) AS BIGINT) AS v"
+                    f"SELECT CAST(CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID({obj})) AS BIGINT) AS v"
                     ).first()
     return int(row["v"]) if row and row["v"] is not None else None
 

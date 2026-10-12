@@ -45,6 +45,36 @@ Before binding, set the matching bundle variables (`lakebase_instance`, `lakebas
 jobs can be adopted the same way (`bind lakefed_ingest <job-id>`, `bind lakefed_ingest_setup
 <job-id>`). Run `databricks bundle plan -t dev` before the first deploy and confirm it deletes nothing.
 
+**Upgrading a preview deployment (Lakebase resources in the `lakefed_ingest` bundle).** Earlier
+preview builds deployed the Lakebase instance (`lakefed-ingest-mt`), its catalog
+(`lakefed_ingest_mt_pg`), the secret scope (`lakefed_ingest_mt`), and jobs `lakefed_ingest_mt_sweep` /
+`lakefed_ingest_mt_setup` from the root `lakefed_ingest` bundle. That bundle name now belongs to
+`job_orchestration/`, whose config no longer has those resources, so **a deploy from
+`job_orchestration/` would delete them** (including all control/checkpoint data and source secrets).
+Move them to this bundle before deploying either version:
+
+```bash
+# 1. Release them from the old bundle state (run from job_orchestration/; resource keys from the old config)
+cd job_orchestration
+databricks bundle deployment unbind mt_lakebase         -t <target>
+databricks bundle deployment unbind mt_lakebase_catalog -t <target>
+databricks bundle deployment unbind mt_secret_scope     -t <target>
+databricks bundle deployment unbind lakefed_ingest_mt_sweep -t <target>
+databricks bundle deployment unbind lakefed_ingest_mt_setup -t <target>
+databricks bundle plan -t <target>        # must show 0 to delete
+cd ..
+```
+
+2. In this bundle's target, set the old names, because the defaults point to a *new, empty* instance:
+   `lakebase_instance: lakefed-ingest-mt`, `lakebase_database: lakefed_ingest_mt`,
+   `lakebase_catalog: lakefed_ingest_mt_pg`, `secret_scope: lakefed_ingest_mt`.
+3. Bind them here (`bind lakebase`, `bind lakebase_catalog`, `bind secret_scope`, and optionally the
+   two jobs as `lakefed_ingest` / `lakefed_ingest_setup`), run `databricks bundle plan` and confirm it
+   deletes nothing, deploy, then run `lakefed_ingest_setup` to migrate the schema in place.
+
+If `unbind` reports that a key isn't in the state, that resource was never deployed by the old
+bundle, so skip it.
+
 **One catalog per Lakebase database.** A Lakebase database can be registered by only one UC
 catalog. If the database is already registered (for example by a catalog created by hand), bind that
 catalog or set `lakebase_catalog` to its name — creating a second catalog for it fails.

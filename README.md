@@ -183,7 +183,11 @@ All metadata lives in Lakebase (`src/lakefed_ingest/lakebase_schema.sql`), schem
 
 Upgrading from an earlier deploy: re-run `lakefed_ingest_setup`. It renames `ct_checkpoint` →
 `checkpoint` (`ct_version` → `position`), `sweep_run` → `ingest_run` (`sweep_id` → `run_id`), and
-`ingest_event.ct_version_from/to` → `position_from/to` in place; data is kept.
+`ingest_event.ct_version_from/to` → `position_from/to` in place; data is kept. This only reaches the
+existing data if the bundle points to the existing instance and database. Preview deployments used
+different names and a different bundle, so follow
+[Upgrading a preview deployment](docs/deploy.md#1-add-a-target) first; the defaults would create a new,
+empty instance.
 
 The Lakebase database is registered in Unity Catalog (default catalog `lakefed_ingest_lakebase`),
 so control and telemetry tables can be queried from DBSQL. See [docs/monitoring.md](docs/monitoring.md).
