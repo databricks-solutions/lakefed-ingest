@@ -102,7 +102,12 @@ databricks bundle run lakefed_ingest_setup -t dev   # idempotent; re-run after u
 4. **Control rows.** Register tables in the Lakebase `control` table (see `../README.md`, "Control
    rows", and `notebooks/load_control_example.ipynb`): `src_type`, `load_type`, source
    host/port/database/table, `secret_key`, `primary_key` (not needed for `full`), explicit
-   `select_list`, sink, `task_collection`, and optional partitioned-seed settings.
+   `select_list`, sink, `task_collection`, and optional partitioned-seed settings. `cursor` rows also
+   need `cursor_column` (rowversion recommended). To consolidate many source databases into shared
+   sink tables, give their rows the same sink and a distinct `client_id` each (see "Consolidated
+   sinks" in the README).
+   - `ct` tables need Change Tracking enabled on the database and the table, a primary key,
+     `ALLOW_SNAPSHOT_ISOLATION ON`, and a `CHANGE_RETENTION` longer than the expected seed time.
 5. **Oracle / MySQL sources only: JDBC driver.** Databricks Runtime bundles the SQL Server and
    PostgreSQL drivers but not Oracle's or MySQL's. Uncomment the matching Maven library in
    `resources/lakefed_ingest.yml` (pin an approved version) and redeploy. Connection notes:
@@ -120,8 +125,8 @@ databricks bundle run lakefed_ingest_setup -t dev   # idempotent; re-run after u
 databricks bundle run lakefed_ingest -t dev --params task_collection=<name>
 ```
 
-The first run seeds; later runs apply Change Tracking increments (`ct` rows) or reload the table
-(`full` rows). Check progress and results with the telemetry queries in [monitoring.md](monitoring.md)
+The first run seeds; later runs apply Change Tracking increments (`ct` rows), read rows above the
+watermark (`cursor` rows), or reload the table (`full` rows). Check progress and results with the telemetry queries in [monitoring.md](monitoring.md)
 (`ingest_run`, `ingest_event`, per-table freshness).
 
 **Upgrading an existing deployment:** re-run `lakefed_ingest_setup` after deploying. It renames the

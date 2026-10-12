@@ -10,14 +10,15 @@ two versions:
 | Metadata / state | Lakebase (Postgres): control, checkpoints, reseed queue, telemetry | Delta control table |
 | Source access | Spark JDBC with per-database credentials from a secret scope | Lakehouse Federation / `remote_query` via UC connections |
 | Load types | SQL Server Change Tracking (`ct`) and watermark `cursor`, each with full / partitioned seed; `full` reload (partitioned or not) for every source. `cdc` and non-SQL Server `cursor` are placeholders | Full, watermark incremental, partitioned full |
-| Sources | SQL Server (`ct`, `full`); Oracle, PostgreSQL, MySQL (`full`) | SQL Server, Oracle, PostgreSQL, Redshift, Synapse, IBM Db2 LUW |
+| Sources | SQL Server (`ct`, `cursor`, `full`); Oracle, PostgreSQL, MySQL (`full`) | SQL Server, Oracle, PostgreSQL, Redshift, Synapse, IBM Db2 LUW |
 | Bundle | `lakefed_ingest_v2` | `lakefed_ingest` |
 
 The job orchestration version remains supported. Use it when you want warehouse-only compute,
-watermark-based incremental loads, or a source the default version doesn't support yet. Use the
-default version when you have many source databases or tables (thousands to hundreds of thousands),
-per-database credentials, or need Change Tracking (incremental loads without a reliable watermark
-column, deletes included).
+watermark-based incremental loads from a source other than SQL Server, or a source the default
+version doesn't support yet. Use the default version when you have many source databases or tables
+(thousands to hundreds of thousands), per-database credentials, want many source databases
+consolidated into shared tables, or need Change Tracking (incremental loads without a reliable
+watermark column, deletes included).
 
 The rest of this README covers the default version.
 
@@ -235,7 +236,7 @@ All metadata lives in Lakebase (`src/lakefed_ingest/lakebase_schema.sql`), schem
 | Table | Holds |
 |---|---|
 | `control` | One row per (source database, table): source, credentials key, keys, sink, `task_collection` |
-| `checkpoint` | Hot per-table state: strategy, position (CT version for `ct`), phase, status, freshness |
+| `checkpoint` | Hot per-table state: strategy, position (CT version for `ct`, watermark for `cursor`), phase, status, freshness |
 | `reseed_queue` | Tables queued for a reseed and why |
 | `ingest_run`, `ingest_event` | Run- and table-level telemetry |
 
