@@ -29,9 +29,13 @@ def test_high_watermark_sql(typ, expr):
     assert cur.high_watermark_sql(CFG, typ) == f"SELECT {expr} AS hi FROM [dbo].[orders]"
 
 
-def test_rowversion_high_watermark_capped_below_min_active_rowversion():
-    sql = cur.high_watermark_sql(CFG, "timestamp")
-    assert "MIN_ACTIVE_ROWVERSION()" in sql and "- 1" in sql
+@pytest.mark.parametrize("typ", ["timestamp", "rowversion"])
+def test_rowversion_high_watermark_capped_below_min_active_rowversion(typ):
+    # Never past the oldest open transaction: rows it commits later must not fall below the watermark.
+    mx, mar = "CAST(MAX([updated_at]) AS BIGINT)", "CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)"
+    assert cur.high_watermark_sql(CFG, typ) == (
+        f"SELECT CONVERT(VARCHAR(20), CASE WHEN {mx} < {mar} THEN {mx} ELSE {mar} - 1 END) AS hi "
+        "FROM [dbo].[orders]")
 
 
 @pytest.mark.parametrize("typ", ["float", "real", "nvarchar", "uniqueidentifier", "bit"])
@@ -89,3 +93,67 @@ def test_column_type_lookup_errors_clearly(monkeypatch):
         cur.column_type(CFG)
     monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "DateTime2"}]))
     assert cur.column_type(CFG) == "datetime2"
+
+
+# ---- read_and_merge: one read feeding one MERGE, per-call temp view, always dropped -----------------
+
+class _Result:
+    def __init__(self, d): self._d = d
+    def asDict(self): return dict(self._d)
+    def __getitem__(self, k): return self._d[k]
+
+
+class _Spark:
+    def __init__(self, result=None, fail=False):
+        self.result, self.fail, self.views, self.statements = result, fail, {}, []
+        spark = self
+
+        class _Catalog:
+            def dropTempView(self, name): spark.views.pop(name, None)
+        self.catalog = _Catalog()
+
+    def sql(self, stmt):
+        self.statements.append(stmt)
+        if self.fail:
+            raise RuntimeError("merge failed")
+        return type("R", (), {"first": lambda s_: self.result})()
+
+
+class _DF:
+    def __init__(self, spark, query): self.spark, self.query = spark, query
+    def createOrReplaceTempView(self, name): self.spark.views[name] = self.query
+
+
+def _merge(monkeypatch, spark, lo="10", hi="20"):
+    import ct_engine
+    queries = []
+    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: (queries.append(q), _DF(sp, q))[1])
+    return cur.read_and_merge(spark, CFG, "c.s.t", "int", lo, hi), queries
+
+
+def test_read_and_merge_reads_window_once_and_drops_view(monkeypatch):
+    spark = _Spark(result=_Result({"num_affected_rows": 7}))
+    n, queries = _merge(monkeypatch, spark)
+    assert n == 7 and spark.views == {}
+    assert queries == ["SELECT [id], [amount], [updated_at] FROM [dbo].[orders] "
+                       "WHERE [updated_at] > 10 AND [updated_at] <= 20"]
+    assert len(spark.statements) == 1 and "USING cursor_staged_" in spark.statements[0]
+
+
+def test_read_and_merge_views_are_unique_per_call(monkeypatch):
+    spark = _Spark(result=_Result({"num_affected_rows": 0}))
+    _merge(monkeypatch, spark); _merge(monkeypatch, spark)
+    views = [st.split(" USING ")[1].split(" ")[0] for st in spark.statements]
+    assert len(set(views)) == 2
+
+
+def test_read_and_merge_failure_propagates_and_drops_view(monkeypatch):
+    spark = _Spark(fail=True)
+    with pytest.raises(RuntimeError, match="merge failed"):
+        _merge(monkeypatch, spark)
+    assert spark.views == {}
+
+
+def test_read_and_merge_without_metrics_returns_none(monkeypatch):
+    assert _merge(monkeypatch, _Spark(result=_Result({})))[0] is None
+    assert _merge(monkeypatch, _Spark(result=None))[0] is None

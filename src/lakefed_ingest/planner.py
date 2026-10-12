@@ -38,6 +38,23 @@ def ct_position(cp: dict) -> int:
     return _CT.decode_position(cp.get("position"))
 
 
+def position_from(plan: dict):
+    """The resume position a worker starts from (telemetry ``position_from``): the cursor value for
+    a cursor increment, the CT version for a CT table resuming its own checkpoint, else None (full
+    reload, seeds and reseeds of another strategy's checkpoint — e.g. load_type switched cursor ->
+    ct — which must never be decoded as a CT version)."""
+    route, cp = plan["route"], plan.get("cp")
+    if route == "cursor":
+        return plan["position"]["value"]
+    if route in ("full", "cursor_seed"):
+        return None
+    if cp is None:
+        return 0
+    if (cp.get("strategy") or ls.CT) != ls.CT:
+        return None
+    return ct_position(cp)
+
+
 def route_tables(configs: List[dict], checkpoints: Dict[int, dict]):
     """Returns ``(plans, candidates, legacy)``.
 

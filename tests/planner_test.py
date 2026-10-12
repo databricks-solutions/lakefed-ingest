@@ -285,3 +285,18 @@ def test_merge_plan_carries_begin_version():
     out = planner.detect_group(g, lambda c: 150, lambda c, i: ({1: (0, 1)}, [], 1),
                                ct_status=lambda c: {("dbo", "a"): (0, 7)})
     assert [(p["route"], p["ct_begin"]) for p in out["plans"]] == [("merge", 7)]
+
+
+def test_position_from_never_decodes_another_strategys_checkpoint():
+    import cursor_engine
+    cur_cp = {"position": cursor_engine.encode_position("rv", "timestamp", "9"), "phase": ss.CDC,
+              "strategy": "cursor"}
+    # load_type switched cursor -> ct: the seed must not int() the cursor JSON
+    assert planner.position_from({"route": "seed", "cp": cur_cp}) is None
+    assert planner.position_from({"route": "schema_reseed", "cp": cur_cp}) is None
+    assert planner.position_from({"route": "cursor", "cp": cur_cp,
+                                  "position": cursor_engine.decode_position(cur_cp["position"])}) == "9"
+    assert planner.position_from({"route": "cursor_seed", "cp": cur_cp}) is None
+    assert planner.position_from({"route": "full", "cp": _cp(5)}) is None
+    assert planner.position_from({"route": "merge", "cp": _cp(5)}) == 5
+    assert planner.position_from({"route": "seed", "cp": None}) == 0
