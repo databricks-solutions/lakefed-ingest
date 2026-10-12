@@ -294,7 +294,7 @@ class _FakeSpark:
 def _seed(monkeypatch, spark):
     from concurrent.futures import ThreadPoolExecutor
     import parallel
-    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q: _DF(sp, q))
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
     cfg = {"id": 1, "src_schema": "dbo", "src_table": "big", "select_list": "id, v",
            "load_partitioned": True, "partition_col": "id", "partition_size_mb": 1}
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -325,7 +325,7 @@ def test_partitioned_seed_empty_bounds_falls_back_to_single_read_seed(monkeypatc
     class _EmptyDF(_DF):
         def first(self):
             return _Row(lb=None, ub=None) if " AS lb" in self.query else super().first()
-    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q: _EmptyDF(sp, q))
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _EmptyDF(sp, q))
     spark = _FakeSpark()
     cfg = {"id": 1, "src_schema": "dbo", "src_table": "big", "select_list": "id, v",
            "load_partitioned": True, "partition_col": "id", "partition_size_mb": 1}
@@ -337,7 +337,7 @@ def test_partitioned_seed_empty_bounds_falls_back_to_single_read_seed(monkeypatc
 
 def test_partitioned_seed_requires_partition_col(monkeypatch):
     import pytest
-    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q: _DF(sp, q))
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
     cfg = {"id": 1, "src_schema": "dbo", "src_table": "big", "select_list": "id, v",
            "load_partitioned": True, "partition_col": "", "partition_size_mb": 1}
     with pytest.raises(ValueError, match="partition_col"):
@@ -365,7 +365,7 @@ _MERGE_CFG = {"id": 1, "src_schema": "dbo", "src_table": "t", "select_list": "id
 
 
 def test_read_and_merge_ct_returns_affected_rows_and_drops_view(monkeypatch):
-    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q: _DF(sp, q))
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
     spark = _MergeSpark(result=_Row(num_affected_rows=7))
     assert ce.read_and_merge_ct(spark, _MERGE_CFG, "c.s.t", 5) == 7
     assert spark.views == {}                                   # view dropped
@@ -374,7 +374,7 @@ def test_read_and_merge_ct_returns_affected_rows_and_drops_view(monkeypatch):
 
 
 def test_read_and_merge_ct_unique_view_per_call(monkeypatch):
-    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q: _DF(sp, q))
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
     spark = _MergeSpark(result=_Row(num_affected_rows=0))
     ce.read_and_merge_ct(spark, _MERGE_CFG, "c.s.t", 5)
     ce.read_and_merge_ct(spark, _MERGE_CFG, "c.s.t", 5)
@@ -384,7 +384,7 @@ def test_read_and_merge_ct_unique_view_per_call(monkeypatch):
 
 def test_read_and_merge_ct_drops_view_even_when_merge_fails(monkeypatch):
     import pytest
-    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q: _DF(sp, q))
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
     spark = _MergeSpark(fail=True)
     with pytest.raises(RuntimeError, match="merge failed"):
         ce.read_and_merge_ct(spark, _MERGE_CFG, "c.s.t", 5)
@@ -392,7 +392,7 @@ def test_read_and_merge_ct_drops_view_even_when_merge_fails(monkeypatch):
 
 
 def test_read_and_merge_ct_unknown_rows_without_metrics(monkeypatch):
-    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q: _DF(sp, q))
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
     assert ce.read_and_merge_ct(_MergeSpark(result=_Row()), _MERGE_CFG, "c.s.t", 5) is None
 
 
@@ -402,7 +402,7 @@ def test_partitioned_seed_guard_failure_leaves_target_untouched(monkeypatch):
     import pytest
     from concurrent.futures import ThreadPoolExecutor
     import parallel
-    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q: _DF(sp, q))
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
     cfg = {"id": 1, "src_schema": "dbo", "src_table": "big", "select_list": "id, v",
            "load_partitioned": True, "partition_col": "id", "partition_size_mb": 1}
     spark = _FakeSpark()
@@ -417,7 +417,7 @@ def test_partitioned_seed_guard_failure_leaves_target_untouched(monkeypatch):
 
 
 def test_ensure_sink_table_enables_type_widening_on_new_sinks(monkeypatch):
-    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q: _DF(sp, q))
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
     spark = _FakeSpark()
     spark.catalog.tableExists = lambda name: False                 # sink does not exist yet
     ce.ensure_sink_table(spark, {"src_schema": "dbo", "src_table": "t", "select_list": "id, v"}, "c.s.t")
@@ -483,3 +483,38 @@ def test_detect_changes_chunk_failure_falls_back_for_that_chunk_only(monkeypatch
     assert queries == 2
     assert res == {1: (1, 1), 2: (1, 0)}
     assert sorted(failed) == [3, 4]
+
+
+# ---- review fixes: strict current_version; read-time retention guard ------------------------------
+
+def test_current_version_none_when_ct_disabled(monkeypatch):
+    class _Null:
+        def first(self):
+            return {"v": None}
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _Null())
+    monkeypatch.setattr(ce, "_spark", lambda: None)
+    assert ce.current_version({"src_database": "d"}) is None
+
+
+def test_retention_guard_sql_raises_with_marker():
+    sql = ce.ct_retention_guard_sql({"src_schema": "dbo", "src_table": "o'k]t"}, 42)
+    assert sql.startswith("IF CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(N'[dbo].[o''k]]t]'))")
+    assert "IS NULL OR" in sql and "> 42" in sql
+    assert "THROW 51000" in sql and ce.RETENTION_LAPSED_MARKER in sql
+
+
+def test_is_retention_lapsed_error():
+    assert ce.is_retention_lapsed_error(RuntimeError(f"SQLServerException: {ce.RETENTION_LAPSED_MARKER}: ..."))
+    assert not ce.is_retention_lapsed_error(RuntimeError("connection reset"))
+
+
+def test_ct_read_carries_the_retention_guard(monkeypatch):
+    seen = {}
+
+    def fake_read(sp, cfg, q, **kw):
+        seen.update(kw)
+        return _DF(sp, q)
+    monkeypatch.setattr(ce, "_read", fake_read)
+    spark = _MergeSpark(result=_Row(num_affected_rows=0))
+    ce.read_and_merge_ct(spark, _MERGE_CFG, "c.s.t", 5)
+    assert ce.RETENTION_LAPSED_MARKER in seen.get("session_init", "") and "> 5" in seen["session_init"]

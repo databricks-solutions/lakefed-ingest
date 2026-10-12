@@ -72,13 +72,28 @@ def detect_group(members, current_version: Callable, detect: Callable, record_sl
            "cur": None, "plans": [], "unchanged": [], "failed": [], "queries": 0,
            "fast_exit": False, "fallback": 0}
     try:
-        cur = int(current_version(cfg0))
+        cur = current_version(cfg0)
         out["queries"] += 1
     except Exception as e:  # database unreachable / auth: isolate THIS group, never the sweep
         err = f"change detection: CHANGE_TRACKING_CURRENT_VERSION failed: {str(e).splitlines()[0][:400] if str(e) else e!r}"
         out["failed"] = [(c, cp, err) for c, cp in members]
         return out
+    if cur is None:  # CT disabled on the database: fail loudly (a 0 would look "unchanged" forever)
+        out["failed"] = [(c, cp, f"change detection: {ct_engine.CT_NOT_ENABLED_MSG}") for c, cp in members]
+        return out
+    cur = int(cur)
     out["cur"] = cur
+
+    # A checkpoint AHEAD of the database's current version means CT versions were reset (restore
+    # from backup, CT disabled and re-enabled): changes since can't be read from the checkpoint.
+    reset = [(c, cp) for c, cp in members if cp["ct_version"] is not None and int(cp["ct_version"]) > cur]
+    for c, cp in reset:
+        out["plans"].append({"cfg": c, "route": "retention_reseed", "cp": cp, "reason": "ct_version_reset"})
+    if reset:
+        reset_ids = {int(c["id"]) for c, _ in reset}
+        members = [(c, cp) for c, cp in members if int(c["id"]) not in reset_ids]
+        if not members:
+            return out
 
     def unchanged_row(c):
         cid = int(c["id"])

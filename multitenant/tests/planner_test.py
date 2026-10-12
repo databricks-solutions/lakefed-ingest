@@ -105,3 +105,31 @@ def test_reseed_classification_and_legacy_select_list_recording():
                                record_sl={2})
     assert [p["route"] for p in out["plans"]] == ["retention_reseed"]
     assert out["unchanged"] == [(2, 150, "id, v")]
+
+
+# ---- review fixes: CT disabled at the database; CT versions reset ---------------------------------
+
+def test_ct_disabled_database_fails_loudly_never_unchanged():
+    # A NULL CHANGE_TRACKING_CURRENT_VERSION() must NOT look like version 0 ("everything current").
+    g1, _ = _two_groups()
+    called = []
+    out = planner.detect_group(g1, lambda c: None, lambda c, i: called.append(1))
+    assert out["unchanged"] == [] and out["plans"] == []
+    assert len(out["failed"]) == 2 and all("not enabled" in err for _, _, err in out["failed"])
+    assert called == []                       # no detection attempted
+
+
+def test_version_reset_routes_ahead_checkpoints_to_reseed():
+    # checkpoint 100 > current version 40 => CT versions were reset: reseed, never "unchanged".
+    g = [(_cfg(1, "d1", "a"), _cp(100)), (_cfg(2, "d1", "b"), _cp(30))]
+    out = planner.detect_group(g, lambda c: 40, lambda c, i: ({2: (0, 0)}, [], 1))
+    reseeds = [p for p in out["plans"] if p["route"] == "retention_reseed"]
+    assert [p["cfg"]["id"] for p in reseeds] == [1] and reseeds[0]["reason"] == "ct_version_reset"
+    assert [u[0] for u in out["unchanged"]] == [2]          # the other table still classified normally
+
+
+def test_all_checkpoints_reset_skips_detection():
+    g = [(_cfg(1, "d1", "a"), _cp(100))]
+    called = []
+    out = planner.detect_group(g, lambda c: 5, lambda c, i: called.append(1))
+    assert [p["reason"] for p in out["plans"]] == ["ct_version_reset"] and called == []

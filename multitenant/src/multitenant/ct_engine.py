@@ -229,7 +229,7 @@ def _spark():
     return SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
 
 
-def _read(spark, cfg: dict, query: str):
+def _read(spark, cfg: dict, query: str, session_init: Optional[str] = None):
     """Run a T-SQL query against the source via Spark JDBC; returns a natively-typed DataFrame.
     Lazy — the source is only queried when the DataFrame is consumed (once, by the write/MERGE)."""
     conf = _jdbc_config(cfg)
@@ -241,6 +241,7 @@ def _read(spark, cfg: dict, query: str):
         .option("user", conf["user"])
         .option("password", conf["password"])
         .option("driver", _JDBC_DRIVER)
+        .options(**({"sessionInitStatement": session_init} if session_init else {}))
         .load()
     )
 
@@ -258,12 +259,18 @@ def staging_table_name(sink_fqn: str) -> str:
 # ======================================================================================
 # A/B/F functions the sweep calls.
 # ======================================================================================
-def current_version(cfg: dict, slots=None) -> int:
-    """(B) Database-wide CHANGE_TRACKING_CURRENT_VERSION(). 0 if CT not enabled on the DB."""
+CT_NOT_ENABLED_MSG = ("Change Tracking is not enabled on this source database "
+                      "(CHANGE_TRACKING_CURRENT_VERSION() is NULL)")
+
+
+def current_version(cfg: dict, slots=None) -> Optional[int]:
+    """(B) Database-wide CHANGE_TRACKING_CURRENT_VERSION(), or None when Change Tracking is not
+    enabled on the database. Callers must treat None as an error, never as version 0 (a 0 would
+    make every checkpoint look current and silently skip the database forever)."""
     with _unit(slots):
         row = _read(_spark(), cfg,
                     "SELECT CAST(CHANGE_TRACKING_CURRENT_VERSION() AS BIGINT) AS v").first()
-    return int(row["v"]) if row and row["v"] is not None else 0
+    return int(row["v"]) if row and row["v"] is not None else None
 
 
 def min_valid_version(cfg: dict, slots=None) -> Optional[int]:
@@ -341,6 +348,28 @@ def quote_ident(name: str) -> str:
 def quote_nstr(value: str) -> str:
     """SQL Server N'...' unicode string literal (``'`` doubled)."""
     return "N'" + str(value).replace("'", "''") + "'"
+
+
+RETENTION_LAPSED_MARKER = "CT_RETENTION_LAPSED"
+
+
+def ct_retention_guard_sql(cfg: dict, from_version: int) -> str:
+    """T-SQL run on the CHANGETABLE read's own connection immediately before the read (Spark JDBC
+    ``sessionInitStatement``). Planning checked retention earlier, but CT auto-cleanup can raise the
+    table's minimum valid version during a long sweep; reading CHANGES from a version below it
+    would silently miss changes. The guard makes SQL Server raise instead, and the sweep turns that
+    error into a reseed. (A check inside the SELECT itself isn't reliable: SQL Server may skip
+    evaluating it when the change set is empty — exactly the lapsed-retention case.)"""
+    obj = quote_nstr(f"{quote_ident(cfg['src_schema'])}.{quote_ident(cfg['src_table'])}")
+    mv = f"CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID({obj}))"
+    return (f"IF {mv} IS NULL OR {mv} > {int(from_version)} "
+            f"THROW 51000, N'{RETENTION_LAPSED_MARKER}: change tracking retention has passed the "
+            f"checkpoint (or CT is disabled on the table); reseed required', 1;")
+
+
+def is_retention_lapsed_error(exc: BaseException) -> bool:
+    """True when a CT read failed because the retention guard fired (route the table to reseed)."""
+    return RETENTION_LAPSED_MARKER in str(exc)
 
 
 def source_group_key(cfg: dict) -> tuple:
@@ -574,7 +603,8 @@ def read_and_merge_ct(spark, cfg: dict, sink_fqn: str, from_version: int,
     one SparkSession, and temp views are session-scoped, so a shared name would let threads
     overwrite each other's change sets."""
     with _unit(slots):                             # read -> MERGE is ONE unit of work
-        df = _read(spark, cfg, ct_read_query(cfg, from_version))
+        df = _read(spark, cfg, ct_read_query(cfg, from_version),
+                   session_init=ct_retention_guard_sql(cfg, from_version))
         view = f"ct_staged_{uuid.uuid4().hex}"
         df.createOrReplaceTempView(view)
         try:
