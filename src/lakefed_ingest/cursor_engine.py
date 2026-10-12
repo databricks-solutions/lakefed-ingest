@@ -138,7 +138,7 @@ def read_where(cfg: dict, typ: str, lo: Optional[str], hi: str) -> str:
 
 
 def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
-    """Idempotent upsert MERGE by PK — (client_id, PK) for a consolidated sink — with schema
+    """Idempotent upsert MERGE by PK — (__client_id__, PK) for a consolidated sink — with schema
     evolution. A watermark read carries no deletes."""
     sl, keys = ", ".join(ct_engine.write_columns(cfg)), ", ".join(ct_engine.merge_keys(cfg))
     return (

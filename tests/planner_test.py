@@ -317,9 +317,11 @@ def test_mixed_sink_rows_fail_at_plan_others_proceed():
 
 
 def test_consolidated_row_must_not_select_client_id_and_must_be_valid():
-    bad_sl = _sink(_cfg(1, "d1", "a", sl="id, Client_ID, v"), client="c1")
+    bad_sl = _sink(_cfg(1, "d1", "a", sl="id, __Client_ID__, v"), client="c1")
     bad_id = _sink(_cfg(2, "d1", "b"), client="c 1; drop")
     ok = _sink(_cfg(3, "d1", "c", sl="id, client_id, v"))         # dedicated: a native client_id is fine
-    plans, _, _ = planner.route_tables([bad_sl, bad_id, ok], {})
+    ok_cons = _sink(_cfg(4, "d1", "d", sl="id, client_id, v"), client="c1")   # ...and when consolidated
+    plans, _, _ = planner.route_tables([bad_sl, bad_id, ok, ok_cons], {})
     errs = {p["cfg"]["id"]: p.get("error") for p in plans}
-    assert "remove it from select_list" in errs[1] and "invalid client_id" in errs[2] and errs[3] is None
+    assert "remove it from select_list" in errs[1] and "invalid client_id" in errs[2]
+    assert errs[3] is None and errs[4] is None

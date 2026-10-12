@@ -189,22 +189,25 @@ By default each control row owns its sink table — typically one schema per sou
 avoid one table per client per source table, set `control.client_id` and point the rows of many
 source databases at the **same** sink (e.g. every client's `dbo.orders` → `main.bronze.orders`):
 
-- Every row written carries a `client_id` column; the sink is created with liquid clustering on it.
-- MERGEs match on (`client_id`, PK), so clients with the same key values never touch each other's
+- Every row written carries the row's `client_id` value in the column `__client_id__` (a
+  reserved-looking name, so it can't clash with a real source column such as `client_id`); the sink
+  is created with liquid clustering on it. To query it as `client_id`, use a view
+  (`SELECT __client_id__ AS client_id, ...`).
+- MERGEs match on (`__client_id__`, PK), so clients with the same key values never touch each other's
   rows, and a CT delete removes only that client's row.
 - Seeds and full reloads replace only that client's rows
-  (`INSERT WITH SCHEMA EVOLUTION INTO <sink> BY NAME REPLACE WHERE client_id = '<id>' ...`). A
+  (`INSERT WITH SCHEMA EVOLUTION INTO <sink> BY NAME REPLACE WHERE __client_id__ = '<id>' ...`). A
   partitioned seed stages in a per-client table, so clients can seed the same sink at once.
 - Schema drift between clients is absorbed by schema evolution: a column one client has and
   another lacks is added to the sink and is NULL for the others.
 - Checkpoints stay per control row, so each client's CT version / watermark is independent.
 - `client_id` is per row, so consolidated and dedicated sinks can coexist (for different sink
-  tables). It must match `^[A-Za-z0-9_.:-]{1,128}$` and `client_id` must not be in `select_list`.
+  tables). It must match `^[A-Za-z0-9_.:-]{1,128}$`, and `__client_id__` must not be in `select_list`.
 
 **Guards.** A unique index allows one row per (sink, `client_id`) — one row per dedicated sink.
 A sink claimed by a dedicated row *and* consolidated rows fails those rows at stage `plan`, and a
 write into an existing sink whose mode doesn't match (a dedicated row into a table with a
-`client_id` column, or the reverse) fails that table — so no row can overwrite another's data.
+`__client_id__` column, or the reverse) fails that table — so no row can overwrite another's data.
 
 **Write conflicts.** Clients (or jobs) writing the same sink at once can hit Delta concurrency
 conflicts. A conflict retries the whole unit (re-read + write) with exponential backoff and full

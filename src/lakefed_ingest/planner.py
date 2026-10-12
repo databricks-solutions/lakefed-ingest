@@ -62,7 +62,7 @@ def sink_key(cfg: dict) -> tuple:
 def config_error(cfg: dict, mixed_sinks=frozenset()) -> Optional[str]:
     """Sink-ownership problems that would let one row overwrite another's data — checked per table
     before any work: an invalid client_id, a consolidated row whose select_list already has a
-    client_id column, or a sink shared by a dedicated row and consolidated rows."""
+    __client_id__ column, or a sink shared by a dedicated row and consolidated rows."""
     try:
         cid = ct_engine.client_id(cfg)
     except ValueError as e:

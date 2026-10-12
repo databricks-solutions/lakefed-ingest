@@ -273,12 +273,13 @@ def staging_table_name(sink_fqn: str, cfg: Optional[dict] = None) -> str:
 
 # ======================================================================================
 # Consolidated sinks (optional, per control row): many source databases -> one sink table.
-# A row with ``control.client_id`` set writes into a shared sink: every row it writes carries
-# ``client_id``; MERGEs match on (client_id, PK); seeds and full reloads replace only that client's
-# rows (``INSERT ... BY NAME REPLACE WHERE client_id = ...``). Rows with client_id NULL own their
+# A row with ``control.client_id`` set writes into a shared sink: every row it writes carries the
+# value in column ``__client_id__`` (CLIENT_COLUMN — a reserved-looking name so it can't clash with
+# a real source column such as ``client_id``); MERGEs match on (__client_id__, PK); seeds and full
+# reloads replace only that client's rows (``INSERT ... BY NAME REPLACE WHERE __client_id__ = ...``). Rows with client_id NULL own their
 # sink outright (the default). Mixing the two on one sink is rejected (planner + ensure_sink_table).
 # ======================================================================================
-CLIENT_COLUMN = "client_id"
+CLIENT_COLUMN = "__client_id__"
 _CLIENT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")   # same rule as the control CHECK constraint
 
 
@@ -294,13 +295,13 @@ def client_id(cfg: dict) -> Optional[str]:
 
 
 def write_columns(cfg: dict) -> List[str]:
-    """Columns written to the sink: select_list, plus client_id for a consolidated sink."""
+    """Columns written to the sink: select_list, plus __client_id__ for a consolidated sink."""
     cols = _split(cfg["select_list"])
     return cols + [CLIENT_COLUMN] if client_id(cfg) else cols
 
 
 def merge_keys(cfg: dict) -> List[str]:
-    """MERGE match keys: (client_id, PK) for a consolidated sink, else the PK."""
+    """MERGE match keys: (__client_id__, PK) for a consolidated sink, else the PK."""
     pk = _split(cfg["primary_key"])
     return [CLIENT_COLUMN] + pk if client_id(cfg) else pk
 
@@ -313,7 +314,7 @@ def client_predicate(cfg: dict) -> str:
 def _tag(df, cfg: dict):
     """Prepend the client_id literal to a source DataFrame (no-op for a dedicated sink). FIRST, so
     a new sink has it within Delta's stats columns (first 32 by default) — liquid clustering on
-    client_id requires stats; wide tables would otherwise fail to cluster."""
+    __client_id__ requires stats; wide tables would otherwise fail to cluster."""
     cid = client_id(cfg)
     if cid is None:
         return df
@@ -335,7 +336,7 @@ def merge_on_cfg(cfg: dict) -> str:
 
 def create_sink_sql(sink_fqn: str, view: str, cfg: dict) -> str:
     """ONE atomic statement creating the sink from a 0-row view: type widening on, and — consolidated
-    sink — liquid clustering on client_id. A single CTAS means a sink can never exist half-configured
+    sink — liquid clustering on __client_id__. A single CTAS means a sink can never exist half-configured
     (two clients racing to create it: one wins, the other sees it exists)."""
     cluster = f"CLUSTER BY (`{CLIENT_COLUMN}`) " if client_id(cfg) else ""
     # Type widening lets schema-evolving writes apply safe widenings (int->bigint, float->double,
@@ -471,11 +472,11 @@ SINK_MODE_MISMATCH_MSG = (
 
 def check_sink_mode(cfg: dict, sink_fqn: str, sink_columns: List[str]) -> None:
     """Refuse to write a dedicated row into a consolidated sink (its overwrite/MERGE would hit every
-    client's rows) or a consolidated row into a dedicated sink (rows without client_id)."""
+    client's rows) or a consolidated row into a dedicated sink (rows without __client_id__)."""
     has = CLIENT_COLUMN in {c.lower() for c in sink_columns}
     cid = client_id(cfg)
     native = CLIENT_COLUMN in {c.lower() for c in _split(cfg.get("select_list"))}
-    if has and cid is None and not native:     # a dedicated table may have its own client_id column
+    if has and cid is None and not native:     # a dedicated table may have its own such column
         raise ValueError(SINK_MODE_MISMATCH_MSG.format(sink=sink_fqn, has="has a", col=CLIENT_COLUMN,
                                                        is_="is not", cid="NULL"))
     if not has and cid is not None:
@@ -488,7 +489,7 @@ def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
     JDBC dialect infers the Spark schema natively), then check the sink's mode (dedicated vs
     consolidated) matches the row. Idempotent. The 0-row read is one unit.
 
-    A consolidated sink is created with a ``client_id`` column and liquid clustering on it, so
+    A consolidated sink is created with the ``__client_id__`` column and liquid clustering on it, so
     each client's slice is cheap to find and concurrent clients' writes touch separate files."""
     if not spark.catalog.tableExists(sink_fqn):
         def create():
@@ -525,7 +526,7 @@ def insert_sql(mode: str, target: str, cols: List[str], source: str, evolve: boo
 def insert_overwrite_sql(sink_fqn: str, cols: List[str], source: str, cfg: Optional[dict] = None) -> str:
     """Data-only atomic replace with schema evolution: the whole target, or — consolidated sink —
     only this client's rows (``INSERT WITH SCHEMA EVOLUTION INTO <sink> BY NAME REPLACE WHERE
-    client_id = '<id>' SELECT ...``; validated on DBR: other clients untouched, BY NAME mapping,
+    __client_id__ = '<id>' SELECT ...``; validated on DBR: other clients untouched, BY NAME mapping,
     new columns added. BY NAME must precede REPLACE WHERE)."""
     if cfg is not None and client_id(cfg):
         collist = ", ".join(f"`{c}`" for c in cols)
@@ -677,8 +678,8 @@ def seed(spark, cfg: dict, sink_fqn: str, slots=None, executor=None, guard=None)
       then swap into the target atomically — see ``_partitioned_seed``.
     No ``.cache()``/``count()``: every source range is read exactly once.
 
-    Consolidated bronze (future, spike-validated): the overwrite becomes ``INSERT WITH SCHEMA
-    EVOLUTION INTO sink REPLACE WHERE client_id = ...`` so only this tenant's slice is replaced."""
+    Consolidated sink (``client_id`` set): the overwrite is ``INSERT WITH SCHEMA EVOLUTION INTO sink
+    BY NAME REPLACE WHERE __client_id__ = ...``, so only this client's rows are replaced."""
     if _is_partitioned(cfg):
         return _partitioned_seed(spark, cfg, sink_fqn, slots, executor, guard)
 
@@ -710,7 +711,7 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
        replaces the staging table and starts over;
     6. on success, swap as one unit: overwrite the target from staging in ONE atomic Delta commit
        (same table — grants, row filters and lineage are preserved; never rename tables), then drop
-       staging. A consolidated sink replaces only this client's rows (``REPLACE WHERE client_id``)
+       staging. A consolidated sink replaces only this client's rows (``REPLACE WHERE __client_id__``)
        and stages in a per-client table.
     Returns rows in the target after the swap."""
     from concurrent.futures import ThreadPoolExecutor, as_completed, wait

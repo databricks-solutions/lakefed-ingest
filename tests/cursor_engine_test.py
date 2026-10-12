@@ -171,8 +171,8 @@ def test_read_and_merge_without_metrics_returns_none(monkeypatch):
 
 def test_consolidated_cursor_merge_matches_on_client_and_pk():
     sql = cur.upsert_merge_sql(dict(CFG, client_id="t1"), "c.s.orders", "v")
-    assert "ON tgt.`client_id` = s.`client_id` AND tgt.`id` = s.`id` " in sql
-    assert "INSERT (`id`, `amount`, `updated_at`, `client_id`)" in sql
+    assert "ON tgt.`__client_id__` = s.`__client_id__` AND tgt.`id` = s.`id` " in sql
+    assert "INSERT (`id`, `amount`, `updated_at`, `__client_id__`)" in sql
 
 
 def test_read_and_merge_retries_whole_unit_on_conflict(monkeypatch):
@@ -193,5 +193,5 @@ def test_consolidated_cursor_read_is_tagged_and_merged_on_client(monkeypatch):
         return real_sql(stmt)
     spark.sql = sql
     _merge(monkeypatch, spark, cfg=dict(CFG, client_id="t1"))
-    assert seen["tagged"] == ("lit(t1) AS client_id", "id", "amount", "updated_at")
-    assert "AND tgt.`client_id` = 't1' " in spark.statements[0]
+    assert seen["tagged"] == ("lit(t1) AS __client_id__", "id", "amount", "updated_at")
+    assert "AND tgt.`__client_id__` = 't1' " in spark.statements[0]

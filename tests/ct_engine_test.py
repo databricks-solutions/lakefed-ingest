@@ -668,24 +668,24 @@ def test_client_id_validation():
 
 
 def test_consolidated_columns_and_keys():
-    assert ce.write_columns(_CONS) == ["id", "v", "client_id"]
-    assert ce.merge_keys(_CONS) == ["client_id", "id"]
+    assert ce.write_columns(_CONS) == ["id", "v", "__client_id__"]
+    assert ce.merge_keys(_CONS) == ["__client_id__", "id"]
     ded = dict(_CONS, client_id=None)
     assert ce.write_columns(ded) == ["id", "v"] and ce.merge_keys(ded) == ["id"]
 
 
 def test_consolidated_ct_merge_matches_on_client_and_pk():
     sql = ce.merge_sql(_CONS, "c.s.t", "v")
-    assert "ON tgt.`client_id` = s.`client_id` AND tgt.`id` = s.`id` " in sql
+    assert "ON tgt.`__client_id__` = s.`__client_id__` AND tgt.`id` = s.`id` " in sql
     assert "UPDATE SET `v` = s.`v` " in sql                         # never rewrites the keys
-    assert "INSERT (`id`, `v`, `client_id`) VALUES (s.`id`, s.`v`, s.`client_id`)" in sql
+    assert "INSERT (`id`, `v`, `__client_id__`) VALUES (s.`id`, s.`v`, s.`__client_id__`)" in sql
     assert "WHEN MATCHED AND s.op = 'D' THEN DELETE" in sql           # scoped by the ON keys
 
 
 def test_consolidated_overwrite_replaces_only_this_client():
     sql = ce.insert_overwrite_sql("c.s.t", ce.write_columns(_CONS), "src", _CONS)
-    assert sql == ("INSERT WITH SCHEMA EVOLUTION INTO c.s.t BY NAME REPLACE WHERE `client_id` = 'tenant-001' "
-                   "SELECT `id`, `v`, `client_id` FROM src")
+    assert sql == ("INSERT WITH SCHEMA EVOLUTION INTO c.s.t BY NAME REPLACE WHERE `__client_id__` = 'tenant-001' "
+                   "SELECT `id`, `v`, `__client_id__` FROM src")
     assert ce.insert_overwrite_sql("c.s.t", ["id"], "src", dict(_CONS, client_id=None)).startswith(
         "INSERT WITH SCHEMA EVOLUTION OVERWRITE c.s.t BY NAME")
 
@@ -698,11 +698,11 @@ def test_staging_table_is_per_client():
 
 
 def test_sink_mode_mismatch_is_refused():
-    ce.check_sink_mode(_CONS, "c.s.t", ["id", "v", "client_id"])
+    ce.check_sink_mode(_CONS, "c.s.t", ["id", "v", "__client_id__"])
     ce.check_sink_mode(dict(_CONS, client_id=None), "c.s.t", ["id", "v"])
-    with pytest.raises(ValueError, match="has a 'client_id' column but this control row is not consolidated"):
-        ce.check_sink_mode(dict(_CONS, client_id=None), "c.s.t", ["id", "Client_Id"])
-    with pytest.raises(ValueError, match="has no 'client_id' column but this control row is consolidated"):
+    with pytest.raises(ValueError, match="has a '__client_id__' column but this control row is not consolidated"):
+        ce.check_sink_mode(dict(_CONS, client_id=None), "c.s.t", ["id", "__CLIENT_ID__"])
+    with pytest.raises(ValueError, match="has no '__client_id__' column but this control row is consolidated"):
         ce.check_sink_mode(_CONS, "c.s.t", ["id", "v"])
 
 
@@ -746,7 +746,7 @@ def test_backoff_is_capped_full_jitter():
 
 def test_sink_created_in_one_statement_clustered_by_client():
     assert ce.create_sink_sql("c.s.t", "v", _CONS) == (
-        "CREATE TABLE IF NOT EXISTS c.s.t CLUSTER BY (`client_id`) "
+        "CREATE TABLE IF NOT EXISTS c.s.t CLUSTER BY (`__client_id__`) "
         "TBLPROPERTIES ('delta.enableTypeWidening' = 'true') AS SELECT * FROM v")
     assert ce.create_sink_sql("c.s.t", "v", dict(_CONS, client_id=None)) == (
         "CREATE TABLE IF NOT EXISTS c.s.t TBLPROPERTIES ('delta.enableTypeWidening' = 'true') AS SELECT * FROM v")
@@ -754,9 +754,9 @@ def test_sink_created_in_one_statement_clustered_by_client():
 
 def test_consolidated_merge_has_literal_client_predicate():
     sql = ce.merge_sql(_CONS, "c.s.t", "v")
-    assert ("ON tgt.`client_id` = s.`client_id` AND tgt.`id` = s.`id` AND tgt.`client_id` = 'tenant-001' "
+    assert ("ON tgt.`__client_id__` = s.`__client_id__` AND tgt.`id` = s.`id` AND tgt.`__client_id__` = 'tenant-001' "
             in sql)
-    assert "AND tgt.`client_id` = '" not in ce.merge_sql(dict(_CONS, client_id=None), "c.s.t", "v")
+    assert "AND tgt.`__client_id__` = '" not in ce.merge_sql(dict(_CONS, client_id=None), "c.s.t", "v")
 
 
 def test_tag_prepends_client_id_literal_first(monkeypatch):
@@ -766,7 +766,7 @@ def test_tag_prepends_client_id_literal_first(monkeypatch):
     assert ce._tag(df, dict(_CONS, client_id=None)) is df and spark.tagged == []
     ce._tag(df, _CONS)
     (cols,) = spark.tagged
-    assert isinstance(cols[0], _FakeLit) and cols[0].value == "tenant-001" and cols[0].name == "client_id"
+    assert isinstance(cols[0], _FakeLit) and cols[0].value == "tenant-001" and cols[0].name == "__client_id__"
     assert list(cols[1:]) == ["id", "v"]                  # original columns follow, in order
 
 
@@ -777,8 +777,8 @@ def test_dedicated_sink_may_have_a_native_client_id_column():
 def test_ensure_sink_table_refuses_mode_mismatch(monkeypatch):
     spark = _FakeSpark()
     spark.catalog.tableExists = lambda name: True
-    monkeypatch.setattr(_Table, "columns", ["id", "v", "client_id"])
-    with pytest.raises(ValueError, match="has a 'client_id' column"):
+    monkeypatch.setattr(_Table, "columns", ["id", "v", "__client_id__"])
+    with pytest.raises(ValueError, match="has a '__client_id__' column"):
         ce.ensure_sink_table(spark, dict(_CONS, client_id=None), "c.s.t")
     assert not any(x.startswith("CREATE") for x in spark.statements)
 
@@ -786,17 +786,17 @@ def test_ensure_sink_table_refuses_mode_mismatch(monkeypatch):
 def test_ensure_sink_table_consolidated_creates_clustered_in_one_statement(monkeypatch):
     monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
     monkeypatch.setattr(ce, "_lit", _FakeLit)
-    monkeypatch.setattr(_Table, "columns", ["client_id", "id", "v"])
+    monkeypatch.setattr(_Table, "columns", ["__client_id__", "id", "v"])
     spark = _FakeSpark()
     spark.catalog.tableExists = lambda name: False
     ce.ensure_sink_table(spark, _CONS, "c.s.t")
     creates = [x for x in spark.statements if x.startswith("CREATE TABLE")]
-    assert len(creates) == 1 and "CLUSTER BY (`client_id`)" in creates[0] and len(spark.tagged) == 1
+    assert len(creates) == 1 and "CLUSTER BY (`__client_id__`)" in creates[0] and len(spark.tagged) == 1
 
 
 def test_ensure_sink_table_skips_create_when_another_client_created_it(monkeypatch):
     monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
-    monkeypatch.setattr(_Table, "columns", ["client_id", "id", "v"])
+    monkeypatch.setattr(_Table, "columns", ["__client_id__", "id", "v"])
     spark = _FakeSpark()
     answers = iter([False, True])                         # outer check: missing; inner re-check: exists
     spark.catalog.tableExists = lambda name: next(answers)
@@ -809,8 +809,8 @@ def test_consolidated_seed_replaces_only_this_client(monkeypatch):
     _seed(monkeypatch, spark, load_partitioned=False, client_id="tenant-001")
     writes = [x for x in spark.statements if x.startswith("INSERT")]
     assert len(writes) == 1 and writes[0].startswith(
-        "INSERT WITH SCHEMA EVOLUTION INTO c.s.big BY NAME REPLACE WHERE `client_id` = 'tenant-001' "
-        "SELECT `id`, `v`, `client_id` FROM seed_full_")
+        "INSERT WITH SCHEMA EVOLUTION INTO c.s.big BY NAME REPLACE WHERE `__client_id__` = 'tenant-001' "
+        "SELECT `id`, `v`, `__client_id__` FROM seed_full_")
     assert len(spark.tagged) == 1                         # the source read was tagged
 
 
@@ -820,10 +820,10 @@ def test_consolidated_partitioned_seed_uses_per_client_staging(monkeypatch):
     staging = ce.staging_table_name("c.s.big", {"client_id": "tenant-001"})
     assert f"SAVE {staging}" in spark.statements
     parts = [x for x in spark.statements if x.startswith(f"INSERT INTO {staging} ")]
-    assert parts and all("`client_id`" in x for x in parts)
+    assert parts and all("`__client_id__`" in x for x in parts)
     swaps = [x for x in spark.statements if "c.s.big BY NAME REPLACE WHERE" in x]
-    assert swaps == [f"INSERT WITH SCHEMA EVOLUTION INTO c.s.big BY NAME REPLACE WHERE `client_id` = 'tenant-001' "
-                     f"SELECT `id`, `v`, `client_id` FROM {staging}"]
+    assert swaps == [f"INSERT WITH SCHEMA EVOLUTION INTO c.s.big BY NAME REPLACE WHERE `__client_id__` = 'tenant-001' "
+                     f"SELECT `id`, `v`, `__client_id__` FROM {staging}"]
     assert not any(x.startswith("INSERT WITH SCHEMA EVOLUTION OVERWRITE c.s.big") for x in spark.statements)
     assert f"DROP TABLE IF EXISTS {staging}" in spark.statements
     assert len(spark.tagged) == 1 + len(parts)            # staging schema + every partition read
