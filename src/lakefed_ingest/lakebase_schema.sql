@@ -9,7 +9,8 @@
 -- Naming: `control` is the framework config table. `control.src_type` selects the SOURCE ADAPTER
 -- (source_adapters.py) and `control.load_type` the LOAD STRATEGY (load_strategies.py). `checkpoint`
 -- is generic: `strategy` names the strategy that wrote it and `position` is that strategy's opaque
--- resume position (CT: the database CT version as text). `reseed_queue` is used by the CT strategy.
+-- resume position (CT: the database CT version as text; cursor: JSON {col, type, value}). `reseed_queue`
+-- is used by the CT and cursor strategies.
 --
 -- Idempotent: re-applying this file (lakefed_ingest_setup) migrates an existing instance in
 -- place (add-column-if-not-exists / drop-and-re-add constraints / non-destructive backfills).

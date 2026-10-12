@@ -144,7 +144,7 @@ def test_route_tables_mixed_strategies_and_sources():
         dict(_cfg(2, "d1", "b"), load_type="full"),                            # sqlserver full
         dict(_cfg(3, "svc", "EMP"), src_type="oracle", load_type="full"),     # oracle full
         dict(_cfg(4, "d1", "c"), src_type="postgresql", load_type="ct"),      # ct on postgres: no
-        dict(_cfg(5, "d1", "d"), src_type="mysql", load_type="cursor"),       # placeholder
+        dict(_cfg(5, "d1", "d"), src_type="mysql", load_type="cursor"),       # placeholder (mysql)
         dict(_cfg(6, "d1", "e"), load_type="cdc"),                             # placeholder
         dict(_cfg(7, "d1", "f"), src_type="db2", load_type="full"),            # unknown adapter
         _cfg(8, "d1", "g"),                                                   # ct, cdc phase
@@ -176,6 +176,42 @@ def test_ct_checkpoint_from_another_strategy_reseeds():
     # a cdc-phase row whose recorded strategy is not ct also seeds
     plans, _, _ = planner.route_tables([_cfg(1, "d1", "a")], {1: _cp(5, strategy="cursor")})
     assert [p["route"] for p in plans] == ["seed"]
+
+
+# ---- cursor (high-watermark) routing ---------------------------------------------------------------
+
+def _cur_cfg(cid=1, col="updated_at", sl="id, v"):
+    return dict(_cfg(cid, "d1", "t", sl=sl), load_type="cursor", cursor_column=col, primary_key="id")
+
+
+def _cur_cp(col="updated_at", value="2026-01-01T00:00:00", sl="id, v", phase=ss.CDC, strategy="cursor"):
+    import cursor_engine
+    return {"position": cursor_engine.encode_position(col, "datetime2", value), "phase": phase,
+            "status": "ok", "select_list": sl, "strategy": strategy, "ct_begin_version": None}
+
+
+def test_cursor_routes_seed_then_increment_never_ct_detection():
+    plans, candidates, legacy = planner.route_tables([_cur_cfg()], {})
+    assert [p["route"] for p in plans] == ["cursor_seed"] and candidates == [] and legacy == []
+    plans, candidates, _ = planner.route_tables([_cur_cfg()], {1: _cur_cp()})
+    assert [p["route"] for p in plans] == ["cursor"] and candidates == []
+    assert plans[0]["position"] == {"col": "updated_at", "type": "datetime2", "value": "2026-01-01T00:00:00"}
+
+
+def test_cursor_reseeds_on_unusable_or_foreign_checkpoint():
+    for cp in (_cur_cp(phase=ss.SEEDING),                        # reseed queued
+               _cur_cp(strategy="ct"),                           # load_type switched
+               dict(_cur_cp(), position="12345"),                # a CT position
+               _cur_cp(col="other_col")):                        # cursor_column changed
+        plans, _, _ = planner.route_tables([_cur_cfg()], {1: cp})
+        assert [p["route"] for p in plans] == ["cursor_seed"], cp
+    plans, _, _ = planner.route_tables([_cur_cfg(col="Updated_At")], {1: _cur_cp()})   # case-insensitive
+    assert [p["route"] for p in plans] == ["cursor"]
+
+
+def test_cursor_select_list_growth_routes_to_schema_reseed():
+    plans, _, _ = planner.route_tables([_cur_cfg(sl="id, v, w")], {1: _cur_cp()})
+    assert [(p["route"], p["added"]) for p in plans] == [("schema_reseed", ["w"])]
 
 
 def test_group_by_source_keys_on_database_and_load_type():

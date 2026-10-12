@@ -7,7 +7,7 @@ Databricks Delta tables. Each is its own Databricks Asset Bundle:
 
 | Version | Location | Bundle | Orchestration / compute / state |
 |---|---|---|---|
-| **Default** | repo root (`databricks.yml`, `resources/`, `src/lakefed_ingest/`, `tests/`) | `lakefed_ingest_v2` | One job task per `task_collection`, in-process threads + FAIR pools on a job cluster; Lakebase (Postgres) state; Spark JDBC; source adapters (SQL Server, Oracle, PostgreSQL, MySQL) + load strategies (SQL Server Change Tracking, full reload) |
+| **Default** | repo root (`databricks.yml`, `resources/`, `src/lakefed_ingest/`, `tests/`) | `lakefed_ingest_v2` | One job task per `task_collection`, in-process threads + FAIR pools on a job cluster; Lakebase (Postgres) state; Spark JDBC; source adapters (SQL Server, Oracle, PostgreSQL, MySQL) + load strategies (SQL Server Change Tracking and watermark cursor, full reload) |
 | **Job orchestration** | `job_orchestration/` | `lakefed_ingest` | Jobs `for_each` tasks; SQL warehouse + notebooks; Delta control table; Lakehouse Federation / `remote_query` |
 
 Never run bundle commands for one version from the other's directory. Local bundle state
@@ -54,10 +54,11 @@ JDBC with per-database credentials (JSON `{user,password}`) from a secret scope 
 - `control` — one row per (source database, table): `task_collection`, `src_type` (source adapter:
   `sqlserver` | `oracle` | `postgresql` | `mysql`), `src_host`/`src_port`, `src_database`, `src_schema`,
   `src_table`, `secret_key`, `primary_key`, `select_list` (explicit columns), sink, `load_type` (load
-  strategy: `ct` | `full`; `cursor` | `cdc` are placeholders), partitioned-seed settings,
+  strategy: `ct` | `full` | `cursor` (SQL Server; placeholder elsewhere); `cdc` is a placeholder), partitioned-seed settings,
   `cursor_column`, `cdc_capture_instance`, `jdbc_options` (JSON). CHECK constraints enforce valid combos.
-- `checkpoint` — generic: `strategy` + `position` (text; CT version for `ct`), phase (`seeding → cdc`
-  for ct, `loaded` for full), status, freshness. `reseed_queue` (ct).
+- `checkpoint` — generic: `strategy` + `position` (text; CT version for `ct`, JSON {col,type,value} for
+  `cursor`), phase (`seeding → cdc` for ct and cursor, `loaded` for full), status, freshness,
+  `ct_begin_version`. `reseed_queue` (ct, cursor).
 - `ingest_run`, `ingest_event` — telemetry (`run_id`, `position_from/to`). The DB is registered in UC
   (default catalog `lakefed_ingest_lakebase`) for DBSQL monitoring.
 - DDL is applied by `apply_lakebase_schema.ipynb`, which splits on `;` — no `DO $$` blocks. Migrations
@@ -75,7 +76,8 @@ JDBC with per-database credentials (JSON `{user,password}`) from a secret scope 
 ### Run flow (`ingest.ipynb`)
 1. Per-collection Lakebase advisory lock (duplicate run exits `skipped`).
 2. Plan (`planner.py`, pure): unsupported (`src_type`, `load_type`) pair → fail per table (stage
-   `plan`); `full` → reload; CT tables → seed / schema_reseed / detection candidate; group by
+   `plan`); `full` → reload; `cursor` → `cursor_seed` / schema_reseed / `cursor` (per-table high
+   watermark, `cursor_engine`); CT tables → seed / schema_reseed / detection candidate; group by
    (source database, load_type); capture CT current version once per DB → fast exit if all checkpoints current,
    else batched detection (`detection_chunk` tables per query); failed chunk → per-table fallback;
    checkpoint ahead of current version → reseed; CT disabled on the DB → fail loudly. Per-table CT
@@ -92,7 +94,8 @@ JDBC with per-database credentials (JSON `{user,password}`) from a secret scope 
 |---|---|
 | `src/lakefed_ingest/ct_engine.py` | Spark JDBC source ops: CT versions, detection, read + MERGE, seed, sink DDL |
 | `src/lakefed_ingest/source_adapters.py` | Per-engine dialect (`src_type`): JDBC URL/driver/options, quoting, literals, select/size/bounds SQL |
-| `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix; cursor/cdc placeholders |
+| `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix (+ placeholder pairs); cdc placeholder |
+| `src/lakefed_ingest/cursor_engine.py` | Cursor (watermark) strategy, SQL Server: type lookup, high watermark (rowversion capped below MIN_ACTIVE_ROWVERSION), typed literals, (lo, hi] read + upsert MERGE |
 | `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning (no Spark/DB; unit-tested with fakes) |
 | `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget |
 | `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |

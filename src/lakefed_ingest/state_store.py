@@ -362,11 +362,11 @@ def finish_run_sql() -> str:
 # horizontal-scale pattern); two sweeps of the SAME collection must not overlap (e.g. a schedule
 # firing while the previous run is still going). A session-level Postgres advisory lock keyed by
 # the collection provides that, and it is released automatically when the holding connection
-# drops — a crashed sweep can never leave a stale lock behind. 64-bit hash => negligible collisions.
-# The namespace is kept stable across upgrades so a new-version run and an old-version run of the
-# same collection still exclude each other.
+# drops — a crashed run can never leave a stale lock behind. 64-bit hash => negligible collisions.
+# Changing the namespace changes every key: don't let a run of an older build (namespace
+# 'lakefed_ingest.sweep:') overlap a run of this one for the same collection during an upgrade.
 # --------------------------------------------------------------------------------------
-LOCK_NAMESPACE = "lakefed_ingest.sweep:"
+LOCK_NAMESPACE = "lakefed_ingest:"
 
 
 def collection_lock_key(task_collection: str) -> str:
@@ -376,7 +376,7 @@ def collection_lock_key(task_collection: str) -> str:
 
 def lock_application_name(task_collection: str, job_run_id: str = "") -> str:
     """Label for the lock connection, visible in pg_stat_activity (Postgres caps it at 63 chars)."""
-    return f"lakefed_ingest_sweep:{task_collection}:{job_run_id}"[:63]
+    return f"lakefed_ingest:{task_collection}:{job_run_id}"[:63]
 
 
 def try_lock_collection_sql() -> str:

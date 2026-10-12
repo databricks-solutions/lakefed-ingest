@@ -5,8 +5,9 @@ and bookkeeping rules can be tested with fakes:
 
 * ``route_tables`` — per control row, by its load strategy (``load_type``) and source adapter
   (``src_type``): an unsupported pair (or a placeholder strategy) -> ``unsupported`` (the row fails
-  on its own with a clear message); ``full`` -> ``full`` (reload every cycle); ``ct`` -> from the
-  bulk-loaded checkpoint, ``seed`` / ``schema_reseed`` / legacy check / detection candidate.
+  on its own with a clear message); ``full`` -> ``full`` (reload every cycle); ``cursor`` ->
+  ``cursor_seed`` / ``schema_reseed`` / ``cursor`` (per-table high-watermark increment); ``ct`` ->
+  from the bulk-loaded checkpoint, ``seed`` / ``schema_reseed`` / legacy check / detection candidate.
 * ``group_by_source`` — candidates grouped by (source database, load_type): CT versions are per
   database and are NOT comparable across databases.
 * ``detect_group`` — one database: capture ``cur`` ONCE, fast-exit when every checkpoint is
@@ -25,6 +26,7 @@ from __future__ import annotations
 from typing import Optional, Callable, Dict, List, Tuple
 
 import ct_engine
+import cursor_engine
 import load_strategies as ls
 import state_store as ss
 
@@ -41,7 +43,8 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict]):
 
     plans      — unsupported (pair not in the support matrix; carries ``error``), full (reload),
                  seed (no CT checkpoint / phase seeding) and schema_reseed (select_list gained
-                 columns vs the recorded one) routes, ready for the worker;
+                 columns vs the recorded one) routes, plus cursor_seed / cursor (carries the
+                 decoded ``position``) for load_type cursor, ready for the worker;
     candidates — [(cfg, cp)] CT tables in the cdc phase to run through change detection;
     legacy     — [(cfg, cp)] cdc tables with no recorded select_list (caller checks the sink once).
     """
@@ -55,6 +58,9 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict]):
         if ss.strategy_name(cfg) == ls.FULL:
             plans.append({"cfg": cfg, "route": "full", "cp": cp})
             continue
+        if ss.strategy_name(cfg) == ls.CURSOR:
+            plans.append(_route_cursor(cfg, cp))
+            continue
         # CT. A checkpoint written by another strategy (load_type changed) can't be resumed: seed.
         if cp is None or cp.get("phase") != ss.CDC or (cp.get("strategy") or ls.CT) != ls.CT:
             plans.append({"cfg": cfg, "route": "seed", "cp": cp})
@@ -67,6 +73,20 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict]):
         else:
             candidates.append((cfg, cp))
     return plans, candidates, legacy
+
+
+def _route_cursor(cfg: dict, cp: Optional[dict]) -> dict:
+    """Cursor tables: seed when there's no usable cursor checkpoint (none, phase seeding, another
+    strategy's, or recorded for a different cursor_column); reseed when select_list gained columns;
+    else a per-table high-watermark increment."""
+    pos = cursor_engine.decode_position(cp.get("position")) if cp else None
+    if (cp is None or cp.get("phase") != ss.CDC or (cp.get("strategy") or ls.CT) != ls.CURSOR
+            or pos is None or pos["col"].lower() != str(cfg.get("cursor_column") or "").lower()):
+        return {"cfg": cfg, "route": "cursor_seed", "cp": cp}
+    added = ss.select_list_added_columns(cfg["select_list"], cp.get("select_list"))
+    if added:
+        return {"cfg": cfg, "route": "schema_reseed", "cp": cp, "added": added}
+    return {"cfg": cfg, "route": "cursor", "cp": cp, "position": pos}
 
 
 def group_by_source(candidates) -> Dict[tuple, list]:

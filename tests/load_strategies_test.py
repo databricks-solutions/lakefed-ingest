@@ -15,7 +15,7 @@ def test_registry_and_default():
 
 def test_support_matrix():
     assert ls.support_matrix() == {
-        "sqlserver":  {"ct": "yes", "cdc": "placeholder", "cursor": "placeholder", "full": "yes"},
+        "sqlserver":  {"ct": "yes", "cdc": "placeholder", "cursor": "yes",         "full": "yes"},
         "oracle":     {"ct": "no",  "cdc": "placeholder", "cursor": "placeholder", "full": "yes"},
         "postgresql": {"ct": "no",  "cdc": "placeholder", "cursor": "placeholder", "full": "yes"},
         "mysql":      {"ct": "no",  "cdc": "placeholder", "cursor": "placeholder", "full": "yes"},
@@ -47,11 +47,25 @@ def test_pk_requirements():
 
 
 def test_placeholders_raise_not_implemented():
-    for name in ("cursor", "cdc"):
-        s = ls.get_strategy(name)
-        assert not s.implemented and "PLACEHOLDER" in type(s).__doc__
-        with pytest.raises(NotImplementedError, match=f"'{name}' is not implemented"):
-            s.load(None, {}, "c.s.t")
+    s = ls.get_strategy("cdc")
+    assert not s.implemented and "PLACEHOLDER" in type(s).__doc__
+    with pytest.raises(NotImplementedError, match="'cdc' is not implemented"):
+        s.load(None, {}, "c.s.t")
+
+
+def test_cursor_is_sqlserver_only_with_placeholders_elsewhere():
+    assert ls.supported("sqlserver", "cursor") and ls.get_strategy("cursor").implemented
+    for st in ("oracle", "postgresql", "mysql"):
+        assert ls.unsupported_reason(st, "cursor") == \
+            f"load_type 'cursor' is not implemented yet (src_type '{st}')"
+
+
+def test_cursor_position_round_trip():
+    import cursor_engine as cur
+    s = ls.get_strategy("cursor")
+    text = cur.encode_position("rv", "timestamp", "2001")
+    assert s.decode_position(s.encode_position(text)) == {"col": "rv", "type": "timestamp", "value": "2001"}
+    assert s.decode_position(None) is None and s.decode_position("287493") is None
 
 
 def test_full_load_ensures_sink_then_seeds(monkeypatch):

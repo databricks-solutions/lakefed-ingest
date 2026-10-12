@@ -9,7 +9,7 @@ two versions:
 | Compute | Job cluster only — no SQL warehouse | SQL warehouse + notebooks |
 | Metadata / state | Lakebase (Postgres): control, checkpoints, reseed queue, telemetry | Delta control table |
 | Source access | Spark JDBC with per-database credentials from a secret scope | Lakehouse Federation / `remote_query` via UC connections |
-| Load types | SQL Server Change Tracking (`ct`) with full / partitioned seed; `full` reload (partitioned or not). `cursor` and `cdc` are placeholders | Full, watermark incremental, partitioned full |
+| Load types | SQL Server Change Tracking (`ct`) and watermark `cursor`, each with full / partitioned seed; `full` reload (partitioned or not) for every source. `cdc` and non-SQL Server `cursor` are placeholders | Full, watermark incremental, partitioned full |
 | Sources | SQL Server (`ct`, `full`); Oracle, PostgreSQL, MySQL (`full`) | SQL Server, Oracle, PostgreSQL, Redshift, Synapse, IBM Db2 LUW |
 | Bundle | `lakefed_ingest_v2` | `lakefed_ingest` |
 
@@ -82,11 +82,13 @@ literals, and the SELECT / size / bounds queries) and `control.load_type` a **lo
 
 | `src_type` | `ct` | `full` | `cursor` | `cdc` |
 |---|---|---|---|---|
-| `sqlserver` | yes | yes | placeholder | placeholder |
+| `sqlserver` | yes | yes | yes | placeholder |
 | `oracle` | — | yes | placeholder | placeholder |
 | `postgresql` | — | yes | placeholder | placeholder |
 | `mysql` | — | yes | placeholder | placeholder |
 
+- **`cursor`** (SQL Server) reads rows above a high watermark — see
+  [Cursor (watermark) tables](#cursor-watermark-tables).
 - **`full`** reloads the whole table every run: one JDBC read into a data-only `INSERT OVERWRITE`
   (the table id, grants, clustering and properties are kept), or the staged partitioned swap when
   `load_partitioned`. No primary key needed. The checkpoint records `strategy = 'full'`, phase
@@ -101,7 +103,8 @@ literals, and the SELECT / size / bounds queries) and `control.load_type` a **lo
   `{"fetchsize": "50000"}`. Connection, credential, driver and query options can't be overridden.
 
 Checkpoints are generic: `checkpoint.strategy` names the strategy that wrote the row and
-`checkpoint.position` (text) is its resume position — for `ct`, the database CT version.
+`checkpoint.position` (text) is its resume position — for `ct`, the database CT version; for
+`cursor`, JSON `{"col", "type", "value"}` (the watermark column, its SQL Server type, and the value).
 
 ### Per-table state (Change Tracking)
 
@@ -114,7 +117,30 @@ Checkpoints are generic: `checkpoint.strategy` names the strategy that wrote the
   Tracking's minimum valid version (retention lapsed), the table is queued for a reseed.
 
 Delivery is at-least-once (checkpoint advances post-commit) and the MERGE is idempotent, so there
-are no gaps and no duplicates. Nothing is `.cache()`d; Delta MERGE materializes the JDBC source
+are no gaps and no duplicates.
+
+### Cursor (watermark) tables
+
+For tables without Change Tracking, `load_type = 'cursor'` follows a monotonically increasing
+column, `cursor_column` (a PK is required — increments are MERGEd by it):
+
+- **Seed:** capture the column's high watermark `hi` *before* the full copy (partitioned when
+  `load_partitioned`), then checkpoint `hi`. Rows written during the seed are re-read next run.
+- **Each run:** one small query reads the current `hi`. Equal to the checkpoint → unchanged (no
+  read, no MERGE). Otherwise read `cursor_column > checkpoint AND cursor_column <= hi` once, upsert
+  it by PK, then advance the checkpoint to `hi`.
+- **Column types:** `rowversion` (recommended), integer / `decimal` / `numeric` (identity keys), and
+  `date` / `datetime` / `datetime2` / `smalldatetime` / `datetimeoffset` (an `updated_at` the
+  application maintains). Float, real and string columns are rejected.
+- **Limits — choose the column accordingly:**
+  - Deletes are never captured. Use `ct` where deletes matter, or a periodic `full` reload.
+  - Updates are captured only if they move the column: `rowversion` always does, an identity never
+    does (inserts only), and an `updated_at` only if every writer sets it.
+  - A transaction that commits a value *below* an already-read watermark after the read is missed.
+    `rowversion` avoids this: the watermark is capped below `MIN_ACTIVE_ROWVERSION()`, so rows from
+    still-open transactions wait for the next run.
+- Changing `cursor_column` re-seeds the table; adding columns to `select_list` reseeds it, as for
+  `ct`. Nothing is `.cache()`d; Delta MERGE materializes the JDBC source
 once (`materializeSource=auto`).
 
 ### Skip-no-change
@@ -198,8 +224,8 @@ Key columns: `task_collection`, `src_type`, `src_host` / `src_port` (NULL port =
 default), `src_database`, `src_schema`, `src_table`, `secret_key`, `primary_key` (comma-separated;
 required for `ct`, `cursor` and `cdc`), `select_list` (explicit columns — `*` isn't supported),
 `sink_catalog` / `sink_schema` / `sink_table`, `load_type` (`ct` | `full` | `cursor` | `cdc`), the
-optional partitioned-seed settings, and `jdbc_options`. `cursor_column` and `cdc_capture_instance`
-are reserved for the placeholder strategies. Check constraints reject invalid combinations (e.g.
+optional partitioned-seed settings, `cursor_column` (required for `cursor`), and `jdbc_options`.
+`cdc_capture_instance` is reserved for the placeholder `cdc` strategy. Check constraints reject invalid combinations (e.g.
 `ct` on a non-SQL Server source). See `notebooks/load_control_example.ipynb`.
 
 **Schema changes.** Writes use schema evolution. Adding a column to `select_list` adds it to the
@@ -271,6 +297,6 @@ Unit tests need no cluster. `tests/validation_test.py` runs against a live SQL S
 
 ## Not yet supported
 
-The `cursor` (watermark) and `cdc` load strategies (placeholders with documented contracts in
-`load_strategies.py`), `ct`/`cursor`/`cdc` for sources other than SQL Server, consolidated bronze
+The `cdc` load strategy (placeholder with a documented contract in `load_strategies.py`),
+`cursor` and `cdc` for sources other than SQL Server (placeholders), consolidated bronze
 tables across source databases, and production alerting.

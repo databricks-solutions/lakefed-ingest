@@ -252,7 +252,7 @@ def test_unlock_collection_sql_matches_lock_key():
 
 def test_lock_application_name_is_labeled_and_capped():
     name = ss.lock_application_name("smoke_test", "12345")
-    assert name == "lakefed_ingest_sweep:smoke_test:12345"
+    assert name == "lakefed_ingest:smoke_test:12345"
     assert len(ss.lock_application_name("c" * 200, "r" * 50)) == 63   # Postgres limit
 
 

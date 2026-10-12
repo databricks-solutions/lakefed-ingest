@@ -12,7 +12,8 @@ ct         SQL Server Change Tracking: seed, then CHANGETABLE increments  CT ver
            MERGEd by PK; skip-no-change per source database
 full       Reload the whole table every cycle (data-only atomic replace;  NULL (not resumable)
            partitioned tables use the staged swap). No PK required
-cursor     PLACEHOLDER — high-watermark column increments                cursor value (text)
+cursor     High-watermark column (SQL Server; placeholder elsewhere): seed,  JSON {col, type, value}
+           then (position, hi] reads upsert-MERGEd by PK; no deletes
 cdc        PLACEHOLDER — log-based CDC (e.g. SQL Server CDC, Postgres     engine LSN / SCN (text)
            logical decoding, Oracle LogMiner, MySQL binlog)
 =========  ============================================================  ==========================
@@ -76,23 +77,29 @@ class FullStrategy(LoadStrategy):
 
 
 class CursorStrategy(LoadStrategy):
-    """PLACEHOLDER — cursor (high-watermark) increments. Contract for the implementation:
+    """Cursor (high-watermark) increments — implemented for SQL Server in ``cursor_engine``; other
+    adapters are placeholders (they need their own type lookup / high-watermark / literal SQL).
 
-    * control: ``cursor_column`` (monotonic: identity, rowversion, or an updated_at maintained by the
-      application) and ``primary_key`` (required — rows are MERGEd by PK; a DB constraint enforces both);
-    * first cycle: capture ``hi = MAX(cursor_column)`` BEFORE a full seed, checkpoint position = hi;
-    * each cycle: ``hi' = MAX(cursor_column)``; read ``cursor_column > position AND <= hi'`` (one
-      source read), MERGE by PK, then advance position to hi' (at-least-once; MERGE is idempotent);
-    * position encoding must order correctly as text OR be decoded before comparing (timestamps as
-      ISO-8601 UTC, numbers as decimal text);
-    * deletes are NOT captured (document; periodic ``full`` reconcile or soft-delete column).
+    * control: ``cursor_column`` (monotonic: rowversion, identity, or an application-maintained
+      updated_at) and ``primary_key`` (rows are MERGEd by PK; a DB constraint enforces both);
+    * first cycle: capture ``hi`` BEFORE a full seed, checkpoint position = hi;
+    * each cycle: ``hi'``; equal -> unchanged, else read ``(position, hi']`` (one source read),
+      upsert-MERGE by PK, then advance to hi' (at-least-once; the MERGE is idempotent);
+    * position = JSON ``{col, type, value}`` (``cursor_engine.encode_position``) — a changed
+      ``cursor_column`` re-seeds;
+    * deletes are NOT captured (use ``ct``, or a periodic ``full``).
     """
 
     name = CURSOR
     requires_pk = True
+    implemented = True
 
-    def load(self, *_, **__):
-        raise NotImplementedError("load_type 'cursor' is not implemented yet")
+    def encode_position(self, value):
+        return value                      # already encoded by cursor_engine.encode_position
+
+    def decode_position(self, text):
+        import cursor_engine
+        return cursor_engine.decode_position(text)
 
 
 class CdcStrategy(LoadStrategy):
@@ -118,11 +125,14 @@ class CdcStrategy(LoadStrategy):
 _STRATEGIES = {s.name: s for s in (CtStrategy(), FullStrategy(), CursorStrategy(), CdcStrategy())}
 
 # (src_type, load_type) pairs that run today. CT is SQL Server-only by definition; FULL works for
-# every adapter. Cursor / CDC are placeholders everywhere.
+# every adapter; CURSOR is SQL Server-only for now. PLACEHOLDER pairs are planned (clear "not
+# implemented yet" error); anything else is "not supported". CDC is a placeholder everywhere.
 SUPPORT = {
-    (sa.SQLSERVER, CT), (sa.SQLSERVER, FULL),
+    (sa.SQLSERVER, CT), (sa.SQLSERVER, FULL), (sa.SQLSERVER, CURSOR),
     (sa.ORACLE, FULL), (sa.POSTGRESQL, FULL), (sa.MYSQL, FULL),
 }
+PLACEHOLDER = {(sa.ORACLE, CURSOR), (sa.POSTGRESQL, CURSOR), (sa.MYSQL, CURSOR)} | {
+    (st, CDC) for st in sa.SRC_TYPES}
 
 
 def get_strategy(load_type: Optional[str]) -> LoadStrategy:
@@ -148,7 +158,7 @@ def unsupported_reason(src_type: Optional[str], load_type: Optional[str]) -> Opt
         return str(e)
     if (adapter.src_type, strategy.name) in SUPPORT:
         return None
-    if not strategy.implemented:
+    if not strategy.implemented or (adapter.src_type, strategy.name) in PLACEHOLDER:
         return f"load_type '{strategy.name}' is not implemented yet (src_type '{adapter.src_type}')"
     ok = sorted(lt for st, lt in SUPPORT if st == adapter.src_type)
     return (f"load_type '{strategy.name}' is not supported for src_type '{adapter.src_type}' "
@@ -163,7 +173,7 @@ def support_matrix() -> dict:
         for lt in LOAD_TYPES:
             if (st, lt) in SUPPORT:
                 out[st][lt] = "yes"
-            elif not _STRATEGIES[lt].implemented:
+            elif (st, lt) in PLACEHOLDER or not _STRATEGIES[lt].implemented:
                 out[st][lt] = "placeholder"
             else:
                 out[st][lt] = "no"
