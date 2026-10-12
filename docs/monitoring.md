@@ -28,6 +28,10 @@ write contention.
 
 ## Canonical queries (run in DBSQL against the Lakebase UC catalog)
 
+Run these on a SQL warehouse (or serverless). The Lakebase catalog is a database catalog, and
+queries from a classic all-purpose or job cluster fail with `PERMISSION_DENIED` (foreign
+credentials). The ingestion job itself doesn't use it; it connects to Lakebase directly.
+
 These are Spark-SQL dialect against the federated catalog `lakefed_ingest_lakebase`. `:collection` is a
 DBSQL query parameter.
 

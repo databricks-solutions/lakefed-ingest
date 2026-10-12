@@ -24,7 +24,7 @@ create schema if not exists lakefed_ingest;
 -- Array-typed columns (primary_key, sink_cluster_cols) are stored as comma-separated text.
 create table if not exists lakefed_ingest.control (
     id                    bigserial primary key,
-    job_name              text        not null,
+    job_name              text,                               -- optional label (unused by this version)
     task_collection       text        not null,
     src_type              text        not null default 'sqlserver',  -- source adapter
     src_connection        text,                               -- legacy: UC connection (host lookup only)
@@ -74,6 +74,8 @@ alter table lakefed_ingest.control add column if not exists cursor_column text;
 alter table lakefed_ingest.control add column if not exists cdc_capture_instance text;
 alter table lakefed_ingest.control add column if not exists jdbc_options text;
 alter table lakefed_ingest.control alter column primary_key drop not null;
+-- job_name is an optional label in this version (the job orchestration version uses it).
+alter table lakefed_ingest.control alter column job_name drop not null;
 -- Consolidated sinks (optional): rows with client_id set share one sink table, each writing only its
 -- own client's rows (MERGE on client_id + PK, REPLACE WHERE client_id for seeds / full reloads).
 alter table lakefed_ingest.control add column if not exists client_id text;

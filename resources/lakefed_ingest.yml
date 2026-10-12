@@ -1,8 +1,8 @@
 # Ingestion job — one run sweeps a whole task_collection (no controller / batching).
 # Sweeps an entire task_collection in one run: reads all enabled tasks for the collection from
 # `control` and ingests them in-process across a thread pool + Spark FAIR scheduler pools (see
-# ingest.ipynb / parallel.py). Per control row, `load_type` selects the load strategy (ct | full today)
-# and `src_type` the source adapter (sqlserver | oracle | postgresql | mysql). This keeps the pipeline under the workspace job limits
+# ingest.ipynb / parallel.py). Per control row, `load_type` selects the load strategy (ct | cursor |
+# full) and `src_type` the source adapter (sqlserver | oracle | postgresql | mysql). This keeps the pipeline under the workspace job limits
 # that a task-per-table design hits (2,000 concurrent task runs; 10,000 run-submits/hour) —
 # throughput becomes compute-bound, the intended cost model.
 #
