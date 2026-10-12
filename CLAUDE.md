@@ -59,7 +59,7 @@ JDBC with per-database credentials (JSON `{user,password}`) from a secret scope 
   sink shared by many source DBs; written to sink column `__client_id__`). CHECK constraints enforce valid combos; a unique index allows one
   row per (sink, client_id).
 - `checkpoint` — generic: `strategy` + `position` (text; CT version for `ct`, JSON {col,type,value} for
-  `cursor`), phase (`seeding → cdc` for ct and cursor, `loaded` for full), status, freshness,
+  `cursor`), phase (`seeding → incremental` for ct and cursor, `loaded` for full), status, freshness,
   `ct_begin_version`. `reseed_queue` (ct, cursor).
 - `ingest_run`, `ingest_event` — telemetry (`run_id`, `position_from/to`). The DB is registered in UC
   (default catalog `lakefed_ingest_lakebase`) for DBSQL monitoring.

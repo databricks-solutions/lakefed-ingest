@@ -109,12 +109,12 @@ Checkpoints are generic: `checkpoint.strategy` names the strategy that wrote the
 
 ### Per-table state (Change Tracking)
 
-`checkpoint.phase` moves `seeding → cdc`.
+`checkpoint.phase` moves `seeding → incremental`.
 
 - **seeding:** capture `V0 = CHANGE_TRACKING_CURRENT_VERSION()` *before* the seed, copy the table,
-  then checkpoint `{V0, cdc}`. The first CDC cycle replays everything that changed during the seed,
-  so there is no gap.
-- **cdc:** read changes since the checkpoint, MERGE, advance. If the checkpoint falls below Change
+  then checkpoint `{V0, incremental}`. The first incremental run replays everything that changed
+  during the seed, so there is no gap.
+- **incremental:** read changes since the checkpoint, MERGE, advance. If the checkpoint falls below Change
   Tracking's minimum valid version (retention lapsed), the table is queued for a reseed.
 
 Delivery is at-least-once (checkpoint advances post-commit) and the MERGE is idempotent, so there
@@ -244,7 +244,9 @@ Column-level reference, a diagram, and the checkpoint lifecycle: [docs/lakebase_
 
 Upgrading from an earlier deploy: re-run `lakefed_ingest_setup`. It renames `ct_checkpoint` →
 `checkpoint` (`ct_version` → `position`), `sweep_run` → `ingest_run` (`sweep_id` → `run_id`), and
-`ingest_event.ct_version_from/to` → `position_from/to` in place; data is kept. This only reaches the
+`ingest_event.ct_version_from/to` → `position_from/to` in place; data is kept. It also renames the
+checkpoint phase `cdc` to `incremental` (history included). Deploy the new code and run the setup
+together: after the setup, an older build's checkpoint writes are rejected. This only reaches the
 existing data if the bundle points to the existing instance and database. Preview deployments used
 different names and a different bundle, so follow
 [Upgrading a preview deployment](docs/deploy.md#1-add-a-target) first; the defaults would create a new,

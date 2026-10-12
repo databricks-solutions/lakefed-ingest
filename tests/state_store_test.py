@@ -37,12 +37,12 @@ def test_reseed_accepts_string_versions():
 
 
 # ---- next_phase --------------------------------------------------------------
-def test_next_phase_seeding_to_cdc():
-    assert ss.next_phase(ss.SEEDING) == ss.CDC
+def test_next_phase_seeding_to_incremental():
+    assert ss.next_phase(ss.SEEDING) == ss.INCREMENTAL
 
 
-def test_next_phase_cdc_is_terminal():
-    assert ss.next_phase(ss.CDC) == ss.CDC
+def test_next_phase_incremental_is_terminal():
+    assert ss.next_phase(ss.INCREMENTAL) == ss.INCREMENTAL
 
 
 # ---- config (control table) builders -----------------------------------------
@@ -165,17 +165,17 @@ def test_decide_action_seeding_phase_seeds():
 
 def test_decide_action_cdc_retention_lapsed_reseeds():
     # checkpoint has fallen below the source minimum valid version -> reseed.
-    assert ss.decide_action(ss.CDC, 5, 10) == "reseed"
+    assert ss.decide_action(ss.INCREMENTAL, 5, 10) == "reseed"
 
 
 def test_decide_action_cdc_valid_increments():
-    assert ss.decide_action(ss.CDC, 10, 5) == "increment"
-    assert ss.decide_action(ss.CDC, 10, 10) == "increment"
+    assert ss.decide_action(ss.INCREMENTAL, 10, 5) == "increment"
+    assert ss.decide_action(ss.INCREMENTAL, 10, 10) == "increment"
 
 
 def test_decide_action_cdc_missing_min_valid_reseeds():
     # CT not enabled / unknown object (min_valid None) -> reseed.
-    assert ss.decide_action(ss.CDC, 10, None) == "reseed"
+    assert ss.decide_action(ss.INCREMENTAL, 10, None) == "reseed"
 
 
 # ---- observability / telemetry builders --------------------------------------
@@ -324,7 +324,7 @@ def test_advance_checkpoint_binds_identity_strategy_then_text_position():
     conn = FakeConn(); ss.StateStore(conn).advance_checkpoint(CFG, 42)
     # strategy defaults to the row's load_type (ct when unset); the CT version is stored as text
     assert conn.calls == [(ss.upsert_checkpoint_sql(),
-                           (7, "d", "s", "t", "ct", "42", "cdc", "ok", None, None))]
+                           (7, "d", "s", "t", "ct", "42", "incremental", "ok", None, None))]
 
 
 def test_advance_checkpoint_full_strategy_has_no_position():
@@ -351,8 +351,8 @@ def test_get_checkpoint_binds_control_id_and_defaults_to_seeding():
     conn = FakeConn(fetch=[None]); cp = ss.StateStore(conn).get_checkpoint("7")
     assert conn.calls == [(ss.get_checkpoint_sql(), (7,))]
     assert cp == {"position": None, "phase": "seeding", "status": "ok", "strategy": None}
-    conn = FakeConn(fetch=[("287493", "cdc", "ok", "ct")])
-    assert ss.StateStore(conn).get_checkpoint(7) == {"position": "287493", "phase": "cdc",
+    conn = FakeConn(fetch=[("287493", "incremental", "ok", "ct")])
+    assert ss.StateStore(conn).get_checkpoint(7) == {"position": "287493", "phase": "incremental",
                                                      "status": "ok", "strategy": "ct"}
 
 
@@ -410,10 +410,10 @@ def test_get_checkpoints_one_query_any_array():
 
 
 def test_get_checkpoints_maps_rows_by_control_id():
-    conn = FakeConn(fetch=[(7, "100", "cdc", "ok", "a, b", "ct", 3), (8, None, "loaded", "ok", None, "full", None)])
+    conn = FakeConn(fetch=[(7, "100", "incremental", "ok", "a, b", "ct", 3), (8, None, "loaded", "ok", None, "full", None)])
     got = ss.StateStore(conn).get_checkpoints(["7", 8])
     assert conn.calls == [(ss.get_checkpoints_sql(), ([7, 8],))]
-    assert got == {7: {"position": "100", "phase": "cdc", "status": "ok", "select_list": "a, b",
+    assert got == {7: {"position": "100", "phase": "incremental", "status": "ok", "select_list": "a, b",
                        "strategy": "ct", "ct_begin_version": 3},
                    8: {"position": None, "phase": "loaded", "status": "ok", "select_list": None,
                        "strategy": "full", "ct_begin_version": None}}
@@ -429,7 +429,7 @@ def test_bulk_advance_never_moves_backwards_and_only_cdc():
     sql = ss.bulk_advance_unchanged_sql()
     # positions are text: compare as numbers, never lexically ('9' > '10')
     assert "position = greatest(coalesce(position, '0')::bigint, %s::bigint)::text" in sql
-    assert "where control_id = %s and phase = 'cdc' and strategy = 'ct'" in sql
+    assert "where control_id = %s and phase = 'incremental' and strategy = 'ct'" in sql
     assert "last_success_at = now()" in sql and "select_list = coalesce(%s, select_list)" in sql
     assert "ct_begin_version = coalesce(ct_begin_version, %s)" in sql   # never overwrite a recorded one
     assert sql.count("%s") == 4
@@ -454,11 +454,11 @@ def test_select_list_added_columns():
 def test_record_failed_tables_bulk_events_and_status():
     conn = FakeConn()
     cfg = dict(CFG, task_collection="tc", sink_catalog="c", sink_schema="s", sink_table="t")
-    n = ss.StateStore(conn).record_failed_tables(3, [(cfg, {"phase": "cdc"}, "db unreachable")])
+    n = ss.StateStore(conn).record_failed_tables(3, [(cfg, {"phase": "incremental"}, "db unreachable")])
     assert n == 1
     (ev_sql, ev_rows), (st_sql, st_rows) = conn.calls
     assert ev_sql == ss.record_event_failed_sql() and "'failed'" in ev_sql
-    assert ev_rows == [(3, "tc", 7, "d", "s", "t", "c.s.t", "increment", "cdc", "detect", "db unreachable")]
+    assert ev_rows == [(3, "tc", 7, "d", "s", "t", "c.s.t", "increment", "incremental", "detect", "db unreachable")]
     assert st_sql == ss.set_status_sql() and st_rows == [(7, "d", "s", "t", "ct", "failed", "db unreachable")]
 
 
@@ -522,7 +522,7 @@ def test_ddl_generic_checkpoint_and_telemetry_columns():
                  "strategy       text        not null default 'ct'",
                  "alter column position type text using position::text",
                  "add column if not exists strategy text not null default 'ct'",
-                 "phase in ('seeding', 'cdc', 'loaded')",
+                 "phase in ('seeding', 'incremental', 'loaded')",
                  "create table if not exists lakefed_ingest.ingest_run",
                  "run_id          bigserial   primary key",
                  "position_from   text", "position_to     text"):

@@ -84,7 +84,7 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=
                  seed (no CT checkpoint / phase seeding) and schema_reseed (select_list gained
                  columns vs the recorded one) routes, plus cursor_seed / cursor (carries the
                  decoded ``position``) for load_type cursor, ready for the worker;
-    candidates — [(cfg, cp)] CT tables in the cdc phase to run through change detection;
+    candidates — [(cfg, cp)] CT tables in the incremental phase to run through change detection;
     legacy     — [(cfg, cp)] cdc tables with no recorded select_list (caller checks the sink once).
     """
     plans, candidates, legacy = [], [], []
@@ -101,7 +101,7 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=
             plans.append(_route_cursor(cfg, cp))
             continue
         # CT. A checkpoint written by another strategy (load_type changed) can't be resumed: seed.
-        if cp is None or cp.get("phase") != ss.CDC or (cp.get("strategy") or ls.CT) != ls.CT:
+        if cp is None or cp.get("phase") != ss.INCREMENTAL or (cp.get("strategy") or ls.CT) != ls.CT:
             plans.append({"cfg": cfg, "route": "seed", "cp": cp})
             continue
         added = ss.select_list_added_columns(cfg["select_list"], cp.get("select_list"))
@@ -119,7 +119,7 @@ def _route_cursor(cfg: dict, cp: Optional[dict]) -> dict:
     strategy's, or recorded for a different cursor_column); reseed when select_list gained columns;
     else a per-table high-watermark increment."""
     pos = cursor_engine.decode_position(cp.get("position")) if cp else None
-    if (cp is None or cp.get("phase") != ss.CDC or (cp.get("strategy") or ls.CT) != ls.CURSOR
+    if (cp is None or cp.get("phase") != ss.INCREMENTAL or (cp.get("strategy") or ls.CT) != ls.CURSOR
             or pos is None or pos["col"].lower() != str(cfg.get("cursor_column") or "").lower()):
         return {"cfg": cfg, "route": "cursor_seed", "cp": cp}
     added = ss.select_list_added_columns(cfg["select_list"], cp.get("select_list"))

@@ -8,7 +8,7 @@ def _cfg(cid, db, table, host="h1", sl="id, v"):
             "src_schema": "dbo", "src_table": table, "select_list": sl}
 
 
-def _cp(v, phase=ss.CDC, sl="id, v", strategy="ct", begin=None):
+def _cp(v, phase=ss.INCREMENTAL, sl="id, v", strategy="ct", begin=None):
     return {"position": None if v is None else str(v), "phase": phase, "status": "ok",
             "select_list": sl, "strategy": strategy, "ct_begin_version": begin}
 
@@ -147,7 +147,7 @@ def test_route_tables_mixed_strategies_and_sources():
         dict(_cfg(5, "d1", "d"), src_type="mysql", load_type="cursor"),       # placeholder (mysql)
         dict(_cfg(6, "d1", "e"), load_type="cdc"),                             # placeholder
         dict(_cfg(7, "d1", "f"), src_type="db2", load_type="full"),            # unknown adapter
-        _cfg(8, "d1", "g"),                                                   # ct, cdc phase
+        _cfg(8, "d1", "g"),                                                   # ct, incremental phase
     ]
     cps = {2: _cp(None, phase=ss.LOADED, strategy="full"), 8: _cp(5)}
     plans, candidates, legacy = planner.route_tables(cfgs, cps)
@@ -184,7 +184,7 @@ def _cur_cfg(cid=1, col="updated_at", sl="id, v"):
     return dict(_cfg(cid, "d1", "t", sl=sl), load_type="cursor", cursor_column=col, primary_key="id")
 
 
-def _cur_cp(col="updated_at", value="2026-01-01T00:00:00", sl="id, v", phase=ss.CDC, strategy="cursor"):
+def _cur_cp(col="updated_at", value="2026-01-01T00:00:00", sl="id, v", phase=ss.INCREMENTAL, strategy="cursor"):
     import cursor_engine
     return {"position": cursor_engine.encode_position(col, "datetime2", value), "phase": phase,
             "status": "ok", "select_list": sl, "strategy": strategy, "ct_begin_version": None}
@@ -289,7 +289,7 @@ def test_merge_plan_carries_begin_version():
 
 def test_position_from_never_decodes_another_strategys_checkpoint():
     import cursor_engine
-    cur_cp = {"position": cursor_engine.encode_position("rv", "timestamp", "9"), "phase": ss.CDC,
+    cur_cp = {"position": cursor_engine.encode_position("rv", "timestamp", "9"), "phase": ss.INCREMENTAL,
               "strategy": "cursor"}
     # load_type switched cursor -> ct: the seed must not int() the cursor JSON
     assert planner.position_from({"route": "seed", "cp": cur_cp}) is None

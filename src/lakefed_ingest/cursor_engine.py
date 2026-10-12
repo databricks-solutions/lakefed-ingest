@@ -1,7 +1,7 @@
 """Cursor (high-watermark) strategy, SQL Server: incremental reads on a monotonically increasing
 column (``control.cursor_column``), MERGEd into the Delta sink by PK.
 
-Per cycle, for a seeded table (checkpoint phase ``cdc``):
+Per cycle, for a seeded table (checkpoint phase ``incremental``):
   1. ``hi`` = the column's current high watermark (one small source query);
   2. ``hi`` == checkpoint position -> unchanged (no read, no MERGE);
   3. otherwise read ``cursor_column > position AND cursor_column <= hi`` (ONE source read) and

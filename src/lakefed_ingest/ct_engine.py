@@ -537,7 +537,7 @@ def insert_overwrite_sql(sink_fqn: str, cols: List[str], source: str, cfg: Optio
 
 def missing_sink_columns(select_list: str, sink_columns: List[str]) -> List[str]:
     """select_list columns absent from the sink (case-insensitive) — pure, unit-tested. A non-empty
-    result in the cdc phase means the source table gained a column: the sweep reseeds that table so
+    result in the incremental phase means the source table gained a column: the sweep reseeds that table so
     historical rows get the new column (CT only returns changed rows)."""
     have = {c.lower() for c in sink_columns}
     return [c for c in _split(select_list) if c.lower() not in have]

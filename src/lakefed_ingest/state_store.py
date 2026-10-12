@@ -17,7 +17,7 @@ unit-tested in tests/state_store_test.py. ``psycopg`` is imported lazily inside
 ``StateStore.connect`` so the module (and its tests) load without the driver installed.
 
 Naming: `control`, `checkpoint`, and the telemetry tables (`ingest_run`, `ingest_event`) are
-framework-level; the reseed surface (reseed_queue, is_reseed_needed, phases seeding/cdc) is used by
+framework-level; the reseed surface (reseed_queue, is_reseed_needed, phases seeding/incremental) is used by
 the CT strategy.
 """
 
@@ -34,7 +34,7 @@ RUN_TABLE = f"{SCHEMA}.ingest_run"        # observability: one row per ingestion
 EVENT_TABLE = f"{SCHEMA}.ingest_event"    # observability: one row per (run, table)
 
 SEEDING = "seeding"
-CDC = "cdc"          # CT: seeded, applying increments
+INCREMENTAL = "incremental"  # ct / cursor: seeded, applying increments
 LOADED = "loaded"    # full: last reload committed (no resumable position)
 
 # Columns selected from the control table, in order. list_task_configs / get_task return dicts
@@ -137,8 +137,8 @@ def is_reseed_needed(checkpoint_version: Optional[int], min_valid_version: Optio
 
 
 def next_phase(current_phase: str) -> str:
-    """Advance the per-table phase state machine: seeding -> cdc (cdc is terminal)."""
-    return CDC if current_phase == SEEDING else CDC
+    """Advance the per-table phase state machine: seeding -> incremental (terminal)."""
+    return INCREMENTAL
 
 
 def decide_action(phase: str, checkpoint_version: Optional[int],
@@ -147,8 +147,8 @@ def decide_action(phase: str, checkpoint_version: Optional[int],
 
     Returns one of:
       - 'seed'      : phase is seeding (first onboarding, or re-seed after retention loss).
-      - 'reseed'    : phase is cdc but CT retention lapsed (checkpoint < min valid) -> re-seed.
-      - 'increment' : phase is cdc and the checkpoint is still valid -> read CHANGES + MERGE.
+      - 'reseed'    : phase is incremental but CT retention lapsed (checkpoint < min valid) -> re-seed.
+      - 'increment' : phase is incremental and the checkpoint is still valid -> read CHANGES + MERGE.
 
     In the seeding branch ``min_valid_version`` is irrelevant and may be None. In the cdc branch
     the caller fetches it (ct_engine.min_valid_version) first, then calls this to split
@@ -264,7 +264,7 @@ def bulk_advance_unchanged_sql() -> str:
         "status = 'ok', detail = null, "
         "select_list = coalesce(%s, select_list), ct_begin_version = coalesce(ct_begin_version, %s), "
         "last_success_at = now(), updated_at = now() "
-        "where control_id = %s and phase = 'cdc' and strategy = 'ct'"
+        "where control_id = %s and phase = 'incremental' and strategy = 'ct'"
     )
 
 
@@ -504,7 +504,7 @@ class StateStore:
         return {int(r[0]): {"position": r[1], "phase": r[2], "status": r[3], "select_list": r[4],
                             "strategy": r[5], "ct_begin_version": r[6]} for r in rows}
 
-    def advance_checkpoint(self, cfg: dict, position, phase=CDC, status="ok", detail=None,
+    def advance_checkpoint(self, cfg: dict, position, phase=INCREMENTAL, status="ok", detail=None,
                            select_list=None, strategy=None):
         """Persist a new checkpoint for control row ``cfg``. Call ONLY after the bronze write has
         committed (cross-system at-least-once: re-reading one window on crash is harmless).

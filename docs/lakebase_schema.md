@@ -133,7 +133,7 @@ at the start of a run.
 | `control_id` | The control row this state belongs to |
 | `src_database`, `src_schema`, `src_table` | Copied from control, for readability |
 | `strategy` | Load strategy that wrote the row (`ct`, `cursor`, `full`). A different `load_type` in control means a reseed |
-| `phase` | `seeding` (needs a full copy) → `cdc` (seeded; applying increments, for `ct` and `cursor`); `loaded` for `full` |
+| `phase` | `seeding` (needs a full copy) → `incremental` (seeded; applying increments, for `ct` and `cursor`); `loaded` for `full` |
 | `position` | Resume point, owned by the strategy. `ct`: the source database's CT version. `cursor`: JSON `{"col", "type", "value"}` (the watermark). `full`: NULL |
 | `status`, `detail` | `ok` or `failed`, with the last error in `detail` |
 | `select_list` | Columns the sink was last written with; compared with `control.select_list` to detect added columns |
@@ -147,10 +147,10 @@ skips data; the next run redoes that window and the MERGE is idempotent.
 ```mermaid
 stateDiagram-v2
     [*] --> seeding: first run (no checkpoint)
-    seeding --> cdc: seed committed (ct, cursor)
+    seeding --> incremental: seed committed (ct, cursor)
     seeding --> loaded: full load committed (full)
-    cdc --> cdc: increment committed, or unchanged
-    cdc --> seeding: reseed needed
+    incremental --> incremental: increment committed, or unchanged
+    incremental --> seeding: reseed needed
     loaded --> loaded: reload every run
 ```
 

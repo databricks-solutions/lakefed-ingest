@@ -148,7 +148,7 @@ create table if not exists lakefed_ingest.checkpoint (
     src_table      text        not null,
     strategy       text        not null default 'ct',  -- load strategy that wrote the position
     position       text,                              -- resume position (CT: CT version as text)
-    phase          text        not null default 'seeding',  -- seeding | cdc (CT) | loaded (full)
+    phase          text        not null default 'seeding',  -- seeding | incremental (ct, cursor) | loaded (full)
     status         text        not null default 'ok', -- ok | running | failed | quarantined
     detail         text,                              -- last error / note
     updated_at     timestamptz not null default now(),
@@ -179,8 +179,12 @@ alter table lakefed_ingest.checkpoint alter column position drop not null;
 alter table lakefed_ingest.checkpoint alter column position type text using position::text;
 alter table lakefed_ingest.checkpoint drop constraint if exists ct_checkpoint_phase_check;
 alter table lakefed_ingest.checkpoint drop constraint if exists valid_phase;
+-- The steady-state phase was called 'cdc' before; it is 'incremental' (shared by ct and cursor, and
+-- distinct from the 'cdc' load type). Rename in place before re-adding the check (ingest_event
+-- history is renamed after that table's DDL, below).
+update lakefed_ingest.checkpoint set phase = 'incremental' where phase = 'cdc';
 alter table lakefed_ingest.checkpoint add constraint valid_phase check (
-    phase in ('seeding', 'cdc', 'loaded')
+    phase in ('seeding', 'incremental', 'loaded')
 );
 
 -- Freshness/lag: when did this table last ingest successfully.
@@ -272,6 +276,8 @@ create table if not exists lakefed_ingest.ingest_event (
 -- CT versions were bigint before the generic checkpoint; positions are text.
 alter table lakefed_ingest.ingest_event alter column position_from type text using position_from::text;
 alter table lakefed_ingest.ingest_event alter column position_to type text using position_to::text;
+-- Phase 'cdc' was renamed 'incremental' (see checkpoint above); keep history consistent.
+update lakefed_ingest.ingest_event set phase = 'incremental' where phase = 'cdc';
 
 create index if not exists ingest_event_run_idx
     on lakefed_ingest.ingest_event (run_id);
