@@ -71,16 +71,16 @@ def test_validate_akv_secret_name():
 
 
 def test_secret_ref_prefers_control_secret_key(monkeypatch):
-    monkeypatch.delenv("MT_SQL_SECRET_KEY", raising=False)
-    monkeypatch.setenv("MT_SQL_SECRET_SCOPE", "kv-scope")
+    monkeypatch.delenv("LAKEFED_SQL_SECRET_KEY", raising=False)
+    monkeypatch.setenv("LAKEFED_SQL_SECRET_SCOPE", "kv-scope")
     cfg = {"id": 1, "secret_key": "tenant-db-001", "src_connection": "legacy_conn"}
     assert ce.secret_ref(cfg) == ("kv-scope", "tenant-db-001")
 
 
 def test_secret_ref_legacy_fallback_and_missing(monkeypatch):
-    monkeypatch.delenv("MT_SQL_SECRET_KEY", raising=False)
-    monkeypatch.delenv("MT_SQL_SECRET_SCOPE", raising=False)
-    assert ce.secret_ref({"id": 1, "src_connection": "c1"}) == ("lakefed_ingest_mt", "c1_json")
+    monkeypatch.delenv("LAKEFED_SQL_SECRET_KEY", raising=False)
+    monkeypatch.delenv("LAKEFED_SQL_SECRET_SCOPE", raising=False)
+    assert ce.secret_ref({"id": 1, "src_connection": "c1"}) == ("lakefed_ingest", "c1_json")
     try:
         ce.secret_ref({"id": 2})
     except ValueError:
@@ -91,7 +91,7 @@ def test_secret_ref_legacy_fallback_and_missing(monkeypatch):
 
 def test_creds_are_keyed_per_secret_not_per_server(monkeypatch):
     # Two DBs on the SAME server with different credentials must not share a cache entry.
-    monkeypatch.delenv("MT_SQL_SECRET_KEY", raising=False)
+    monkeypatch.delenv("LAKEFED_SQL_SECRET_KEY", raising=False)
     a = {"id": 1, "src_host": "sql1", "secret_key": "db-a"}
     b = {"id": 2, "src_host": "sql1", "secret_key": "db-b"}
     assert ce.secret_ref(a) != ce.secret_ref(b)
@@ -107,9 +107,9 @@ def test_jdbc_url_trust_flag():
 
 
 def test_trust_server_certificate_env(monkeypatch):
-    monkeypatch.setenv("MT_SQL_TRUST_SERVER_CERT", "false")
+    monkeypatch.setenv("LAKEFED_SQL_TRUST_SERVER_CERT", "false")
     assert ce.trust_server_certificate() is False
-    monkeypatch.setenv("MT_SQL_TRUST_SERVER_CERT", "true")
+    monkeypatch.setenv("LAKEFED_SQL_TRUST_SERVER_CERT", "true")
     assert ce.trust_server_certificate() is True
 
 
@@ -129,7 +129,7 @@ def test_merge_sql_uses_given_view_and_handles_deletes():
 def test_engine_source_has_no_cache_or_persist():
     # Rule: read the source once, never .cache()/.persist() a source DataFrame.
     from pathlib import Path
-    src = (Path(__file__).parent.parent / "src" / "multitenant" / "ct_engine.py").read_text()
+    src = (Path(__file__).parent.parent / "src" / "lakefed_ingest" / "ct_engine.py").read_text()
     code = "\n".join(l for l in src.splitlines() if not l.strip().startswith(("#", "\"", "``")))
     assert ".cache()" not in code.replace("``.cache()``", "")
     assert ".persist(" not in code
@@ -192,7 +192,7 @@ def _resolve(monkeypatch, cfg, env_host=None):
     monkeypatch.setattr(ce, "_uc_host", lambda name: ("uc-host", 1500))
     ce._config_cache.clear()
     if env_host is None:
-        monkeypatch.delenv("MT_SQL_HOST", raising=False)
+        monkeypatch.delenv("LAKEFED_SQL_HOST", raising=False)
     return ce._jdbc_config(dict({"id": 1, "secret_key": "k"}, **cfg))
 
 
@@ -214,7 +214,7 @@ def test_jdbc_config_secret_host_last_resort(monkeypatch):
 def test_jdbc_config_no_host_raises(monkeypatch):
     monkeypatch.setattr(ce, "_creds", lambda scope, key: ("u", "p", None))
     ce._config_cache.clear()
-    monkeypatch.delenv("MT_SQL_HOST", raising=False)
+    monkeypatch.delenv("LAKEFED_SQL_HOST", raising=False)
     import pytest
     with pytest.raises(ValueError):
         ce._jdbc_config({"id": 1, "secret_key": "k"})
@@ -518,3 +518,87 @@ def test_ct_read_carries_the_retention_guard(monkeypatch):
     spark = _MergeSpark(result=_Row(num_affected_rows=0))
     ce.read_and_merge_ct(spark, _MERGE_CFG, "c.s.t", 5)
     assert ce.RETENTION_LAPSED_MARKER in seen.get("session_init", "") and "> 5" in seen["session_init"]
+
+
+# ---- source adapters: the JDBC read and the seed / full-load SQL follow control.src_type ----------
+
+class _Reader:
+    def __init__(self):
+        self.opts = {}
+
+    def format(self, f):
+        self.opts["format"] = f
+        return self
+
+    def option(self, k, v):
+        self.opts[k] = v
+        return self
+
+    def options(self, **kw):
+        self.opts.update(kw)
+        return self
+
+    def load(self):
+        return self.opts
+
+
+def test_read_uses_the_rows_adapter_url_driver_and_options(monkeypatch):
+    monkeypatch.setattr(ce, "_creds", lambda scope, key: ("u", "p", None))
+    monkeypatch.setenv("LAKEFED_SQL_TRUST_SERVER_CERT", "false")
+    ce._config_cache.clear()
+    spark = type("S", (), {"read": property(lambda self: _Reader())})()
+    cfg = {"id": 1, "secret_key": "k", "src_type": "oracle", "src_host": "ora1", "src_database": "SVC",
+           "jdbc_options": '{"fetchsize": "50000"}'}
+    got = ce._read(spark, cfg, "SELECT 1 FROM dual")
+    assert got["url"] == "jdbc:oracle:thin:@//ora1:1521/SVC"          # adapter default port
+    assert got["driver"] == "oracle.jdbc.OracleDriver" and got["fetchsize"] == "50000"
+    assert "sessionInitStatement" not in got
+    got = ce._read(spark, dict(cfg, src_type="sqlserver", jdbc_options=None, src_port=1500), "SELECT 1")
+    assert got["url"].startswith("jdbc:sqlserver://ora1:1500;") and "fetchsize" not in got
+
+
+def test_jdbc_config_port_defaults_per_adapter(monkeypatch):
+    for src_type, port in (("postgresql", 5432), ("mysql", 3306), (None, 1433)):
+        conf = _resolve(monkeypatch, {"src_host": "h", "src_type": src_type})
+        assert conf["port"] == port
+
+
+def test_seed_selects_in_the_sources_dialect(monkeypatch):
+    queries = []
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: queries.append(q) or _DF(sp, q))
+    cfg = {"id": 1, "src_type": "postgresql", "src_schema": "public", "src_table": "orders",
+           "select_list": "id, v"}
+    ce.seed(_FakeSpark(), cfg, "c.s.orders")
+    assert queries == ['SELECT "id", "v" FROM "public"."orders"']
+
+
+def test_partitioned_full_load_on_mysql_uses_mysql_sql(monkeypatch):
+    queries = []
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: queries.append(q) or _DF(sp, q))
+    cfg = {"id": 1, "src_type": "mysql", "load_type": "full", "src_schema": "app", "src_table": "big",
+           "select_list": "id, v", "load_partitioned": True, "partition_col": "id", "partition_size_mb": 1}
+    from concurrent.futures import ThreadPoolExecutor
+    import parallel
+    spark = _FakeSpark()
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        ce.seed(spark, cfg, "c.s.big", slots=parallel.WorkSlots(4), executor=ex)
+    assert "information_schema.tables" in queries[0]
+    assert queries[1] == "SELECT MIN(`id`) AS lb, MAX(`id`) AS ub FROM `app`.`big`"
+    parts = [q for q in queries[2:] if "1=0" not in q]
+    assert len(parts) == 10 and all(q.startswith("SELECT `id`, `v` FROM `app`.`big` WHERE ") for q in parts)
+    assert any("`id` >= " in q for q in parts)
+    assert spark.statements[-1] == "DROP TABLE IF EXISTS c.s.big__seed_staging"   # staged swap
+
+
+def test_source_group_key_uses_adapter_default_port():
+    a = {"src_type": "postgresql", "src_host": "h", "src_database": "d", "secret_key": "k"}
+    assert ce.source_group_key(a) == ("h", 5432, "d", "k")
+
+
+def test_require_table_ct_refuses_tables_without_ct(monkeypatch):
+    import pytest
+    monkeypatch.setattr(ce, "min_valid_version", lambda cfg, slots=None: None)
+    with pytest.raises(RuntimeError, match="not enabled on this source table"):
+        ce.require_table_ct({"src_schema": "dbo", "src_table": "t"})
+    monkeypatch.setattr(ce, "min_valid_version", lambda cfg, slots=None: 467)
+    assert ce.require_table_ct({"src_schema": "dbo", "src_table": "t"}) == 467

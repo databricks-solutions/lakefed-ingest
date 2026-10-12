@@ -5,14 +5,14 @@ Two halves:
     (dicts keyed by PK). "missing" = missed insert; "extra" = missed delete; "mismatched" = missed
     update. `ok` iff identical.
   * `SqlServerTestSource` — source-side ops against a test SQL Server DB (host/database from
-    MT_TEST_SQLSERVER_HOST / MT_TEST_SQLSERVER_DB or explicit args) via **pytds over TLS**
+    LAKEFED_TEST_SQLSERVER_HOST / LAKEFED_TEST_SQLSERVER_DB or explicit args) via **pytds over TLS**
     (pymssql fails on serverless), to stand up a CT-enabled table and generate I/U/D.
 
 Credential model:
   * READS (the ingest engine, ct_engine.py) use Spark JDBC with the per-database JSON secret named
     in control.secret_key (scope = the sweep's `secret_scope` parameter) — no UC connection.
   * WRITES / test-data (this harness) use pytds with creds from a Databricks secret (JSON
-    {user, password}, flat or nested), e.g. scope `lakefed_ingest_mt`.
+    {user, password}, flat or nested), e.g. scope `lakefed_ingest`.
 """
 from __future__ import annotations
 
@@ -56,8 +56,8 @@ class SqlServerTestSource:
     """pytds (TLS) wrapper for standing up CT test data on the Azure SQL test DB."""
 
     # No hardcoded test environment: host/database/secret key come from env or explicit args.
-    DEFAULT_HOST = os.environ.get("MT_TEST_SQLSERVER_HOST", "")
-    DEFAULT_DB = os.environ.get("MT_TEST_SQLSERVER_DB", "")
+    DEFAULT_HOST = os.environ.get("LAKEFED_TEST_SQLSERVER_HOST", "")
+    DEFAULT_DB = os.environ.get("LAKEFED_TEST_SQLSERVER_DB", "")
 
     def __init__(self, host: str, database: str, user: str, password: str, port: int = 1433):
         self.host, self.database, self.user, self.password, self.port = \
@@ -66,10 +66,10 @@ class SqlServerTestSource:
     @classmethod
     def from_env(cls) -> "SqlServerTestSource":
         return cls(
-            host=os.environ.get("MT_TEST_SQLSERVER_HOST", cls.DEFAULT_HOST),
-            database=os.environ.get("MT_TEST_SQLSERVER_DB", cls.DEFAULT_DB),
-            user=os.environ["MT_TEST_SQLSERVER_USER"],
-            password=os.environ["MT_TEST_SQLSERVER_PASSWORD"],
+            host=os.environ.get("LAKEFED_TEST_SQLSERVER_HOST", cls.DEFAULT_HOST),
+            database=os.environ.get("LAKEFED_TEST_SQLSERVER_DB", cls.DEFAULT_DB),
+            user=os.environ["LAKEFED_TEST_SQLSERVER_USER"],
+            password=os.environ["LAKEFED_TEST_SQLSERVER_PASSWORD"],
         )
 
     @classmethod
@@ -79,8 +79,8 @@ class SqlServerTestSource:
         return cls(host=host, database=database, user=user, password=password)
 
     @classmethod
-    def from_databricks(cls, dbutils, scope: str = "lakefed_ingest_mt",
-                        key: str = os.environ.get("MT_TEST_SQLSERVER_SECRET_KEY", ""),
+    def from_databricks(cls, dbutils, scope: str = "lakefed_ingest",
+                        key: str = os.environ.get("LAKEFED_TEST_SQLSERVER_SECRET_KEY", ""),
                         host: str = DEFAULT_HOST,
                         database: str = DEFAULT_DB) -> "SqlServerTestSource":
         return cls.from_secret_json(dbutils.secrets.get(scope, key), host, database)

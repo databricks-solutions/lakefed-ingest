@@ -14,6 +14,7 @@ takes NULLs (``< ub OR col IS NULL``) and the last is open-ended (``>= lb``), so
 exactly one partition even if the bounds are stale. Numeric, date, and datetime columns are
 supported (date/datetime via UTC epoch seconds).
 
+Dialect-specific SQL (quoting, literals, size/bounds queries) comes from ``source_adapters``.
 Pure Python — no Spark/dbutils imports — so it is unit-tested off-cluster.
 """
 
@@ -34,27 +35,22 @@ def num_partitions_for(table_size_mb, partition_size_mb) -> int:
     return max(int(size / per), 2)
 
 
-def table_size_mb_query(src_schema: str, src_table: str) -> str:
-    """T-SQL returning one row ``table_size_mb`` for a SQL Server table (data + index pages), as in
-    the original ``_get_table_size_sqlserver``."""
-    schema = src_schema.replace("'", "''")
-    table = src_table.replace("'", "''")
-    return (
-        "SELECT CAST(ROUND((SUM(a.total_pages) * 8) / 1024.0, 2) AS NUMERIC(36, 2)) AS table_size_mb"
-        " FROM sys.tables t"
-        " JOIN sys.indexes i ON t.object_id = i.object_id"
-        " JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id"
-        " JOIN sys.allocation_units a ON p.partition_id = a.container_id"
-        " LEFT OUTER JOIN sys.schemas s ON t.schema_id = s.schema_id"
-        f" WHERE s.name = '{schema}' AND t.name = '{table}'"
-        " AND t.is_ms_shipped = 0 AND i.object_id > 255"
-    )
+def table_size_mb_query(src_schema: str, src_table: str, adapter=None) -> str:
+    """Query returning one row ``table_size_mb`` for the table (data + indexes), in the source's
+    dialect (``adapter``, default SQL Server — the original ``_get_table_size_sqlserver``)."""
+    return _adapter(adapter).table_size_mb_query(src_schema, src_table)
 
 
-def bounds_query(src_schema: str, src_table: str, partition_col: str) -> str:
-    """T-SQL returning one row ``(lb, ub)`` = MIN/MAX of the partition column."""
-    col = f"[{partition_col}]"
-    return f"SELECT MIN({col}) AS lb, MAX({col}) AS ub FROM [{src_schema}].[{src_table}]"
+def bounds_query(src_schema: str, src_table: str, partition_col: str, adapter=None) -> str:
+    """Query returning one row ``(lb, ub)`` = MIN/MAX of the partition column."""
+    return _adapter(adapter).bounds_query(src_schema, src_table, partition_col)
+
+
+def _adapter(adapter):
+    if adapter is not None:
+        return adapter
+    import source_adapters
+    return source_adapters.get_adapter(source_adapters.SQLSERVER)
 
 
 def get_internal_bound_value(bound_value) -> int:
@@ -73,24 +69,18 @@ def get_internal_bound_value(bound_value) -> int:
     )
 
 
-def bound_value_to_str(bound_value: int, bound_value_orig) -> str:
+def bound_value_to_str(bound_value: int, bound_value_orig, adapter=None) -> str:
     """Render an internal (int) bound back to a SQL literal of the original column type."""
-    if isinstance(bound_value_orig, (int, float, Decimal)) and not isinstance(bound_value_orig, bool):
-        return str(bound_value)
-    if isinstance(bound_value_orig, datetime):
-        return f"'{datetime.fromtimestamp(bound_value, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}'"
-    if isinstance(bound_value_orig, date):
-        return f"'{datetime.fromtimestamp(bound_value, tz=timezone.utc).strftime('%Y-%m-%d')}'"
-    raise ValueError(
-        f"Unsupported data type: {type(bound_value_orig)}. Only int, date, and datetime are supported"
-    )
+    return _adapter(adapter).render_bound(bound_value, bound_value_orig)
 
 
-def get_partition_list(partition_col: str, lower_bound, upper_bound, num_partitions: int) -> List[dict]:
+def get_partition_list(partition_col: str, lower_bound, upper_bound, num_partitions: int,
+                       adapter=None) -> List[dict]:
     """WHERE clauses for ``num_partitions`` partitions that together cover every row exactly once.
 
     Faithful port of the original ``get_partition_list`` (Spark-JDBC-derived stride; NULLs in the
-    first partition), with the column bracket-quoted for SQL Server. Returns
+    first partition). The column is quoted and bounds rendered in the source's dialect (``adapter``,
+    default SQL Server: ``[col]`` and plain string date/datetime literals). Returns
     ``[{"id": i, "where_clause": "..."}]``.
     """
     if type(lower_bound) is not type(upper_bound):
@@ -101,7 +91,8 @@ def get_partition_list(partition_col: str, lower_bound, upper_bound, num_partiti
     num_partitions = int(num_partitions)
     if num_partitions < 1:
         raise ValueError("num_partitions must be >= 1")
-    col = f"[{partition_col}]"
+    dialect = _adapter(adapter)
+    col = dialect.quote_ident(partition_col)
     lower_bound_orig = lower_bound
     lower = get_internal_bound_value(lower_bound)
     upper = get_internal_bound_value(upper_bound)
@@ -113,9 +104,9 @@ def get_partition_list(partition_col: str, lower_bound, upper_bound, num_partiti
     stride = int(upper / num_partitions - lower / num_partitions)
     current = lower
     for i in range(num_partitions):
-        lb = f"{col} >= {bound_value_to_str(current, lower_bound_orig)}" if i != 0 else None
+        lb = f"{col} >= {dialect.render_bound(current, lower_bound_orig)}" if i != 0 else None
         current += stride
-        ub = (f"{col} < {bound_value_to_str(current, lower_bound_orig)}"
+        ub = (f"{col} < {dialect.render_bound(current, lower_bound_orig)}"
               if i != num_partitions - 1 else None)
         if ub is None:
             where = lb

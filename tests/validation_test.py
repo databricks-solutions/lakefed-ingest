@@ -31,10 +31,10 @@ def test_extract_creds_raises_when_missing():
 
 
 @pytest.mark.skipif(
-    not os.environ.get("MT_TEST_SQLSERVER_USER"),
-    reason="set MT_TEST_SQLSERVER_{USER,PASSWORD} (+ optional HOST/DB) to hit the Azure SQL test DB",
+    not os.environ.get("LAKEFED_TEST_SQLSERVER_USER"),
+    reason="set LAKEFED_TEST_SQLSERVER_{USER,PASSWORD} (+ optional HOST/DB) to hit the Azure SQL test DB",
 )
 def test_sqlserver_source_roundtrip():
     src = vh.SqlServerTestSource.from_env()
-    src.create_ct_table("dbo", "mt_ct_test")
-    assert isinstance(src.snapshot("dbo", "mt_ct_test"), dict)
+    src.create_ct_table("dbo", "ct_test")
+    assert isinstance(src.snapshot("dbo", "ct_test"), dict)

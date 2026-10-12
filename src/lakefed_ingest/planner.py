@@ -1,12 +1,14 @@
-"""Skip-no-change planning for the consolidated sweep — pure, unit-testable (no Spark, no DB).
+"""Run planning: strategy routing + CT skip-no-change — pure, unit-testable (no Spark, no DB).
 
-The sweep calls these with injected functions for the source queries, so the routing and
-bookkeeping rules can be tested with fakes:
+The ingestion notebook calls these with injected functions for the source queries, so the routing
+and bookkeeping rules can be tested with fakes:
 
-* ``route_tables`` — from the bulk-loaded checkpoints, route each control row to ``seed`` /
-  ``schema_reseed`` / legacy check / detection candidate.
-* ``group_by_source`` — candidates grouped by source database (CT versions are per database and
-  are NOT comparable across databases).
+* ``route_tables`` — per control row, by its load strategy (``load_type``) and source adapter
+  (``src_type``): an unsupported pair (or a placeholder strategy) -> ``unsupported`` (the row fails
+  on its own with a clear message); ``full`` -> ``full`` (reload every cycle); ``ct`` -> from the
+  bulk-loaded checkpoint, ``seed`` / ``schema_reseed`` / legacy check / detection candidate.
+* ``group_by_source`` — candidates grouped by (source database, load_type): CT versions are per
+  database and are NOT comparable across databases.
 * ``detect_group`` — one database: capture ``cur`` ONCE, fast-exit when every checkpoint is
   already >= cur, otherwise batched detection; classify each table as changed / unchanged /
   reseed. Every unchanged row and every merge plan carries THIS group's ``cur``. If the database
@@ -20,24 +22,41 @@ the advanced checkpoint (at-least-once; the MERGE is idempotent).
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Tuple
+from typing import Optional, Callable, Dict, List, Tuple
 
 import ct_engine
+import load_strategies as ls
 import state_store as ss
+
+_CT = ls.get_strategy(ls.CT)
+
+
+def ct_position(cp: dict) -> int:
+    """The CT version a CT checkpoint is at (``position`` text; NULL -> 0)."""
+    return _CT.decode_position(cp.get("position"))
 
 
 def route_tables(configs: List[dict], checkpoints: Dict[int, dict]):
     """Returns ``(plans, candidates, legacy)``.
 
-    plans      — seed (no checkpoint / phase seeding) and schema_reseed (select_list gained columns
-                 vs the recorded one) routes, ready for the per-table worker;
-    candidates — [(cfg, cp)] cdc tables to run through change detection;
+    plans      — unsupported (pair not in the support matrix; carries ``error``), full (reload),
+                 seed (no CT checkpoint / phase seeding) and schema_reseed (select_list gained
+                 columns vs the recorded one) routes, ready for the worker;
+    candidates — [(cfg, cp)] CT tables in the cdc phase to run through change detection;
     legacy     — [(cfg, cp)] cdc tables with no recorded select_list (caller checks the sink once).
     """
     plans, candidates, legacy = [], [], []
     for cfg in configs:
         cp = checkpoints.get(int(cfg["id"]))
-        if cp is None or cp.get("phase") != ss.CDC:
+        reason = ls.unsupported_reason(cfg.get("src_type"), cfg.get("load_type"))
+        if reason:
+            plans.append({"cfg": cfg, "route": "unsupported", "cp": cp, "error": reason})
+            continue
+        if ss.strategy_name(cfg) == ls.FULL:
+            plans.append({"cfg": cfg, "route": "full", "cp": cp})
+            continue
+        # CT. A checkpoint written by another strategy (load_type changed) can't be resumed: seed.
+        if cp is None or cp.get("phase") != ss.CDC or (cp.get("strategy") or ls.CT) != ls.CT:
             plans.append({"cfg": cfg, "route": "seed", "cp": cp})
             continue
         added = ss.select_list_added_columns(cfg["select_list"], cp.get("select_list"))
@@ -51,18 +70,28 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict]):
 
 
 def group_by_source(candidates) -> Dict[tuple, list]:
+    """{(source database key, load_type): [(cfg, cp)]} — one detection group per source database
+    and strategy."""
     groups: Dict[tuple, list] = {}
     for cfg, cp in candidates:
-        groups.setdefault(ct_engine.source_group_key(cfg), []).append((cfg, cp))
+        key = (ct_engine.source_group_key(cfg), ss.strategy_name(cfg))
+        groups.setdefault(key, []).append((cfg, cp))
     return groups
 
 
-def detect_group(members, current_version: Callable, detect: Callable, record_sl=frozenset()) -> dict:
+def detect_group(members, current_version: Callable, detect: Callable, record_sl=frozenset(),
+                 ct_status: Optional[Callable] = None) -> dict:
     """Plan ONE source database.
 
     ``current_version(cfg) -> int``; ``detect(cfg, items) -> (results, failed_ids, queries)`` where
     items = [(control_id, schema, table, checkpoint)] and results {control_id: (mv, changed)}.
     ``record_sl`` = control ids whose select_list should be recorded on the bulk advance (legacy).
+    ``ct_status(cfg) -> {(schema, table): min_valid_version}`` lists the database's CT-enabled tables
+    (keys lower-cased). It runs BEFORE the fast exit: disabling or re-enabling CT on a single table
+    doesn't move the database version, so without it a quiet database would never notice. A table
+    that lost CT is routed to reseed (its seed then fails visibly until CT is back); one whose min valid version passed its checkpoint (CT
+    re-enabled, or retention lapsed on a quiet database) is routed to reseed, as is one whose CT
+    begin_version differs from the value recorded at seed time (CT turned off and on between cycles).
 
     Returns {cur, plans, unchanged: [(control_id, cur, select_list|None)], failed: [(cfg, cp, error)],
     queries, fast_exit, fallback}.
@@ -86,7 +115,7 @@ def detect_group(members, current_version: Callable, detect: Callable, record_sl
 
     # A checkpoint AHEAD of the database's current version means CT versions were reset (restore
     # from backup, CT disabled and re-enabled): changes since can't be read from the checkpoint.
-    reset = [(c, cp) for c, cp in members if cp["ct_version"] is not None and int(cp["ct_version"]) > cur]
+    reset = [(c, cp) for c, cp in members if ct_position(cp) > cur]
     for c, cp in reset:
         out["plans"].append({"cfg": c, "route": "retention_reseed", "cp": cp, "reason": "ct_version_reset"})
     if reset:
@@ -95,16 +124,46 @@ def detect_group(members, current_version: Callable, detect: Callable, record_sl
         if not members:
             return out
 
+    begin = {}  # control_id -> current CT begin_version (recorded when the checkpoint lacks one)
+    if ct_status is not None:
+        try:
+            status = ct_status(cfg0)
+            out["queries"] += 1
+        except Exception as e:  # can't confirm per-table CT state: don't risk a silent fast exit
+            err = f"change detection: CT table status query failed: {str(e).splitlines()[0][:400] if str(e) else e!r}"
+            out["failed"].extend((c, cp, err) for c, cp in members)
+            return out
+        keep = []
+        for c, cp in members:
+            key = (str(c["src_schema"]).lower(), str(c["src_table"]).lower())
+            if key not in status:
+                # CT off on this table: re-seed it. Its seed refuses to run while CT is off (visible
+                # failure every cycle) and succeeds once CT is back — changes made meanwhile included.
+                out["plans"].append({"cfg": c, "route": "retention_reseed", "cp": cp, "reason": "ct_disabled"})
+                continue
+            mv, bv = status[key]
+            recorded = cp.get("ct_begin_version")
+            if mv is None or int(mv) > ct_position(cp):
+                out["plans"].append({"cfg": c, "route": "retention_reseed", "cp": cp, "reason": "retention_miss"})
+            elif recorded is not None and bv is not None and int(bv) != int(recorded):
+                out["plans"].append({"cfg": c, "route": "retention_reseed", "cp": cp, "reason": "ct_reenabled"})
+            else:
+                begin[int(c["id"])] = bv
+                keep.append((c, cp))
+        members = keep
+        if not members:
+            return out
+
     def unchanged_row(c):
         cid = int(c["id"])
-        return (cid, cur, c["select_list"] if cid in record_sl else None)
+        return (cid, cur, c["select_list"] if cid in record_sl else None, begin.get(cid))
 
-    if ct_engine.all_current([cp["ct_version"] for _, cp in members], cur):
+    if ct_engine.all_current([ct_position(cp) for _, cp in members], cur):
         out["fast_exit"] = True
         out["unchanged"] = [unchanged_row(c) for c, _ in members]
         return out
 
-    items = [(int(c["id"]), c["src_schema"], c["src_table"], cp["ct_version"]) for c, cp in members]
+    items = [(int(c["id"]), c["src_schema"], c["src_table"], ct_position(cp)) for c, cp in members]
     try:
         res, failed_ids, q = detect(cfg0, items)
     except Exception as e:  # whole detection failed for this database
@@ -119,11 +178,11 @@ def detect_group(members, current_version: Callable, detect: Callable, record_sl
             out["plans"].append({"cfg": c, "route": "fallback", "cp": cp})
             out["fallback"] += 1
             continue
-        kind = ct_engine.classify(cp["ct_version"], *res[cid])
+        kind = ct_engine.classify(ct_position(cp), *res[cid])
         if kind == "reseed":
             out["plans"].append({"cfg": c, "route": "retention_reseed", "cp": cp})
         elif kind == "changed":
-            out["plans"].append({"cfg": c, "route": "merge", "cp": cp, "cur": cur})
+            out["plans"].append({"cfg": c, "route": "merge", "cp": cp, "cur": cur, "ct_begin": begin.get(cid)})
         else:
             out["unchanged"].append(unchanged_row(c))
     return out

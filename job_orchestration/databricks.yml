@@ -1,0 +1,44 @@
+# This is a Databricks asset bundle definition for lakefed_ingest.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+bundle:
+  name: lakefed_ingest
+  uuid: 988e06fe-e6fb-4a5f-9c09-47ebf5ea2636
+
+include:
+  - resources/*.yml
+
+# Variable declarations. These variables are assigned in the dev/prod targets below.
+variables:
+  warehouse_id:
+    description: Lookup ID of an existing warehouse
+  concurrency:
+    description: Concurrency of for each tasks. Can be overridden during deployment.
+
+targets:
+  dev:
+    # The default target uses 'mode: development' to create a development copy.
+    # - Deployed resources get prefixed with '[dev my_user_name]'
+    # - Any job schedules and triggers are paused by default.
+    # See also https://docs.databricks.com/dev-tools/bundles/deployment-modes.html.
+    mode: development
+    default: true
+    workspace:
+      host: https://company-dev.cloud.databricks.com/
+    variables:
+      warehouse_id:
+        lookup:
+          warehouse: "Serverless Warehouse"
+      concurrency: 16
+
+
+  prod:
+    mode: production
+    workspace:
+      host: https://company-prd.cloud.databricks.com/
+      # Use fixed location to make sure we only have a single copy.
+      # If this path results in an error, please make sure you have a recent version of the CLI installed.
+      root_path: /Workspace/${bundle.name}
+    variables:
+      cluster_id: 0709-132523-cnhxf2p6
+      warehouse_id: 4b9b953939869799
+      concurrency: 16

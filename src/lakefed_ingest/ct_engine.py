@@ -1,12 +1,15 @@
-"""Change-Tracking engine — IMPLEMENTED (workstreams A/B/F).
+"""Source engine: Spark JDBC reads, seeds / full loads, and the Change-Tracking (CT) strategy.
 
-Fills the functions the consolidated sweep (``copy_data_sweep.ipynb``) calls. Every
-source-touching / CT operation lives here so the orchestration (threading, FAIR pools, Lakebase
-checkpointing, failure isolation) stays strategy-agnostic.
+Fills the functions the ingestion notebook (``ingest.ipynb``) calls. Every source-touching
+operation lives here so the orchestration (threading, FAIR pools, Lakebase checkpointing, failure
+isolation) stays strategy-agnostic. Dialect-specific SQL (JDBC URL, driver, quoting, SELECT /
+size / bounds queries) comes from the row's source adapter (``source_adapters``, chosen by
+``control.src_type``); the CT functions (CHANGETABLE, detection, retention guard) are SQL Server-only.
 
-Transport = **Spark JDBC on the cluster** (`spark.read.format("jdbc")` with the Microsoft SQL
-Server driver bundled in Databricks Runtime). No SQL warehouse and no UC connection are required:
-the source read lands as a natively-typed DataFrame straight into the Delta write/MERGE.
+Transport = **Spark JDBC on the cluster** (`spark.read.format("jdbc")`; the SQL Server and
+PostgreSQL drivers ship with Databricks Runtime, Oracle / MySQL need a cluster library). No SQL
+warehouse and no UC connection are required: the source read lands as a natively-typed DataFrame
+straight into the Delta write/MERGE.
 
 Single source read, no caching: ``seed`` streams the JDBC read straight into the Delta overwrite and
 ``read_and_merge_ct`` feeds the CHANGETABLE read straight into the MERGE; row counts come from Delta
@@ -16,15 +19,18 @@ guarantees a non-Delta (JDBC) source is evaluated once — we add no ``.cache()`
 
 Connection (per control row ``cfg``, keyed by ``state_store.CONTROL_COLUMNS``):
   * host/port: ``cfg['src_host']``/``cfg['src_port']`` -> (legacy) the UC connection named in
-    ``cfg['src_connection']`` -> the secret's own host field -> env ``MT_SQL_HOST``.
+    ``cfg['src_connection']`` -> the secret's own host field -> env ``LAKEFED_SQL_HOST``.
+  * port: ``cfg['src_port']`` -> the adapter's default (1433 / 1521 / 5432 / 3306).
   * credentials: secret ``scope``/``key`` holding JSON ``{user, password}`` (flat or nested):
-      - scope = env ``MT_SQL_SECRET_SCOPE`` (default ``"lakefed_ingest_mt"``; may be an Azure Key
+      - scope = env ``LAKEFED_SQL_SECRET_SCOPE`` (default ``"lakefed_ingest"``; may be an Azure Key
         Vault-backed scope — note AKV secret names allow only alphanumerics and dashes, see
         ``validate_akv_secret_name``)
-      - key   = ``cfg['secret_key']`` -> env ``MT_SQL_SECRET_KEY`` -> legacy ``f"{src_connection}_json"``
+      - key   = ``cfg['secret_key']`` -> env ``LAKEFED_SQL_SECRET_KEY`` -> legacy ``f"{src_connection}_json"``
     Credentials are cached per (scope, key) — one secret per tenant database — never per server.
-  * TLS: ``trustServerCertificate`` from env ``MT_SQL_TRUST_SERVER_CERT`` (default ``true`` for dev;
-    production should set ``false`` and present a trusted server certificate).
+  * TLS: env ``LAKEFED_SQL_TRUST_SERVER_CERT`` (default ``true`` for dev; production should set
+    ``false`` and present a trusted server certificate) — mapped per adapter (SQL Server
+    trustServerCertificate, PostgreSQL sslmode, MySQL sslMode).
+  * extra Spark JDBC read options: adapter defaults (e.g. fetchsize) + ``cfg['jdbc_options']`` (JSON).
 Concurrency: every function that does query work takes an optional ``slots``
 (``parallel.WorkSlots``) and runs each UNIT of work — one source query, one read->write/MERGE, one
 partition, the staging->target swap — while holding exactly ONE slot. The sweep creates one
@@ -46,8 +52,10 @@ import threading
 import uuid
 from typing import List, Optional, Tuple
 
-_DEFAULT_SECRET_SCOPE = "lakefed_ingest_mt"
-_JDBC_DRIVER = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+import source_adapters
+
+_DEFAULT_SECRET_SCOPE = "lakefed_ingest"
+_SQLSERVER = source_adapters.get_adapter(source_adapters.SQLSERVER)
 _USER_KEYS = ("user", "username", "userName", "login", "uid")
 _PWD_KEYS = ("password", "pwd", "passwd")
 _HOST_KEYS = ("host", "server", "dsn")
@@ -134,12 +142,12 @@ def validate_akv_secret_name(name: str) -> str:
 def secret_ref(cfg: dict) -> Tuple[str, str]:
     """(scope, key) holding this task's SQL Server credentials — the creds cache key.
 
-    key precedence: ``cfg['secret_key']`` -> env ``MT_SQL_SECRET_KEY`` -> legacy
+    key precedence: ``cfg['secret_key']`` -> env ``LAKEFED_SQL_SECRET_KEY`` -> legacy
     ``f"{src_connection}_json"``. Never derived from the server alone: each tenant database may
     carry its own credential even when it shares a server with others.
     """
-    scope = os.environ.get("MT_SQL_SECRET_SCOPE", _DEFAULT_SECRET_SCOPE)
-    key = cfg.get("secret_key") or os.environ.get("MT_SQL_SECRET_KEY")
+    scope = os.environ.get("LAKEFED_SQL_SECRET_SCOPE", _DEFAULT_SECRET_SCOPE)
+    key = cfg.get("secret_key") or os.environ.get("LAKEFED_SQL_SECRET_KEY")
     if not key and cfg.get("src_connection"):
         key = f"{cfg['src_connection']}_json"
     if not key:
@@ -153,14 +161,11 @@ def config_cache_key(host: str, port: int, scope: str, key: str) -> tuple:
 
 
 def trust_server_certificate() -> bool:
-    return os.environ.get("MT_SQL_TRUST_SERVER_CERT", "true").strip().lower() in ("1", "true", "yes")
+    return os.environ.get("LAKEFED_SQL_TRUST_SERVER_CERT", "true").strip().lower() in ("1", "true", "yes")
 
 
-def jdbc_url(host: str, port: int, database: str, trust_cert: bool) -> str:
-    return (
-        f"jdbc:sqlserver://{host}:{int(port)};databaseName={database};encrypt=true;"
-        f"trustServerCertificate={'true' if trust_cert else 'false'}"
-    )
+def jdbc_url(host: str, port: int, database: str, trust_cert: bool, src_type: str = None) -> str:
+    return source_adapters.get_adapter(src_type).jdbc_url(host, port, database, trust_cert)
 
 
 _lock = threading.Lock()
@@ -179,7 +184,7 @@ def _extract_creds(blob):
         user, pwd = pick(cand, _USER_KEYS), pick(cand, _PWD_KEYS)
         if user and pwd:
             return user, pwd, pick(cand, _HOST_KEYS)
-    raise ValueError("could not find user/password fields in the SQL Server secret")
+    raise ValueError("could not find user/password fields in the source credential secret")
 
 
 def _creds(scope: str, key: str):
@@ -213,10 +218,10 @@ def _jdbc_config(cfg: dict) -> dict:
     if not host and cfg.get("src_connection"):
         host, uc_port = _uc_host(cfg["src_connection"])
         port = port or uc_port
-    host = host or secret_host or os.environ.get("MT_SQL_HOST")
+    host = host or secret_host or os.environ.get("LAKEFED_SQL_HOST")
     if not host:
         raise ValueError(f"control row {cfg.get('id')}: no src_host could be resolved")
-    port = int(port or 1433)
+    port = int(port or source_adapters.for_cfg(cfg).default_port)
     ck = config_cache_key(host, port, scope, key)
     with _lock:
         if ck not in _config_cache:
@@ -230,17 +235,19 @@ def _spark():
 
 
 def _read(spark, cfg: dict, query: str, session_init: Optional[str] = None):
-    """Run a T-SQL query against the source via Spark JDBC; returns a natively-typed DataFrame.
+    """Run a query (in the source's dialect) via Spark JDBC; returns a natively-typed DataFrame.
     Lazy — the source is only queried when the DataFrame is consumed (once, by the write/MERGE)."""
+    adapter = source_adapters.for_cfg(cfg)
     conf = _jdbc_config(cfg)
     return (
         spark.read.format("jdbc")
-        .option("url", jdbc_url(conf["host"], conf["port"], cfg["src_database"],
-                                trust_server_certificate()))
+        .options(**adapter.read_options(cfg))
+        .option("url", adapter.jdbc_url(conf["host"], conf["port"], cfg["src_database"],
+                                        trust_server_certificate()))
         .option("query", query)
         .option("user", conf["user"])
         .option("password", conf["password"])
-        .option("driver", _JDBC_DRIVER)
+        .option("driver", adapter.driver)
         .options(**({"sessionInitStatement": session_init} if session_init else {}))
         .load()
     )
@@ -273,6 +280,51 @@ def current_version(cfg: dict, slots=None) -> Optional[int]:
     return int(row["v"]) if row and row["v"] is not None else None
 
 
+CT_TABLE_STATUS_SQL = (
+    "SELECT s.name AS sch, t.name AS tbl, "
+    "CAST(CHANGE_TRACKING_MIN_VALID_VERSION(t.object_id) AS BIGINT) AS mv, "
+    "CAST(c.begin_version AS BIGINT) AS bv "
+    "FROM sys.change_tracking_tables AS c "
+    "JOIN sys.tables AS t ON t.object_id = c.object_id "
+    "JOIN sys.schemas AS s ON s.schema_id = t.schema_id")
+
+
+def ct_table_status(cfg: dict, slots=None) -> dict:
+    """{(schema, table) lower-cased: (min_valid_version, begin_version)} for every CT-enabled table in
+    the source database — ONE metadata query per database per cycle (rows are table names, not data).
+    Checked before the fast exit: per-table CT disable/re-enable doesn't move the database version.
+    ``begin_version`` is the database version when CT (re)started on the table; a change from the
+    value recorded at seed time means CT was re-enabled since, so the table must re-seed."""
+    with _unit(slots):
+        rows = _read(_spark(), cfg, CT_TABLE_STATUS_SQL).collect()
+    as_int = lambda v: int(v) if v is not None else None
+    return {(str(r["sch"]).lower(), str(r["tbl"]).lower()): (as_int(r["mv"]), as_int(r["bv"])) for r in rows}
+
+
+def ct_begin_version(cfg: dict, slots=None) -> Optional[int]:
+    """The table's CT begin_version (database version when CT started on it), recorded at seed time."""
+    obj = quote_nstr(f"{quote_ident(cfg['src_schema'])}.{quote_ident(cfg['src_table'])}")
+    with _unit(slots):
+        row = _read(_spark(), cfg,
+                    "SELECT CAST(begin_version AS BIGINT) AS bv FROM sys.change_tracking_tables "
+                    f"WHERE object_id = OBJECT_ID({obj})").first()
+    return int(row["bv"]) if row and row["bv"] is not None else None
+
+
+CT_TABLE_NOT_ENABLED_MSG = ("Change Tracking is not enabled on this source table "
+                            "(CHANGE_TRACKING_MIN_VALID_VERSION() is NULL); enable it, then the table re-seeds")
+
+
+def require_table_ct(cfg: dict, slots=None) -> int:
+    """Raise unless Change Tracking is enabled on the TABLE; returns its min valid version. The seed
+    calls this before copying: seeding a table without CT would checkpoint it as cdc, after which its
+    changes are invisible (it never appears in CHANGETABLE, and a quiet database fast-exits)."""
+    mv = min_valid_version(cfg, slots=slots)
+    if mv is None:
+        raise RuntimeError(CT_TABLE_NOT_ENABLED_MSG)
+    return mv
+
+
 def min_valid_version(cfg: dict, slots=None) -> Optional[int]:
     """(F) CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID('<schema>.<table>')). None when CT is not
     enabled on the table -> state_store.is_reseed_needed treats None as 'reseed'."""
@@ -289,19 +341,13 @@ def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
     JDBC dialect infers the Spark schema natively). Idempotent. The 0-row read is one unit."""
     if spark.catalog.tableExists(sink_fqn):
         return
-    cols = ", ".join(f"[{c}]" for c in _split(cfg["select_list"]))
     with _unit(slots):
-        empty = _read(spark, cfg,
-                      f"SELECT {cols} FROM [{cfg['src_schema']}].[{cfg['src_table']}] WHERE 1=0")
+        empty = _read(spark, cfg, source_adapters.for_cfg(cfg).select_sql(cfg, where="1=0"))
         empty.write.format("delta").mode("ignore").saveAsTable(sink_fqn)
         # Type widening lets schema-evolving writes apply safe widenings (int->bigint, float->double,
         # decimal precision) when a client's column type is wider. New sinks only; existing sinks:
         # ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true').
         spark.sql(f"ALTER TABLE {sink_fqn} SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')")
-
-
-def _select_cols(cfg: dict) -> str:
-    return ", ".join(f"[{c}]" for c in _split(cfg["select_list"]))
 
 
 def _is_partitioned(cfg: dict) -> bool:
@@ -341,13 +387,13 @@ DEFAULT_DETECTION_CHUNK = 200
 
 
 def quote_ident(name: str) -> str:
-    """SQL Server bracket-quoted identifier (``]`` doubled)."""
-    return "[" + str(name).replace("]", "]]") + "]"
+    """SQL Server bracket-quoted identifier (``]`` doubled) — the CT SQL below is SQL Server-only."""
+    return _SQLSERVER.quote_ident(name)
 
 
 def quote_nstr(value: str) -> str:
     """SQL Server N'...' unicode string literal (``'`` doubled)."""
-    return "N'" + str(value).replace("'", "''") + "'"
+    return _SQLSERVER.quote_str(value)
 
 
 RETENTION_LAPSED_MARKER = "CT_RETENTION_LAPSED"
@@ -377,7 +423,8 @@ def source_group_key(cfg: dict) -> tuple:
     CHANGE_TRACKING_CURRENT_VERSION() capture and batched change detection."""
     host = (cfg.get("src_host") or cfg.get("src_connection") or "").lower()
     key = cfg.get("secret_key") or cfg.get("src_connection") or ""
-    return (host, int(cfg.get("src_port") or 1433), cfg.get("src_database"), key)
+    port = int(cfg.get("src_port") or source_adapters.for_cfg(cfg).default_port)
+    return (host, port, cfg.get("src_database"), key)
 
 
 def chunked(items: list, size: int) -> List[list]:
@@ -456,10 +503,11 @@ def _insert_overwrite(spark, sink_fqn: str, source: str, cols: List[str]) -> int
 
 
 def seed(spark, cfg: dict, sink_fqn: str, slots=None, executor=None, guard=None) -> int:
-    """(B seed) Full copy of the current table state into the Delta bronze sink.
+    """(B seed) Full copy of the current table state into the Delta bronze sink — the CT seed and
+    every cycle of the ``full`` strategy (any source adapter).
 
-    Called after current_version() captured V0, so rows changed during the seed are reconciled on the
-    first cdc cycle by the idempotent PK MERGE (no gap, no dupe).
+    For CT, called after current_version() captured V0, so rows changed during the seed are
+    reconciled on the first cdc cycle by the idempotent PK MERGE (no gap, no dupe).
 
     * Non-partitioned: ONE unit — one JDBC read streams straight into a data-only ``INSERT OVERWRITE``
       (a single atomic commit); rows come from the INSERT's own metrics.
@@ -472,7 +520,7 @@ def seed(spark, cfg: dict, sink_fqn: str, slots=None, executor=None, guard=None)
     if _is_partitioned(cfg):
         return _partitioned_seed(spark, cfg, sink_fqn, slots, executor, guard)
     with _unit(slots):
-        df = _read(spark, cfg, f"SELECT {_select_cols(cfg)} FROM [{cfg['src_schema']}].[{cfg['src_table']}]")
+        df = _read(spark, cfg, source_adapters.for_cfg(cfg).select_sql(cfg))
         view = f"seed_full_{uuid.uuid4().hex}"
         df.createOrReplaceTempView(view)
         try:
@@ -484,7 +532,7 @@ def seed(spark, cfg: dict, sink_fqn: str, slots=None, executor=None, guard=None)
 def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=None) -> int:
     """Size-bounded, staged, atomic partitioned seed (the accelerator's partitioning strategy).
 
-    1. table size (SQL Server catalog) and MIN/MAX of ``partition_col`` — one unit each;
+    1. table size (source catalog, per adapter) and MIN/MAX of ``partition_col`` — one unit each;
     2. ``num_partitions = max(size_mb / partition_size_mb, 2)``, clamped to the bound range — can be
        thousands; they are NOT limited by cores;
     3. create/replace the EMPTY staging table ``<sink>__seed_staging`` with the source schema (unit);
@@ -506,11 +554,12 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
     schema, table, pcol = cfg["src_schema"], cfg["src_table"], cfg.get("partition_col")
     if not pcol:
         raise ValueError("load_partitioned is set but partition_col is empty")
+    adapter = source_adapters.for_cfg(cfg)
     with _unit(slots):
-        size_row = _read(spark, cfg, partitions.table_size_mb_query(schema, table)).first()
+        size_row = _read(spark, cfg, partitions.table_size_mb_query(schema, table, adapter)).first()
     size_mb = float(size_row["table_size_mb"] or 0) if size_row else 0.0
     with _unit(slots):
-        b = _read(spark, cfg, partitions.bounds_query(schema, table, pcol)).first()
+        b = _read(spark, cfg, partitions.bounds_query(schema, table, pcol, adapter)).first()
     lb, ub = (b["lb"], b["ub"]) if b else (None, None)
     if lb is None or ub is None:  # empty table (or all-NULL column): nothing to partition
         print(f"[seed] {schema}.{table}: no {pcol} bounds -> non-partitioned seed")
@@ -518,22 +567,21 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
 
     n = partitions.num_partitions_for(size_mb, cfg.get("partition_size_mb"))
     n = partitions.effective_num_partitions(lb, ub, n)
-    plist = partitions.get_partition_list(pcol, lb, ub, n)
+    plist = partitions.get_partition_list(pcol, lb, ub, n, adapter)
     staging = staging_table_name(sink_fqn)
     print(f"[seed] {schema}.{table}: size={size_mb} MB, partition_size_mb={cfg.get('partition_size_mb')}, "
           f"{pcol} in [{lb}, {ub}], num_partitions={len(plist)}, staging={staging}")
 
-    base = f"SELECT {_select_cols(cfg)} FROM [{schema}].[{table}]"
     cols = _split(cfg["select_list"])
     with _unit(slots):
-        _read(spark, cfg, f"{base} WHERE 1=0").write.mode("overwrite") \
+        _read(spark, cfg, adapter.select_sql(cfg, where="1=0")).write.mode("overwrite") \
             .option("overwriteSchema", "true").saveAsTable(staging)
 
     def load_partition(part):
         if guard is not None:
             guard()                                # e.g. raises if the sweep lost its collection lock
         with _unit(slots):
-            df = _read(spark, cfg, f"{base} WHERE {part['where_clause']}")
+            df = _read(spark, cfg, adapter.select_sql(cfg, where=part["where_clause"]))
             view = f"seed_part_{uuid.uuid4().hex}"
             df.createOrReplaceTempView(view)
             try:
