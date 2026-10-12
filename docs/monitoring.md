@@ -26,6 +26,8 @@ seed/merge/load/checkpoint — pinpoints *where* a failure happened; `plan` = th
 (status `running`) and UPDATEd at finish — concurrent workers touch distinct rows, so there is no
 write contention.
 
+Table and column reference: [lakebase_schema.md](lakebase_schema.md).
+
 ## Canonical queries (run in DBSQL against the Lakebase UC catalog)
 
 Run these on a SQL warehouse (or serverless). The Lakebase catalog is a database catalog, and

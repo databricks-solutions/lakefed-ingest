@@ -48,7 +48,7 @@ databricks bundle run --target prod --profile PROD
 
 Warehouse-free: everything runs on cluster compute. No UC connections — source reads use Spark
 JDBC with per-database credentials (JSON `{user,password}`) from a secret scope named by
-`control.secret_key`. See `README.md`, `docs/deploy.md`, `docs/monitoring.md`.
+`control.secret_key`. See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase_schema.md`.
 
 ### Lakebase state (`src/lakefed_ingest/lakebase_schema.sql`, schema `lakefed_ingest`)
 - `control` — one row per (source database, table): `task_collection`, `src_type` (source adapter:

@@ -240,6 +240,8 @@ All metadata lives in Lakebase (`src/lakefed_ingest/lakebase_schema.sql`), schem
 | `reseed_queue` | Tables queued for a reseed and why |
 | `ingest_run`, `ingest_event` | Run- and table-level telemetry |
 
+Column-level reference, a diagram, and the checkpoint lifecycle: [docs/lakebase_schema.md](docs/lakebase_schema.md).
+
 Upgrading from an earlier deploy: re-run `lakefed_ingest_setup`. It renames `ct_checkpoint` →
 `checkpoint` (`ct_version` → `position`), `sweep_run` → `ingest_run` (`sweep_id` → `run_id`), and
 `ingest_event.ct_version_from/to` → `position_from/to` in place; data is kept. This only reaches the
