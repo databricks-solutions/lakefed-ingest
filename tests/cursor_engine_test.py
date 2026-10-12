@@ -112,23 +112,33 @@ class _Spark:
             def dropTempView(self, name): spark.views.pop(name, None)
         self.catalog = _Catalog()
 
+    conflicts = 0
+
     def sql(self, stmt):
         self.statements.append(stmt)
+        if self.conflicts:
+            self.conflicts -= 1
+            raise RuntimeError("ConcurrentAppendException: files added by a concurrent update")
         if self.fail:
             raise RuntimeError("merge failed")
         return type("R", (), {"first": lambda s_: self.result})()
 
 
 class _DF:
-    def __init__(self, spark, query): self.spark, self.query = spark, query
-    def createOrReplaceTempView(self, name): self.spark.views[name] = self.query
+    columns = ["id", "amount", "updated_at"]
+    def __init__(self, spark, query): self.spark, self.query, self.tagged = spark, query, None
+    def select(self, *cols):
+        d = _DF(self.spark, self.query); d.tagged = cols; return d
+    def createOrReplaceTempView(self, name): self.spark.views[name] = (self.query, self.tagged)
 
 
-def _merge(monkeypatch, spark, lo="10", hi="20"):
+def _merge(monkeypatch, spark, lo="10", hi="20", cfg=CFG):
     import ct_engine
     queries = []
     monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: (queries.append(q), _DF(sp, q))[1])
-    return cur.read_and_merge(spark, CFG, "c.s.t", "int", lo, hi), queries
+    monkeypatch.setattr(ct_engine, "_lit", lambda v: type("L", (), {"alias": lambda s_, n: f"lit({v}) AS {n}"})())
+    monkeypatch.setattr(ct_engine, "WRITE_RETRY_BASE_S", 0.0)
+    return cur.read_and_merge(spark, cfg, "c.s.t", "int", lo, hi), queries
 
 
 def test_read_and_merge_reads_window_once_and_drops_view(monkeypatch):
@@ -163,3 +173,25 @@ def test_consolidated_cursor_merge_matches_on_client_and_pk():
     sql = cur.upsert_merge_sql(dict(CFG, client_id="t1"), "c.s.orders", "v")
     assert "ON tgt.`client_id` = s.`client_id` AND tgt.`id` = s.`id` " in sql
     assert "INSERT (`id`, `amount`, `updated_at`, `client_id`)" in sql
+
+
+def test_read_and_merge_retries_whole_unit_on_conflict(monkeypatch):
+    spark = _Spark(result=_Result({"num_affected_rows": 4}))
+    spark.conflicts = 1
+    n, queries = _merge(monkeypatch, spark)
+    views = {st.split(" USING ")[1].split(" ")[0] for st in spark.statements}
+    assert n == 4 and len(queries) == 2 and len(views) == 2 and spark.views == {}
+
+
+def test_consolidated_cursor_read_is_tagged_and_merged_on_client(monkeypatch):
+    spark = _Spark(result=_Result({"num_affected_rows": 1}))
+    seen = {}
+    real_sql = spark.sql
+    def sql(stmt):
+        view = stmt.split(" USING ")[1].split(" ")[0]
+        seen["tagged"] = spark.views[view][1]
+        return real_sql(stmt)
+    spark.sql = sql
+    _merge(monkeypatch, spark, cfg=dict(CFG, client_id="t1"))
+    assert seen["tagged"] == ("lit(t1) AS client_id", "id", "amount", "updated_at")
+    assert "AND tgt.`client_id` = 't1' " in spark.statements[0]

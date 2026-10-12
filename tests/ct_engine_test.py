@@ -224,6 +224,12 @@ def test_jdbc_config_no_host_raises(monkeypatch):
 
 # ---- partitioned seed: failure leaves the target untouched; success swaps once -----------
 
+class _FakeLit:
+    """Stands in for pyspark F.lit in ct_engine._tag."""
+    def __init__(self, value): self.value, self.name = value, None
+    def alias(self, name): self.name = name; return self
+    def __repr__(self): return f"lit({self.value!r}) AS {self.name}"
+
 class _Row(dict):
     def asDict(self):
         return dict(self)
@@ -247,9 +253,15 @@ class _Writer:
 
 
 class _DF:
+    columns = ["id", "v"]
+
     def __init__(self, spark, query):
         self.spark, self.query = spark, query
         self.write = _Writer(spark)
+
+    def select(self, *cols):                       # ct_engine._tag: records the projection
+        self.spark.tagged.append(cols)
+        return _DF(self.spark, self.query)
 
     def first(self):
         if "table_size_mb" in self.query:
@@ -277,7 +289,7 @@ class _Table:
 class _FakeSpark:
     def __init__(self, fail_where=None):
         import threading
-        self.statements, self.views, self.fail_where = [], {}, fail_where
+        self.statements, self.views, self.fail_where, self.tagged = [], {}, fail_where, []
         self.catalog, self._mu = _Catalog(self), threading.Lock()
 
     def table(self, name):
@@ -293,12 +305,13 @@ class _FakeSpark:
         return type("R", (), {"first": lambda self_: _Row(num_inserted_rows=1)})()
 
 
-def _seed(monkeypatch, spark):
+def _seed(monkeypatch, spark, **overrides):
     from concurrent.futures import ThreadPoolExecutor
     import parallel
     monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
+    monkeypatch.setattr(ce, "_lit", _FakeLit)
     cfg = {"id": 1, "src_schema": "dbo", "src_table": "big", "select_list": "id, v",
-           "load_partitioned": True, "partition_col": "id", "partition_size_mb": 1}
+           "load_partitioned": True, "partition_col": "id", "partition_size_mb": 1, **overrides}
     with ThreadPoolExecutor(max_workers=4) as ex:
         return ce.seed(spark, cfg, "c.s.big", slots=parallel.WorkSlots(4), executor=ex)
 
@@ -349,13 +362,16 @@ def test_partitioned_seed_requires_partition_col(monkeypatch):
 # ---- read_and_merge_ct: unique view per call, always dropped, rows from MERGE metrics ------
 
 class _MergeSpark(_FakeSpark):
-    def __init__(self, result=None, fail=False):
+    def __init__(self, result=None, fail=False, conflicts=0):
         super().__init__()
-        self.result, self.fail = result, fail
+        self.result, self.fail, self.conflicts = result, fail, conflicts
 
     def sql(self, stmt):
         self.statements.append(stmt)
         if stmt.startswith("MERGE WITH SCHEMA EVOLUTION INTO"):
+            if self.conflicts:
+                self.conflicts -= 1
+                raise RuntimeError("[DELTA_CONCURRENT_APPEND] Files were added by a concurrent update")
             if self.fail:
                 raise RuntimeError("merge failed")
             return type("R", (), {"first": lambda s_: self.result})()
@@ -734,3 +750,91 @@ def test_sink_created_in_one_statement_clustered_by_client():
         "TBLPROPERTIES ('delta.enableTypeWidening' = 'true') AS SELECT * FROM v")
     assert ce.create_sink_sql("c.s.t", "v", dict(_CONS, client_id=None)) == (
         "CREATE TABLE IF NOT EXISTS c.s.t TBLPROPERTIES ('delta.enableTypeWidening' = 'true') AS SELECT * FROM v")
+
+
+def test_consolidated_merge_has_literal_client_predicate():
+    sql = ce.merge_sql(_CONS, "c.s.t", "v")
+    assert ("ON tgt.`client_id` = s.`client_id` AND tgt.`id` = s.`id` AND tgt.`client_id` = 'tenant-001' "
+            in sql)
+    assert "AND tgt.`client_id` = '" not in ce.merge_sql(dict(_CONS, client_id=None), "c.s.t", "v")
+
+
+def test_tag_prepends_client_id_literal_first(monkeypatch):
+    monkeypatch.setattr(ce, "_lit", _FakeLit)
+    spark = _FakeSpark()
+    df = _DF(spark, "q")
+    assert ce._tag(df, dict(_CONS, client_id=None)) is df and spark.tagged == []
+    ce._tag(df, _CONS)
+    (cols,) = spark.tagged
+    assert isinstance(cols[0], _FakeLit) and cols[0].value == "tenant-001" and cols[0].name == "client_id"
+    assert list(cols[1:]) == ["id", "v"]                  # original columns follow, in order
+
+
+def test_dedicated_sink_may_have_a_native_client_id_column():
+    ce.check_sink_mode(dict(_CONS, client_id=None, select_list="id, client_id, v"), "c.s.t", ["id", "client_id", "v"])
+
+
+def test_ensure_sink_table_refuses_mode_mismatch(monkeypatch):
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: True
+    monkeypatch.setattr(_Table, "columns", ["id", "v", "client_id"])
+    with pytest.raises(ValueError, match="has a 'client_id' column"):
+        ce.ensure_sink_table(spark, dict(_CONS, client_id=None), "c.s.t")
+    assert not any(x.startswith("CREATE") for x in spark.statements)
+
+
+def test_ensure_sink_table_consolidated_creates_clustered_in_one_statement(monkeypatch):
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
+    monkeypatch.setattr(ce, "_lit", _FakeLit)
+    monkeypatch.setattr(_Table, "columns", ["client_id", "id", "v"])
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: False
+    ce.ensure_sink_table(spark, _CONS, "c.s.t")
+    creates = [x for x in spark.statements if x.startswith("CREATE TABLE")]
+    assert len(creates) == 1 and "CLUSTER BY (`client_id`)" in creates[0] and len(spark.tagged) == 1
+
+
+def test_ensure_sink_table_skips_create_when_another_client_created_it(monkeypatch):
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
+    monkeypatch.setattr(_Table, "columns", ["client_id", "id", "v"])
+    spark = _FakeSpark()
+    answers = iter([False, True])                         # outer check: missing; inner re-check: exists
+    spark.catalog.tableExists = lambda name: next(answers)
+    ce.ensure_sink_table(spark, _CONS, "c.s.t")
+    assert not any(x.startswith("CREATE") for x in spark.statements)
+
+
+def test_consolidated_seed_replaces_only_this_client(monkeypatch):
+    spark = _FakeSpark()
+    _seed(monkeypatch, spark, load_partitioned=False, client_id="tenant-001")
+    writes = [x for x in spark.statements if x.startswith("INSERT")]
+    assert len(writes) == 1 and writes[0].startswith(
+        "INSERT WITH SCHEMA EVOLUTION INTO c.s.big BY NAME REPLACE WHERE `client_id` = 'tenant-001' "
+        "SELECT `id`, `v`, `client_id` FROM seed_full_")
+    assert len(spark.tagged) == 1                         # the source read was tagged
+
+
+def test_consolidated_partitioned_seed_uses_per_client_staging(monkeypatch):
+    spark = _FakeSpark()
+    _seed(monkeypatch, spark, client_id="tenant-001")
+    staging = ce.staging_table_name("c.s.big", {"client_id": "tenant-001"})
+    assert f"SAVE {staging}" in spark.statements
+    parts = [x for x in spark.statements if x.startswith(f"INSERT INTO {staging} ")]
+    assert parts and all("`client_id`" in x for x in parts)
+    swaps = [x for x in spark.statements if "c.s.big BY NAME REPLACE WHERE" in x]
+    assert swaps == [f"INSERT WITH SCHEMA EVOLUTION INTO c.s.big BY NAME REPLACE WHERE `client_id` = 'tenant-001' "
+                     f"SELECT `id`, `v`, `client_id` FROM {staging}"]
+    assert not any(x.startswith("INSERT WITH SCHEMA EVOLUTION OVERWRITE c.s.big") for x in spark.statements)
+    assert f"DROP TABLE IF EXISTS {staging}" in spark.statements
+    assert len(spark.tagged) == 1 + len(parts)            # staging schema + every partition read
+
+
+def test_read_and_merge_ct_retries_whole_unit_on_conflict(monkeypatch):
+    reads = []
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: reads.append(q) or _DF(sp, q))
+    monkeypatch.setattr(ce, "WRITE_RETRY_BASE_S", 0.0)
+    spark = _MergeSpark(result=_Row(num_affected_rows=3), conflicts=1)
+    assert ce.read_and_merge_ct(spark, _MERGE_CFG, "c.s.t", 5) == 3
+    merges = [x for x in spark.statements if x.startswith("MERGE")]
+    views = {x.split(" USING ")[1].split()[0] for x in merges}
+    assert len(reads) == 2 and len(merges) == 2 and len(views) == 2 and spark.views == {}

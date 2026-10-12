@@ -317,8 +317,20 @@ def _tag(df, cfg: dict):
     cid = client_id(cfg)
     if cid is None:
         return df
+    return df.select(_lit(cid).alias(CLIENT_COLUMN), *df.columns)
+
+
+def _lit(value):
     from pyspark.sql import functions as F
-    return df.select(F.lit(cid).alias(CLIENT_COLUMN), *df.columns)
+    return F.lit(value)
+
+
+def merge_on_cfg(cfg: dict) -> str:
+    """MERGE ON for a control row: the match keys, plus — consolidated sink — a LITERAL client
+    predicate on the target, so Delta prunes to this client's (clustered) files and scopes conflict
+    detection to them instead of every client's rows."""
+    on = merge_on(", ".join(merge_keys(cfg)))
+    return f"{on} AND tgt.{client_predicate(cfg)}" if client_id(cfg) else on
 
 
 def create_sink_sql(sink_fqn: str, view: str, cfg: dict) -> str:
@@ -462,7 +474,8 @@ def check_sink_mode(cfg: dict, sink_fqn: str, sink_columns: List[str]) -> None:
     client's rows) or a consolidated row into a dedicated sink (rows without client_id)."""
     has = CLIENT_COLUMN in {c.lower() for c in sink_columns}
     cid = client_id(cfg)
-    if has and cid is None:
+    native = CLIENT_COLUMN in {c.lower() for c in _split(cfg.get("select_list"))}
+    if has and cid is None and not native:     # a dedicated table may have its own client_id column
         raise ValueError(SINK_MODE_MISMATCH_MSG.format(sink=sink_fqn, has="has a", col=CLIENT_COLUMN,
                                                        is_="is not", cid="NULL"))
     if not has and cid is not None:
@@ -785,7 +798,7 @@ def merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
     ``op`` column out of bronze. ON keeps tgt./s. qualifiers; SET/INSERT targets are unqualified."""
     sl, keys = ", ".join(write_columns(cfg)), ", ".join(merge_keys(cfg))
     return (
-        f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s ON {merge_on(keys)} "
+        f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s ON {merge_on_cfg(cfg)} "
         "WHEN MATCHED AND s.op = 'D' THEN DELETE "
         f"WHEN MATCHED THEN UPDATE SET {merge_set(sl, keys)} "
         "WHEN NOT MATCHED AND s.op <> 'D' THEN "

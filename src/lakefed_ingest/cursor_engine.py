@@ -143,7 +143,7 @@ def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
     sl, keys = ", ".join(ct_engine.write_columns(cfg)), ", ".join(ct_engine.merge_keys(cfg))
     return (
         f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s "
-        f"ON {ct_engine.merge_on(keys)} "
+        f"ON {ct_engine.merge_on_cfg(cfg)} "
         f"WHEN MATCHED THEN UPDATE SET {ct_engine.merge_set(sl, keys)} "
         f"WHEN NOT MATCHED THEN INSERT ({ct_engine.merge_insert_cols(sl)}) "
         f"VALUES ({ct_engine.merge_insert_vals(sl)})"
