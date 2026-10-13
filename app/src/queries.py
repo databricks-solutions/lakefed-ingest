@@ -6,6 +6,8 @@ free of web-framework and database imports so it is unit-tested in app/tests/que
 
 from __future__ import annotations
 
+import json
+import re
 from typing import List, Optional, Tuple
 
 SCHEMA = "lakefed_ingest"
@@ -175,6 +177,19 @@ def validate_control_row(row: dict) -> List[str]:
         errs.append("select_list must list explicit columns (* isn't supported)")
     if row.get("load_partitioned") and (not row.get("partition_col") or not row.get("partition_size_mb")):
         errs.append("partitioned loads need partition_col and partition_size_mb")
+    cid = row.get("client_id")
+    if cid not in (None, "") and not re.match(r"^[A-Za-z0-9_.:-]{1,128}$", str(cid)):
+        errs.append("client_id may only use letters, digits and _ . : - (1-128 characters)")
+    if "__client_id__" in {c.strip().lower() for c in str(row.get("select_list") or "").split(",")}:
+        errs.append("select_list must not include __client_id__ (consolidated sinks add it)")
+    opts = row.get("jdbc_options")
+    if opts not in (None, ""):
+        try:
+            ok = isinstance(json.loads(opts) if isinstance(opts, str) else opts, dict)
+        except ValueError:
+            ok = False
+        if not ok:
+            errs.append("jdbc_options must be a JSON object")
     return errs
 
 
@@ -339,3 +354,170 @@ def merge_review_edits(review: List[dict], edits: List[dict]) -> List[dict]:
 def public_review_row(row: dict) -> dict:
     """A review row without the server-only fields (connection, secret key, select_list)."""
     return {k: v for k, v in row.items() if not k.startswith("_")}
+
+
+# ---- editing control rows -----------------------------------------------------------------------
+#
+# Integrity rules (mirrored by the ingestion planner's identity check, which also catches SQL edits):
+# changing where a ct / cursor table reads from, where it writes to, or its merge key makes the
+# existing checkpoint meaningless, so the edit flips the table to seeding in the same transaction.
+# Edits are refused while either affected collection is running (the run's advisory lock).
+
+CONTROL_EDIT_COLUMNS = (
+    "task_collection", "task_enabled", "tier", "priority", "src_type", "src_host", "src_port", "secret_key",
+    "src_database", "src_schema", "src_table", "select_list", "primary_key", "load_type", "cursor_column",
+    "sink_catalog", "sink_schema", "sink_table", "client_id", "load_partitioned", "partition_col",
+    "partition_size_mb", "jdbc_options",
+)
+BULK_EDIT_FIELDS = ("task_collection", "task_enabled", "tier", "priority", "load_partitioned", "partition_col",
+                    "partition_size_mb", "jdbc_options", "sink_catalog", "sink_schema")
+RESEED_FIELDS = {
+    "src_type": "source_changed", "src_host": "source_changed", "src_port": "source_changed",
+    "src_database": "source_changed", "src_schema": "source_changed", "src_table": "source_changed",
+    "sink_catalog": "sink_changed", "sink_schema": "sink_changed", "sink_table": "sink_changed",
+    "client_id": "sink_changed", "primary_key": "primary_key_changed",
+}
+INT_FIELDS = {"src_port", "priority", "partition_size_mb"}
+BOOL_FIELDS = {"task_enabled", "load_partitioned"}
+DEFAULT_PORTS = {"sqlserver": 1433, "oracle": 1521, "postgresql": 5432, "mysql": 3306}
+CASE_INSENSITIVE = {"src_host", "src_database", "src_schema", "src_table", "sink_catalog", "sink_schema",
+                    "sink_table", "primary_key"}
+
+
+def normalize_value(field: str, value):
+    """Form / JSON value -> the stored value (blank strings -> NULL, numbers and booleans typed)."""
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "":
+            return None
+    if value is None:
+        return None
+    if field in INT_FIELDS:
+        return int(value)
+    if field in BOOL_FIELDS:
+        return value if isinstance(value, bool) else str(value).lower() in ("true", "1", "yes", "y")
+    return value
+
+
+def _same(field: str, old, new, row: dict) -> bool:
+    if field in CASE_INSENSITIVE:
+        norm = lambda v: ",".join(p.strip() for p in str(v).lower().split(",")) if v is not None else None
+        return norm(old) == norm(new)
+    if field == "src_port":
+        default = DEFAULT_PORTS.get(str(row.get("src_type") or "sqlserver"))
+        return (old or default) == (new or default)
+    return old == new
+
+
+def plan_edit(rows: List[dict], changes: dict, bulk: bool) -> List[dict]:
+    """What an edit will do to each control row: {id, changes: {field: [old, new]}, reseed (reason
+    or None), notes, errors}. Pure; the API applies it only when no row has errors."""
+    allowed = BULK_EDIT_FIELDS if bulk else CONTROL_EDIT_COLUMNS
+    bad = sorted(set(changes) - set(allowed))
+    plans = []
+    for row in rows:
+        p = {"id": row["id"], "table": f"{row['src_database']}.{row['src_schema']}.{row['src_table']}",
+             "changes": {}, "reseed": None, "notes": [], "errors": []}
+        if bad:
+            p["errors"].append(("cannot be changed in bulk: " if bulk else "unknown fields: ") + ", ".join(bad))
+            plans.append(p)
+            continue
+        try:
+            new_values = {f: normalize_value(f, v) for f, v in changes.items()}
+        except (TypeError, ValueError) as e:
+            p["errors"].append(f"invalid value: {e}")
+            plans.append(p)
+            continue
+        merged = dict(row)
+        for f, v in new_values.items():
+            if not _same(f, row.get(f), v, row):
+                p["changes"][f] = [row.get(f), v]
+                merged[f] = v
+        p["errors"] += validate_control_row(merged)
+        lt = merged.get("load_type")
+        incremental = lt in ("ct", "cursor")
+        reasons = [RESEED_FIELDS[f] for f in p["changes"] if f in RESEED_FIELDS]
+        if incremental and reasons:
+            p["reseed"] = reasons[0]
+        if "load_type" in p["changes"] or ("cursor_column" in p["changes"] and lt == "cursor"):
+            p["notes"].append("the load strategy changes: the next run reseeds the table")
+        if "select_list" in p["changes"]:
+            old_cols = {c.strip().lower() for c in str(row.get("select_list") or "").split(",") if c.strip()}
+            new_cols = {c.strip().lower() for c in str(merged.get("select_list") or "").split(",") if c.strip()}
+            if new_cols - old_cols:
+                p["notes"].append(f"new columns {', '.join(sorted(new_cols - old_cols))}: the next run reseeds to backfill them")
+            if old_cols - new_cols:
+                p["notes"].append(f"removed columns {', '.join(sorted(old_cols - new_cols))} stay in the sink and stop updating")
+        if any(f in p["changes"] for f in ("sink_catalog", "sink_schema", "sink_table")):
+            old_sink = ".".join(str(row.get(k)) for k in ("sink_catalog", "sink_schema", "sink_table"))
+            p["notes"].append(f"the old sink {old_sink} is left in place; drop it once the new one is verified")
+        if "client_id" in p["changes"]:
+            p["notes"].append("the rows already written under the old client_id stay in the sink; delete them separately")
+        if "task_collection" in p["changes"]:
+            p["notes"].append(f"moves to collection {merged['task_collection']}: that collection's runs and schedule apply")
+        if p["reseed"]:
+            p["notes"].insert(0, f"reseed required ({p['reseed']}): the table is copied again on its next run")
+        plans.append(p)
+    return plans
+
+
+def control_rows_for_update_sql() -> str:
+    cols = ", ".join(("id",) + CONTROL_EDIT_COLUMNS)
+    return f"select {cols} from {SCHEMA}.control where id = any(%s) order by id for update"
+
+
+def control_row_sql() -> str:
+    cols = ", ".join(("id",) + CONTROL_EDIT_COLUMNS)
+    return f"select {cols} from {SCHEMA}.control where id = %s"
+
+
+def update_control_sql(fields: List[str]) -> str:
+    """UPDATE of whitelisted columns only (field names come from CONTROL_EDIT_COLUMNS)."""
+    assert fields and all(f in CONTROL_EDIT_COLUMNS for f in fields), fields
+    return f"update {SCHEMA}.control set " + ", ".join(f"{f} = %s" for f in fields) + " where id = %s"
+
+
+def collection_lock_sql() -> str:
+    """Take a collection's run lock for this transaction (the same key the ingestion job holds for a
+    whole run). False = a run of that collection is in progress. Param: lock key."""
+    return "select pg_try_advisory_xact_lock(hashtextextended(%s, 0))"
+
+
+def collection_lock_key(collection: str) -> str:
+    return "lakefed_ingest:" + str(collection)   # state_store.LOCK_NAMESPACE + collection
+
+
+def flip_to_seeding_sql() -> str:
+    """Params: detail, control ids."""
+    return (f"update {SCHEMA}.checkpoint set phase = 'seeding', status = 'ok', detail = %s, updated_at = now() "
+            f"where control_id = any(%s)")
+
+
+def mixed_sinks_for_sql() -> str:
+    """Sinks among the given (lower-cased catalog.schema.table) list claimed by a dedicated row and by
+    other rows. Param: list of sink names."""
+    return (f"select lower(sink_catalog || '.' || sink_schema || '.' || sink_table) as sink from {SCHEMA}.control "
+            f"where lower(sink_catalog || '.' || sink_schema || '.' || sink_table) = any(%s) group by 1 "
+            f"having count(*) filter (where client_id is null) > 0 and count(*) > 1")
+
+
+def log_change_sql() -> str:
+    """Params: changed_by, action, control_id, task_collection, field, old_value, new_value,
+    reseed_reason, batch_id."""
+    return (f"insert into {SCHEMA}.control_change (changed_by, action, control_id, task_collection, field, "
+            f"old_value, new_value, reseed_reason, batch_id) values (%s, %s, %s, %s, %s, %s, %s, %s, %s)")
+
+
+def changes_sql(control_id: Optional[int], limit: int) -> Tuple[str, tuple]:
+    where, params = "", ()
+    if control_id is not None:
+        where, params = "where control_id = %s ", (int(control_id),)
+    return (f"select changed_at, changed_by, action, control_id, task_collection, field, old_value, new_value, "
+            f"reseed_reason, batch_id from {SCHEMA}.control_change {where}order by changed_at desc, id desc limit %s",
+            params + (int(limit),))
+
+
+def checkpoint_for_sql() -> str:
+    """One table's checkpoint. Param: control_id."""
+    return (f"select phase, status, position, strategy, detail, last_success_at, updated_at, source_identity, "
+            f"sink_identity, merge_key from {SCHEMA}.checkpoint where control_id = %s")

@@ -9,6 +9,7 @@ Run locally (`python main.py` with DATABRICKS_CONFIG_PROFILE set) it connects as
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
@@ -83,3 +84,20 @@ def execute_returning(sql: str, params: tuple = ()):
     with connect() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchone()
+
+
+@contextlib.contextmanager
+def transaction():
+    """A cursor in one transaction: committed when the block succeeds, rolled back on any error
+    (advisory xact locks taken inside are released either way)."""
+    conn = connect()
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            yield cur
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

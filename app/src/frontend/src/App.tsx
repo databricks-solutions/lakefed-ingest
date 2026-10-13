@@ -8,6 +8,7 @@ import Tables from "./pages/Tables";
 import Jobs from "./pages/Jobs";
 import AddTable from "./pages/AddTable";
 import BulkImport from "./pages/BulkImport";
+import Changes from "./pages/Changes";
 
 interface Settings { staleMinutes: number; config?: Config }
 const SettingsContext = createContext<Settings>({ staleMinutes: 60 });
@@ -15,7 +16,7 @@ export const useSettings = () => useContext(SettingsContext);
 
 const NAV = [
   ["/overview", "Overview"], ["/runs", "Runs"], ["/tables", "Tables"], ["/jobs", "Jobs"],
-  ["/add", "Add table"], ["/bulk", "Bulk import"],
+  ["/add", "Add table"], ["/bulk", "Bulk import"], ["/changes", "Changes"],
 ] as const;
 
 export default function App() {
@@ -56,6 +57,7 @@ export default function App() {
             <Route path="/jobs" element={<Jobs />} />
             <Route path="/add" element={<AddTable />} />
             <Route path="/bulk" element={<BulkImport />} />
+            <Route path="/changes" element={<Changes />} />
             <Route path="*" element={<Navigate to="/overview" replace />} />
           </Routes>
         </main>
