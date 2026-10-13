@@ -7,14 +7,15 @@ import { useSettings } from "../App";
 import { Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, autoColumns, fmtTime } from "../components";
 
 const EDITABLE = ["include", "load_type", "primary_key", "cursor_column", "load_partitioned", "partition_col",
-  "partition_size_mb", "sink_catalog", "sink_schema", "sink_table", "client_id"];
+  "partition_size_mb", "sink_catalog", "sink_schema", "sink_table", "client_id", "freshness_sla_minutes"];
+const NUMBER_FIELDS = ["partition_size_mb", "freshness_sla_minutes"];
 const BULK_FIELDS = EDITABLE.filter((f) => f !== "include");
 const key = (r: Row) => `${r.src_database}\u0000${r.src_schema}\u0000${r.src_table}`;
 const theme = themeQuartz.withParams({ fontSize: 13, headerFontSize: 13, spacing: 5, wrapperBorderRadius: 6 });
 
 interface Shared {
   sink_catalog: string; sink_schema: string; sink_table: string; client_id: string;
-  partition_threshold_mb: number; partition_size_mb: number; include_default: boolean;
+  freshness_sla_minutes: number | null; partition_threshold_mb: number; partition_size_mb: number; include_default: boolean;
 }
 
 function DiscoverForm({ onStarted }: { onStarted: (id: string) => void }) {
@@ -67,7 +68,7 @@ export default function BulkImport() {
 
   const [collection, setCollection] = useState("");
   const [shared, setShared] = useState<Shared>({
-    sink_catalog: "main", sink_schema: "bronze_{database}", sink_table: "{table}", client_id: "",
+    sink_catalog: "main", sink_schema: "bronze_{database}", sink_table: "{table}", client_id: "", freshness_sla_minutes: null,
     partition_threshold_mb: config?.defaults.partition_threshold_mb ?? 1024,
     partition_size_mb: config?.defaults.partition_size_mb ?? 512, include_default: true,
   });
@@ -105,6 +106,7 @@ export default function BulkImport() {
     notes: { minWidth: 300, tooltipField: "notes" },
     ...Object.fromEntries(["primary_key", "cursor_column", "partition_col", "partition_size_mb", "sink_catalog",
       "sink_schema", "sink_table", "client_id"].map((f) => [f, { editable: true }])),
+    freshness_sla_minutes: { editable: true, cellDataType: "number", headerName: "sla_min" },
   }), [shown]);
 
   const payload = (dry: boolean) => ({
@@ -162,6 +164,11 @@ export default function BulkImport() {
               <input placeholder="e.g. {database}" value={shared.client_id} onChange={(e) => setShared({ ...shared, client_id: e.target.value })} />
               <span className="muted small">with a shared sink_schema, consolidates databases into one table each</span>
             </label>
+            <label>freshness_sla_minutes
+              <input type="number" min={1} placeholder="blank = no SLA" value={shared.freshness_sla_minutes ?? ""}
+                onChange={(e) => setShared({ ...shared, freshness_sla_minutes: Number(e.target.value) > 0 ? Number(e.target.value) : null })} />
+              <span className="muted small">a table is late when its last success is older than this</span>
+            </label>
             <label>Partition tables larger than (MB)
               <input type="number" min={1} value={shared.partition_threshold_mb}
                 onChange={(e) => setShared({ ...shared, partition_threshold_mb: Number(e.target.value) || 1 })} />
@@ -187,7 +194,7 @@ export default function BulkImport() {
             <button className="ghost" disabled={!selected.length} onClick={() => {
               const ks = new Set(selected.map(key));
               const v: any = bulkField === "load_partitioned" ? bulkValue.trim().toLowerCase() === "true"
-                : bulkField === "partition_size_mb" ? (Number(bulkValue) || null) : bulkValue;
+                : NUMBER_FIELDS.includes(bulkField) ? (Number(bulkValue) || null) : bulkValue;
               update((r) => ks.has(key(r)), (r) => ({ ...r, [bulkField]: v }));
             }}>Apply</button>
           </div>

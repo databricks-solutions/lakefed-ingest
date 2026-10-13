@@ -427,7 +427,8 @@ required for `ct`, `cursor` and `cdc`), `select_list` (explicit columns — `*` 
 `sink_catalog` / `sink_schema` / `sink_table`, `load_type` (`ct` | `full` | `cursor` | `cdc`), the
 optional partitioned-seed settings, `cursor_column` (required for `cursor`), `client_id`
 (consolidated sinks), `write_mode` (`merge` | `append`, see [Append sinks](#append-sinks-optional)),
-`client_attrs` (identity columns, JSON), and `jdbc_options`.
+`client_attrs` (identity columns, JSON), `jdbc_options`, and `freshness_sla_minutes` (optional freshness
+SLA for monitoring; see `docs/monitoring.md`).
 `cdc_capture_instance` is reserved for the placeholder `cdc` strategy.
 
 **Bulk onboarding.** The `lakefed_ingest_discover` job lists a SQL Server database's tables with

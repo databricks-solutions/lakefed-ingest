@@ -8,6 +8,7 @@ import { Badge, ConfirmButton, ErrorBox, Grid, Notice, autoColumns, fmtTime } fr
 
 export const EDIT_FIELDS: { key: string; type?: "number" | "checkbox" | "select"; options?: string[]; help?: string }[] = [
   { key: "task_collection" }, { key: "task_enabled", type: "checkbox" }, { key: "tier" }, { key: "priority", type: "number" },
+  { key: "freshness_sla_minutes", type: "number", help: "minutes; blank = no SLA" },
   { key: "src_type", type: "select", options: ["sqlserver", "oracle", "postgresql", "mysql"] }, { key: "src_host" },
   { key: "src_port", type: "number" }, { key: "secret_key" }, { key: "src_database" }, { key: "src_schema" }, { key: "src_table" },
   { key: "select_list" }, { key: "primary_key" }, { key: "load_type", type: "select", options: ["ct", "cursor", "full"] },
@@ -15,8 +16,8 @@ export const EDIT_FIELDS: { key: string; type?: "number" | "checkbox" | "select"
   { key: "load_partitioned", type: "checkbox" }, { key: "partition_col" }, { key: "partition_size_mb", type: "number" },
   { key: "jdbc_options", help: "JSON object" },
 ];
-export const BULK_FIELDS = ["task_collection", "task_enabled", "tier", "priority", "load_partitioned", "partition_col",
-  "partition_size_mb", "jdbc_options", "sink_catalog", "sink_schema"];
+export const BULK_FIELDS = ["task_collection", "task_enabled", "tier", "priority", "freshness_sla_minutes", "load_partitioned",
+  "partition_col", "partition_size_mb", "jdbc_options", "sink_catalog", "sink_schema"];
 
 interface PlanResult { summary: Row; plans: Row[] }
 

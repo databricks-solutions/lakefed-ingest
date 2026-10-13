@@ -79,8 +79,8 @@ def config(request: Request):
 
 
 @app.get("/api/overview")
-def overview(stale_minutes: int = 60):
-    return {"collections": db.query(q.collections_overview_sql(), (int(stale_minutes),)),
+def overview():
+    return {"collections": db.query(q.collections_overview_sql()),
             "running": db.query(q.running_runs_sql())}
 
 
@@ -111,10 +111,10 @@ def run_events(run_id: int):
 
 @app.get("/api/tables")
 def tables(collection: Optional[str] = None, search: Optional[str] = None, status: str = "all",
-           stale_minutes: int = 60, limit: int = 1000):
+           limit: int = 1000):
     if status not in q.TABLE_FILTERS:
         raise HTTPException(400, f"status must be one of {q.TABLE_FILTERS}")
-    sql, params = q.tables_sql(collection or None, search or None, status, stale_minutes, limit)
+    sql, params = q.tables_sql(collection or None, search or None, status, limit)
     return db.query(sql, params)
 
 
@@ -311,6 +311,7 @@ class Shared(BaseModel):
     sink_schema: str = "bronze_{database}"
     sink_table: str = "{table}"
     client_id: str = ""
+    freshness_sla_minutes: Optional[int] = Field(default=None, gt=0)
     partition_threshold_mb: float = q.DEFAULT_PARTITION_THRESHOLD_MB
     partition_size_mb: int = q.DEFAULT_PARTITION_SIZE_MB
     include_default: bool = True

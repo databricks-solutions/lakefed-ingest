@@ -64,7 +64,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `cursor_column`, `cdc_capture_instance`, `jdbc_options` (JSON), `client_id` (optional: consolidated
   sink shared by many source DBs; written to sink column `__client_id__`), `client_attrs` (JSON
   {column: value}: identity columns written as STRING on every row), `write_mode` (`merge` default |
-  `append` for ct/full: change-log sink with `__change_op`/`__change_version`/`__extracted_at`/`__run_id`).
+  `append` for ct/full: change-log sink with `__change_op`/`__change_version`/`__extracted_at`/`__run_id`), `freshness_sla_minutes`
+  (optional; monitoring only, the app's "SLA breached" rule `queries.SLA_BREACHED`), `created_at`.
   CHECK constraints enforce valid combos; a unique index allows one row per (sink, client_id).
 - `checkpoint` — generic: `strategy` + `position` (text; CT version for `ct`, JSON {col,type,value} for
   `cursor`), phase (`seeding → incremental` for ct and cursor, `loaded` for full), status, freshness,

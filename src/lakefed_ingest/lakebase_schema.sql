@@ -69,7 +69,9 @@ create table if not exists lakefed_ingest.control (
     tier                  text,                               -- placement: cadence/SLA tier
     priority              int,                                -- placement: sweep priority
     warehouse_id          text,                               -- unused (this version is warehouse-free)
-    task_enabled          boolean     not null default true
+    task_enabled          boolean     not null default true,
+    freshness_sla_minutes int,                                -- max minutes since last success; NULL = no SLA
+    created_at            timestamptz not null default now()
 );
 
 -- Migrate an existing control table: JDBC host/port + per-DB secret key.
@@ -100,6 +102,10 @@ alter table lakefed_ingest.control add column if not exists write_mode text not 
 -- Identity columns written on every row next to __client_id__, as a JSON object {column: value}
 -- (for example the tenant name or the source server).
 alter table lakefed_ingest.control add column if not exists client_attrs text;
+-- Freshness SLA (monitoring only; the ingestion job doesn't read it): an enabled table breaches it
+-- when its last success (or, if it never succeeded, its creation) is older than this many minutes.
+alter table lakefed_ingest.control add column if not exists freshness_sla_minutes int;
+alter table lakefed_ingest.control add column if not exists created_at timestamptz not null default now();
 
 -- Constraints are (re-)declared here so re-applying the file updates existing tables. Older
 -- deploys had an inline load_type check (auto-named) and `mt_`-prefixed names; drop those too.
@@ -163,6 +169,10 @@ alter table lakefed_ingest.control add constraint valid_client_attrs check (
 alter table lakefed_ingest.control drop constraint if exists valid_client_id;
 alter table lakefed_ingest.control add constraint valid_client_id check (
     client_id is null or client_id ~ '^[A-Za-z0-9_.:-]{1,128}$'
+);
+alter table lakefed_ingest.control drop constraint if exists valid_freshness_sla;
+alter table lakefed_ingest.control add constraint valid_freshness_sla check (
+    freshness_sla_minutes is null or freshness_sla_minutes > 0
 );
 -- One writer per sink slice: a dedicated sink (client_id NULL) has exactly one control row, and a
 -- consolidated sink at most one row per client. (A sink mixing a dedicated row with consolidated

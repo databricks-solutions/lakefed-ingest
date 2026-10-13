@@ -7,13 +7,13 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 
 | Page | What it does |
 |---|---|
-| **Overview** | Per-collection health: enabled, failing, seeding and stale tables; the last run; runs in progress; failed tables in the last 24 hours |
+| **Overview** | Per-collection health: enabled, failing, seeding and SLA-breached tables, and a warning for enabled tables with no freshness SLA; the last run; runs in progress; failed tables in the last 24 hours |
 | **Runs** | Recent runs (filter by collection); select one to see its per-table events and errors |
-| **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag). Filter by collection, text, or failing / stale / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection), **enable**, **disable** or **force a reseed** |
+| **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag, SLA). Filter by collection, text, or failing / SLA breached / no SLA / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection), **enable**, **disable** or **force a reseed** |
 | **Jobs** | The ingestion job's schedule; active and recent runs; **start a run** for a collection; **cancel** a run; run the schema setup job |
 | **Changes** | The change log: every add, register, edit, enable / disable and reseed made in the app, with who, what and when |
 | **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop) |
-| **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
+| **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template, freshness SLA), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
 
 Every write asks for confirmation. The app never deletes rows.
 
@@ -36,7 +36,7 @@ Data integrity comes first, so edits go through the server's rules, not the brow
 - **Not while running.** Edits, enable / disable and reseeds are refused while an affected collection
   is running (they take that collection's run lock), so they can't race the run's own checkpoint writes.
 - **Bulk edits are limited** to fields that are safe across many tables: collection, enabled, tier,
-  priority, partition settings, `jdbc_options`, sink catalog and schema. Source, key and sink table
+  priority, freshness SLA, partition settings, `jdbc_options`, sink catalog and schema. Source, key and sink table
   name changes are made one table at a time.
 - **Change log.** Every change is recorded in `lakefed_ingest.control_change` with the signed-in
   user, in the same transaction.

@@ -2,14 +2,12 @@ import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { useSettings } from "../App";
 import { Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, autoColumns } from "../components";
 import { EditBulk, EditOne } from "./EditTables";
 
-const FILTERS = ["all", "failing", "stale", "seeding", "disabled"];
+const FILTERS = ["all", "failing", "sla_breached", "no_sla", "seeding", "disabled"];
 
 export default function Tables() {
-  const { staleMinutes } = useSettings();
   const [params, setParams] = useSearchParams();
   const collection = params.get("collection") ?? "";
   const [search, setSearch] = useState("");
@@ -21,8 +19,8 @@ export default function Tables() {
   const qc = useQueryClient();
   const collections = useQuery({ queryKey: ["collections"], queryFn: () => api.get<string[]>("/collections") });
   const tables = useQuery({
-    queryKey: ["tables", collection, search, status, staleMinutes, limit],
-    queryFn: () => api.get(`/tables${qs({ collection, search, status, stale_minutes: staleMinutes, limit })}`),
+    queryKey: ["tables", collection, search, status, limit],
+    queryFn: () => api.get(`/tables${qs({ collection, search, status, limit })}`),
   });
   const act = useMutation({
     mutationFn: ({ path, body }: { path: string; body: Row }) => api.post<{ updated: number }>(path, body),
@@ -72,6 +70,7 @@ export default function Tables() {
           columns={autoColumns(tables.data ?? [], {
             status: { cellRenderer: (p: any) => <Badge value={p.value} /> },
             phase: { cellRenderer: (p: any) => <Badge value={p.value} /> },
+            sla_breached: { cellRenderer: (p: any) => p.value ? <Badge value="breached" /> : null },
             detail: { flex: 1, minWidth: 300, tooltipField: "detail" },
           })} />
       </Section>

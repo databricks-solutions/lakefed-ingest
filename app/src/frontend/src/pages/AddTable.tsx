@@ -25,6 +25,7 @@ const FIELDS: Field[] = [
   { key: "load_partitioned", label: "load_partitioned", type: "checkbox", initial: false },
   { key: "partition_col", label: "partition_col" },
   { key: "partition_size_mb", label: "partition_size_mb", type: "number" },
+  { key: "freshness_sla_minutes", label: "freshness_sla_minutes", type: "number", help: "max minutes since last success; blank = no SLA" },
 ];
 
 export default function AddTable() {
@@ -36,6 +37,7 @@ export default function AddTable() {
       ...row,
       src_port: row.src_port === "" ? null : Number(row.src_port),
       partition_size_mb: row.partition_size_mb === "" ? null : Number(row.partition_size_mb),
+      freshness_sla_minutes: row.freshness_sla_minutes === "" ? null : Number(row.freshness_sla_minutes),
     }),
     onSuccess: () => qc.invalidateQueries(),
   });

@@ -65,7 +65,7 @@ export function Metric({ label, value, tone }: { label: string; value: ReactNode
 export function Badge({ value }: { value: unknown }) {
   const v = String(value ?? "");
   const tone = ["failed", "FAILED", "invalid", "INTERNAL_ERROR"].includes(v) ? "bad"
-    : ["running", "RUNNING", "PENDING", "seeding", "skipped"].includes(v) ? "warn"
+    : ["running", "RUNNING", "PENDING", "seeding", "skipped", "breached"].includes(v) ? "warn"
     : ["ok", "completed", "SUCCESS", "registered", "valid", "incremental", "loaded"].includes(v) ? "ok" : "";
   return <span className={`badge ${tone}`}>{v}</span>;
 }
