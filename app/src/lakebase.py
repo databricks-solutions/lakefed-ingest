@@ -4,7 +4,7 @@ Connects as the app's service principal with a short-lived, SDK-minted Lakebase 
 stored password), the same way the ingestion job does. The `lakefed_ingest_app_grants` job gives the
 service principal instance access, a Postgres role and the table privileges.
 
-Run locally (`streamlit run app.py` with DATABRICKS_CONFIG_PROFILE set) it connects as you.
+Run locally (`python main.py` with DATABRICKS_CONFIG_PROFILE set) it connects as you.
 """
 
 from __future__ import annotations
@@ -13,9 +13,10 @@ import os
 import threading
 import time
 import uuid
-from typing import Optional
+from datetime import date, datetime
+from decimal import Decimal
+from typing import List, Optional
 
-import pandas as pd
 import psycopg
 from databricks.sdk import WorkspaceClient
 
@@ -55,11 +56,20 @@ def connect():
                            application_name="lakefed_ingest_app")
 
 
-def query(sql: str, params: tuple = ()) -> pd.DataFrame:
+def _jsonable(v):
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if isinstance(v, Decimal):
+        return float(v)
+    return v
+
+
+def query(sql: str, params: tuple = ()) -> List[dict]:
+    """Rows as JSON-ready dicts (timestamps as ISO 8601 strings, numerics as floats)."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         cols = [d.name for d in cur.description]
-        return pd.DataFrame(cur.fetchall(), columns=cols)
+        return [{c: _jsonable(v) for c, v in zip(cols, row)} for row in cur.fetchall()]
 
 
 def execute(sql: str, params: tuple = ()) -> int:

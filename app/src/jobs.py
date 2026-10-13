@@ -5,9 +5,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Optional
-
-import pandas as pd
+from typing import List, Optional
 
 from lakebase import workspace
 
@@ -16,8 +14,8 @@ SETUP_JOB_ID = os.environ.get("SETUP_JOB_ID")
 DISCOVER_JOB_ID = os.environ.get("DISCOVER_JOB_ID")
 
 
-def _ts(ms) -> Optional[datetime]:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc) if ms else None
+def _ts(ms) -> Optional[str]:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat() if ms else None
 
 
 def job_summary(job_id) -> dict:
@@ -38,7 +36,7 @@ def job_summary(job_id) -> dict:
     }
 
 
-def runs(job_id, active_only: bool = False, limit: int = 25) -> pd.DataFrame:
+def runs(job_id, active_only: bool = False, limit: int = 25) -> List[dict]:
     rows = []
     # The Jobs API caps a page at 25 runs; the SDK pages through, and we stop at `limit`.
     for r in workspace().jobs.list_runs(job_id=int(job_id), active_only=active_only, limit=min(limit, 25)):
@@ -56,7 +54,7 @@ def runs(job_id, active_only: bool = False, limit: int = 25) -> pd.DataFrame:
         })
         if len(rows) >= limit:
             break
-    return pd.DataFrame(rows)
+    return rows
 
 
 def run_now(job_id, job_parameters: dict) -> int:

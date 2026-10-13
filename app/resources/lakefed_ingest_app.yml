@@ -15,7 +15,7 @@ resources:
       description: "lakefed_ingest operations: runs, tables, errors, control rows, jobs."
       source_code_path: ../src
       config:
-        command: ["streamlit", "run", "app.py"]
+        command: ["python", "main.py"]
         env:
           - name: LAKEBASE_INSTANCE
             value: ${var.lakebase_instance}

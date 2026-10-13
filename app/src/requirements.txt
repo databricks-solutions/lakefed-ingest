@@ -1,4 +1,4 @@
-streamlit>=1.40
-pandas
+fastapi>=0.115
+uvicorn[standard]>=0.30
 psycopg[binary]>=3.2
 databricks-sdk==0.145.0
