@@ -838,3 +838,20 @@ def test_read_and_merge_ct_retries_whole_unit_on_conflict(monkeypatch):
     merges = [x for x in spark.statements if x.startswith("MERGE")]
     views = {x.split(" USING ")[1].split()[0] for x in merges}
     assert len(reads) == 2 and len(merges) == 2 and len(views) == 2 and spark.views == {}
+
+
+def test_existing_sinks_query_and_fallback():
+    sql = ce.existing_sinks_sql("Main", ["Bronze", "it's"])
+    assert sql.startswith("SELECT lower(table_schema) AS s, lower(table_name) AS t FROM `Main`.information_schema.tables")
+    assert "IN ('bronze', 'it''s')" in sql
+
+    class _Spark:
+        def __init__(self, fail): self.fail = fail
+        def sql(self, q):
+            if self.fail:
+                raise RuntimeError("PERMISSION_DENIED")
+            return type("R", (), {"collect": lambda s: [{"s": "bronze", "t": "orders"}]})()
+    cfgs = [{"sink_catalog": "Main", "sink_schema": "Bronze", "sink_table": "Orders"}]
+    assert ce.existing_sinks(_Spark(False), cfgs) == {"main.bronze.orders"}
+    assert ce.existing_sinks(_Spark(True), cfgs) is None
+    assert ce.sink_fqn(cfgs[0]) == "main.bronze.orders"

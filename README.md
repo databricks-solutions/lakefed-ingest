@@ -185,6 +185,11 @@ database, so detection is grouped by source database:
   - A table whose CT `begin_version` differs from the one recorded at seed time (CT turned off and
     back on between runs) is queued for a reseed (reason `ct_reenabled`).
   - A checkpoint ahead of the database's current version (restore) routes the table to a reseed.
+- **Edited or missing sinks.** Each checkpoint records the source, sink and primary key it was
+  written for. A `ct` / `cursor` table whose control row now points at a different source, sink or
+  key, or whose sink table no longer exists, is reseeded rather than merging only new changes into
+  the new place (a silent gap). The sink check is one `information_schema` query per sink catalog
+  per run; it's skipped with a warning if a catalog can't be listed.
   - **Limitation:** if CT is turned off and back on while the database's CT version still equals
     the table's original `begin_version` (no tracked commit anywhere in the database since CT was
     first enabled), the toggle leaves no trace in SQL Server metadata. Checkpoints created before

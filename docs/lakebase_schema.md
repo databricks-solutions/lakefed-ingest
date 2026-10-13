@@ -13,6 +13,7 @@ as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitor
 | `reseed_queue` | **Log.** Every reseed the job queued, and why | The ingestion job |
 | `ingest_run` | **Telemetry.** One row per job run | The ingestion job |
 | `ingest_event` | **Telemetry.** One row per table per run | The ingestion job |
+| `control_change` | **Audit.** Every change the operations app makes to control rows | The operations app |
 | `discovery`, `discovered_table` | **Onboarding.** Tables found by the discovery job, with recommended control-row settings | The discovery job |
 
 ```mermaid
@@ -138,6 +139,7 @@ at the start of a run.
 | `position` | Resume point, owned by the strategy. `ct`: the source database's CT version. `cursor`: JSON `{"col", "type", "value"}` (the watermark). `full`: NULL |
 | `status`, `detail` | `ok` or `failed`, with the last error in `detail` |
 | `select_list` | Columns the sink was last written with; compared with `control.select_list` to detect added columns |
+| `source_identity`, `sink_identity`, `merge_key` | What the checkpoint was written for: `engine://host:port/db/schema/table`, the sink (`catalog.schema.table`, plus `#client_id` for a shared sink) and the normalized primary key. A control row that now points elsewhere reseeds (`source_changed`, `sink_changed`, `primary_key_changed`). NULL until first recorded |
 | `ct_begin_version` | `ct`: the table's Change Tracking begin version at seed time. A change means CT was turned off and on, so the table reseeds |
 | `last_success_at` | When the table last ingested successfully, used for freshness and lag |
 | `updated_at` | Last change to this row |
@@ -156,7 +158,8 @@ stateDiagram-v2
 ```
 
 A table reseeds when Change Tracking retention lapsed, CT was turned off or re-enabled on it,
-`select_list` gained columns, `cursor_column` changed, or `load_type` changed.
+`select_list` gained columns, `cursor_column` or `load_type` changed, its source, sink or primary
+key changed, or its sink table no longer exists (`sink_missing`).
 
 **Forcing a reseed.** Set the phase back to `seeding`; the next run copies the table again:
 
@@ -211,6 +214,19 @@ when the watermark hasn't moved.
 | `pool` | Spark FAIR pools the table's work ran in |
 | `error` | Error message for a failed table |
 | `retry_count` | Reserved; not currently populated (write-conflict retries are logged in the job output) |
+
+## `control_change` — change log
+
+Written by the operations app in the same transaction as each change. Columns:
+- `changed_at`, `changed_by` (the signed-in user);
+- `action`: `add`, `register`, `edit`, `enable`, `disable` or `reseed`;
+- `control_id`, and `task_collection` (the row's collection after the change);
+- `field`, `old_value`, `new_value`, for edits;
+- `reseed_reason`, when the change flipped the table to seeding;
+- `batch_id`, which groups the rows of one bulk action.
+
+Edits made directly with SQL aren't logged, but the job still reseeds a table whose source, sink or
+key changed (see `checkpoint`).
 
 ## `discovery` and `discovered_table` — bulk onboarding
 

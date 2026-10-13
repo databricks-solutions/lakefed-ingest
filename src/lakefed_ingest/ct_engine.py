@@ -507,6 +507,37 @@ def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
     check_sink_mode(cfg, sink_fqn, spark.table(sink_fqn).columns)
 
 
+def sink_fqn(cfg: dict) -> str:
+    """Lower-cased catalog.schema.table of a control row's sink."""
+    return ".".join(str(cfg.get(k) or "").strip().lower() for k in ("sink_catalog", "sink_schema", "sink_table"))
+
+
+def existing_sinks_sql(catalog: str, schemas) -> str:
+    """Tables that exist in the given schemas of one catalog — ONE information_schema query per sink
+    catalog per run, so the planner can reseed an incremental table whose sink is gone."""
+    cat = "`" + str(catalog).replace("`", "``") + "`"
+    lits = ", ".join("'" + str(s).lower().replace("'", "''") + "'" for s in sorted(schemas))
+    return (f"SELECT lower(table_schema) AS s, lower(table_name) AS t FROM {cat}.information_schema.tables "
+            f"WHERE lower(table_schema) IN ({lits})")
+
+
+def existing_sinks(spark, configs) -> Optional[set]:
+    """{catalog.schema.table} (lower) of the sink tables that exist for these control rows, or None
+    when a catalog can't be listed (the caller then skips the check rather than guessing)."""
+    by_cat = {}
+    for c in configs:
+        by_cat.setdefault(str(c["sink_catalog"]).strip().lower(), set()).add(str(c["sink_schema"]).strip().lower())
+    found = set()
+    for cat, schemas in by_cat.items():
+        try:
+            rows = spark.sql(existing_sinks_sql(cat, schemas)).collect()
+        except Exception as e:
+            print(f"[warn] can't list tables in catalog {cat} ({str(e)[:160]}); skipping the missing-sink check")
+            return None
+        found |= {f"{cat}.{r['s']}.{r['t']}" for r in rows}
+    return found
+
+
 def _is_partitioned(cfg: dict) -> bool:
     v = cfg.get("load_partitioned")
     return v is True or str(v).lower() == "true"

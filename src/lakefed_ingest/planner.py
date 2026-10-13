@@ -59,6 +59,35 @@ def sink_key(cfg: dict) -> tuple:
     return tuple(str(cfg.get(k) or "").lower() for k in ("sink_catalog", "sink_schema", "sink_table"))
 
 
+IDENTITY_REASONS = (("source_identity", "source_changed"), ("sink_identity", "sink_changed"),
+                    ("merge_key", "primary_key_changed"))
+
+
+def identity_change(cfg: dict, cp: Optional[dict]) -> Optional[str]:
+    """Reseed reason when the control row now points at a different source, sink (or client slice),
+    or merge key than its checkpoint was written for — e.g. an edit made with SQL. Continuing would
+    merge only new changes into the new place (a silent gap) or match on the wrong key. A checkpoint
+    without a recorded value (written before this check existed) is never reseeded for it; the
+    value is recorded on its next advance."""
+    if not cp:
+        return None
+    current = dict(zip(("source_identity", "sink_identity", "merge_key"), ss.identity_values(cfg)))
+    for col, reason in IDENTITY_REASONS:
+        recorded = cp.get(col)
+        if recorded is not None and recorded != current[col]:
+            return reason
+    return None
+
+
+def sink_missing(cfg: dict, existing_sinks: Optional[set]) -> Optional[str]:
+    """'sink_missing' when an incremental table's sink table doesn't exist (dropped, renamed, or the
+    row was pointed at a new sink). Continuing would create an empty sink and merge only new changes
+    into it — a silent gap — so the table reseeds. existing_sinks None = unknown (check skipped)."""
+    if existing_sinks is None:
+        return None
+    return None if ct_engine.sink_fqn(cfg) in existing_sinks else "sink_missing"
+
+
 def config_error(cfg: dict, mixed_sinks=frozenset()) -> Optional[str]:
     """Sink-ownership problems that would let one row overwrite another's data — checked per table
     before any work: an invalid client_id, a consolidated row whose select_list already has a
@@ -83,7 +112,8 @@ def config_error(cfg: dict, mixed_sinks=frozenset()) -> Optional[str]:
     return None
 
 
-def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=frozenset()):
+def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=frozenset(),
+                 existing_sinks: Optional[set] = None):
     """Returns ``(plans, candidates, legacy)``.
 
     plans      — unsupported (pair not in the support matrix, or a sink-ownership problem — see
@@ -105,11 +135,15 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=
             plans.append({"cfg": cfg, "route": "full", "cp": cp})
             continue
         if ss.strategy_name(cfg) == ls.CURSOR:
-            plans.append(_route_cursor(cfg, cp))
+            plans.append(_route_cursor(cfg, cp, existing_sinks))
             continue
         # CT. A checkpoint written by another strategy (load_type changed) can't be resumed: seed.
         if cp is None or cp.get("phase") != ss.INCREMENTAL or (cp.get("strategy") or ls.CT) != ls.CT:
             plans.append({"cfg": cfg, "route": "seed", "cp": cp})
+            continue
+        moved = identity_change(cfg, cp) or sink_missing(cfg, existing_sinks)
+        if moved:
+            plans.append({"cfg": cfg, "route": "reseed", "cp": cp, "reason": moved})
             continue
         added = ss.select_list_added_columns(cfg["select_list"], cp.get("select_list"))
         if added is None:
@@ -121,7 +155,7 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=
     return plans, candidates, legacy
 
 
-def _route_cursor(cfg: dict, cp: Optional[dict]) -> dict:
+def _route_cursor(cfg: dict, cp: Optional[dict], existing_sinks: Optional[set] = None) -> dict:
     """Cursor tables: seed when there's no usable cursor checkpoint (none, phase seeding, another
     strategy's, or recorded for a different cursor_column); reseed when select_list gained columns;
     else a per-table high-watermark increment."""
@@ -129,6 +163,9 @@ def _route_cursor(cfg: dict, cp: Optional[dict]) -> dict:
     if (cp is None or cp.get("phase") != ss.INCREMENTAL or (cp.get("strategy") or ls.CT) != ls.CURSOR
             or pos is None or pos["col"].lower() != str(cfg.get("cursor_column") or "").lower()):
         return {"cfg": cfg, "route": "cursor_seed", "cp": cp}
+    moved = identity_change(cfg, cp) or sink_missing(cfg, existing_sinks)
+    if moved:
+        return {"cfg": cfg, "route": "reseed", "cp": cp, "reason": moved}
     added = ss.select_list_added_columns(cfg["select_list"], cp.get("select_list"))
     if added:
         return {"cfg": cfg, "route": "schema_reseed", "cp": cp, "added": added}
@@ -222,7 +259,7 @@ def detect_group(members, current_version: Callable, detect: Callable, record_sl
 
     def unchanged_row(c):
         cid = int(c["id"])
-        return (cid, cur, c["select_list"] if cid in record_sl else None, begin.get(cid))
+        return (cid, cur, c["select_list"] if cid in record_sl else None, begin.get(cid), ss.identity_values(c))
 
     if ct_engine.all_current([ct_position(cp) for _, cp in members], cur):
         out["fast_exit"] = True

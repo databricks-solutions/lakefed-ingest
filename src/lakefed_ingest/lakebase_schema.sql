@@ -192,6 +192,12 @@ alter table lakefed_ingest.checkpoint add column if not exists last_success_at t
 -- CT begin_version recorded at seed time; a different current value means CT was re-enabled on the
 -- table since (changes made while it was off are invisible to CHANGETABLE), so the table re-seeds.
 alter table lakefed_ingest.checkpoint add column if not exists ct_begin_version bigint;
+-- What the checkpoint was written for: source (engine://host:port/db/schema/table), sink (+ #client_id)
+-- and merge key. A control row that now points elsewhere (edited) is reseeded instead of merging only
+-- new changes into the new place. NULL = not recorded yet (recorded on the next advance).
+alter table lakefed_ingest.checkpoint add column if not exists source_identity text;
+alter table lakefed_ingest.checkpoint add column if not exists sink_identity text;
+alter table lakefed_ingest.checkpoint add column if not exists merge_key text;
 
 -- The select_list the sink was last written with. The sweep compares it with control.select_list:
 -- a column ADDED to the control row means the table is reseeded (CT returns changed rows only, so
@@ -333,3 +339,27 @@ create table if not exists lakefed_ingest.discovered_table (
     discovered_at         timestamptz not null default now(),
     constraint discovered_table_pk primary key (discovery_id, src_database, src_schema, src_table)
 );
+
+-- ---------------------------------------------------------------------------------------
+-- Change log for control rows: who changed what, when. Written by the operations app in the same
+-- transaction as each change (add, register, edit, move, enable / disable, reseed). Edits made with
+-- SQL aren't logged here; the ingestion planner still reseeds a table whose source, sink or key
+-- changed (checkpoint.source_identity / sink_identity / merge_key).
+-- ---------------------------------------------------------------------------------------
+create table if not exists lakefed_ingest.control_change (
+    id              bigserial   primary key,
+    changed_at      timestamptz not null default now(),
+    changed_by      text,                         -- signed-in user (app) or NULL
+    action          text        not null,         -- add | register | edit | enable | disable | reseed
+    control_id      bigint,                       -- -> control.id
+    task_collection text,                         -- the row's collection after the change
+    field           text,                         -- edited column (NULL for whole-row actions)
+    old_value       text,
+    new_value       text,
+    reseed_reason   text,                         -- set when the change flipped the table to seeding
+    batch_id        text                          -- groups the rows of one bulk action
+);
+create index if not exists control_change_control_idx
+    on lakefed_ingest.control_change (control_id, changed_at);
+create index if not exists control_change_time_idx
+    on lakefed_ingest.control_change (changed_at);
