@@ -73,3 +73,58 @@ def test_control_params_order_and_blank_to_null():
     assert len(params) == len(q.CONTROL_INSERT_COLUMNS) == q.insert_control_sql().count("%s")
     d = dict(zip(q.CONTROL_INSERT_COLUMNS, params))
     assert d["client_id"] is None and d["cursor_column"] is None and d["src_table"] == "t"
+
+
+# ---- bulk import ----------------------------------------------------------------------------------
+
+def _disc(**kw):
+    base = dict(src_database="Tenant-01", src_schema="dbo", src_table="Orders", row_count=10, size_mb=5.0,
+                ct_enabled=True, load_type="ct", primary_key="id", cursor_column=None, partition_candidate="id",
+                select_list="id, v", notes=None, registered_id=None, src_type="sqlserver", src_host="h",
+                src_port=None, secret_key="creds-tenant-01")
+    base.update(kw)
+    return base
+
+
+SHARED = dict(sink_catalog="main", sink_schema="bronze_{database}", sink_table="{table}", client_id="",
+              partition_threshold_mb=1024, partition_size_mb=512, include_default=True)
+
+
+def test_review_rows_templates_and_partition_threshold():
+    small, big = q.review_rows([_disc(), _disc(src_table="Big", size_mb=4096)], SHARED)
+    assert (small["sink_schema"], small["sink_table"], small["client_id"]) == ("bronze_tenant_01", "orders", None)
+    assert (small["load_partitioned"], small["partition_col"]) == (False, None)
+    assert (big["load_partitioned"], big["partition_col"], big["partition_size_mb"]) == (True, "id", 512)
+
+
+def test_review_rows_large_table_without_candidate_is_not_partitioned():
+    (r,) = q.review_rows([_disc(size_mb=9999, partition_candidate=None)], SHARED)
+    assert r["load_partitioned"] is False
+
+
+def test_review_rows_consolidated_client_template_keeps_raw_value():
+    (r,) = q.review_rows([_disc()], dict(SHARED, sink_schema="bronze", client_id="{database}"))
+    assert r["sink_schema"] == "bronze" and r["client_id"] == "Tenant-01"
+
+
+def test_registered_and_columnless_tables_start_excluded():
+    rows = q.review_rows([_disc(), _disc(registered_id=7), _disc(select_list="")], SHARED)
+    assert [r["include"] for r in rows] == [True, False, False]
+    assert all(r["include"] is False for r in q.review_rows([_disc()], dict(SHARED, include_default=False)))
+
+
+def test_control_row_from_review_validates_and_drops_irrelevant_fields():
+    (r,) = q.review_rows([_disc(load_type="full", cursor_column="rv")], SHARED)
+    row = q.control_row_from_review(r, "coll")
+    assert row["cursor_column"] is None and row["partition_col"] is None and row["secret_key"] == "creds-tenant-01"
+    assert q.validate_control_row(row) == []
+    assert len(q.control_params(row)) == len(q.CONTROL_INSERT_COLUMNS)
+
+
+def test_identifier_and_insert_if_absent():
+    assert q.identifier("Tenant-01 / Orders!") == "tenant_01_orders" and q.identifier("***") == "t"
+    assert q.insert_control_if_absent_sql().endswith("on conflict do nothing returning id")
+
+
+def test_parse_databases():
+    assert q.parse_databases(" a, b\nc,,a ") == ["a", "b", "c"] and q.parse_databases(None) == []

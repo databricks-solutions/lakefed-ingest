@@ -92,6 +92,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   transient source error, 0 = off; `table_retry.py`), `table_retry_budget` (retries per run),
   `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
+- `lakefed_ingest_discover` → `discover_tables.ipynb`: table discovery for bulk onboarding (params
+  `discovery_id`, `spec` JSON); writes `discovery` / `discovered_table`.
 - `lakefed_ingest_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
   instance, its UC catalog, and the secret scope (`database_instances.lakebase`,
   `database_catalogs.lakebase_catalog`, `secret_scopes.secret_scope`).
@@ -134,6 +136,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 | `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning (no Spark/DB; unit-tested with fakes) |
 | `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget, `SourceLimiter` (per-source permits) |
 | `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |
+| `src/lakefed_ingest/discovery.py` | Table discovery for bulk onboarding (catalog queries + recommended control-row settings); run by `discover_tables.ipynb` / job `lakefed_ingest_discover` |
 | `src/lakefed_ingest/state_store.py` | Lakebase accessor (psycopg, SDK-minted OAuth token) + pure helpers |
 | `tests/conftest.py` | Puts `src/lakefed_ingest` on `sys.path` |
 | `tests/synthetic/` | Synthetic SQL Server DB generator, change generator, reconcile |

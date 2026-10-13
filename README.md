@@ -423,7 +423,12 @@ required for `ct`, `cursor` and `cdc`), `select_list` (explicit columns — `*` 
 optional partitioned-seed settings, `cursor_column` (required for `cursor`), `client_id`
 (consolidated sinks), `write_mode` (`merge` | `append`, see [Append sinks](#append-sinks-optional)),
 `client_attrs` (identity columns, JSON), and `jdbc_options`.
-`cdc_capture_instance` is reserved for the placeholder `cdc` strategy. Check constraints reject invalid combinations (e.g.
+`cdc_capture_instance` is reserved for the placeholder `cdc` strategy.
+
+**Bulk onboarding.** The `lakefed_ingest_discover` job lists a SQL Server database's tables with
+recommended settings (load type from Change Tracking / rowversion / primary key, select list, partition
+column) into Lakebase. The optional operations app reviews them and creates control rows in bulk;
+without the app, query `discovered_table` and insert control rows yourself. Check constraints reject invalid combinations (e.g.
 `ct` on a non-SQL Server source). See `notebooks/load_control_example.ipynb`.
 
 **Schema changes.** Writes use schema evolution. Adding a column to `select_list` adds it to the

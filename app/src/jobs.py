@@ -1,5 +1,5 @@
 """Databricks Jobs operations for the app (the app's service principal holds CAN_MANAGE_RUN on the
-ingestion and setup jobs through the app's `job` resources: view, run, and cancel; not edit)."""
+ingestion, setup and discovery jobs through the app's `job` resources: view, run, and cancel; not edit)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from lakebase import workspace
 
 INGEST_JOB_ID = os.environ.get("INGEST_JOB_ID")
 SETUP_JOB_ID = os.environ.get("SETUP_JOB_ID")
+DISCOVER_JOB_ID = os.environ.get("DISCOVER_JOB_ID")
 
 
 def _ts(ms) -> Optional[datetime]:

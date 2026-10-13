@@ -14,6 +14,7 @@ as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitor
 | `reseed_queue` | **Log.** Every reseed the job queued, and why | The ingestion job |
 | `ingest_run` | **Telemetry.** One row per job run | The ingestion job |
 | `ingest_event` | **Telemetry.** One row per table per run | The ingestion job |
+| `discovery`, `discovered_table` | **Onboarding.** Tables found by the discovery job, with recommended control-row settings | The discovery job |
 | `schema_version` | **Bookkeeping.** Schema versions applied | The setup job, or the first ingestion run after an upgrade |
 
 ```mermaid
@@ -223,6 +224,21 @@ when the watermark hasn't moved.
 | `pool` | Spark FAIR pools the table's work ran in |
 | `error` | Error message for a failed or retried attempt, with its deepest Java cause when Spark's message leaves it out |
 | `retry_count` | Earlier attempts of this table in the run: 0 for the first, 1 for the first retry. Write-conflict retries inside an attempt are logged in the job output only |
+
+## `discovery` and `discovered_table` — bulk onboarding
+
+Written by the `lakefed_ingest_discover` job, which reads source catalog metadata only, and reviewed
+in the operations app's Bulk import page.
+- **`discovery`:** one row per (discovery, database), with the connection used (`src_host`,
+  `src_port`, `secret_key`), `status` (`running` | `ok` | `failed`), `error`, and the number of
+  tables found.
+- **`discovered_table`:** one row per table, with size and row counts, whether Change Tracking is
+  enabled, and the recommended settings: `select_list` (unsupported column types listed in
+  `excluded_columns`), `primary_key`, `load_type` (`ct` if CT and a PK; `cursor` on a rowversion
+  column if a PK; else `full`), `cursor_column`, and `partition_candidate`. Partitioning itself is
+  decided at review from a size threshold.
+
+Nothing here is used by ingestion; control rows are created only when a reviewer registers tables.
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.

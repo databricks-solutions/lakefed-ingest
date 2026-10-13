@@ -338,3 +338,46 @@ create index if not exists ingest_event_collection_idx
 -- NOTE: the two-level controller/batching was removed — one run ingests a whole task_collection in
 -- one task (see ingest.ipynb), so there is no `task_batch` table. A `task_batch` left over from an
 -- earlier deploy is harmless/orphaned; we don't drop it here.
+
+-- ---------------------------------------------------------------------------------------
+-- Table discovery (bulk onboarding). The lakefed_ingest_discover job lists a source database's
+-- tables with recommended control-row settings (discovery.py); the operations app shows them for
+-- review and creates control rows from the selection. One `discovery` row per (discovery, database)
+-- reports status / errors; `discovered_table` holds one row per table found.
+-- ---------------------------------------------------------------------------------------
+create table if not exists lakefed_ingest.discovery (
+    discovery_id  text        not null,
+    src_type      text,
+    src_host      text,
+    src_port      int,
+    src_database  text        not null,
+    secret_key    text,
+    status        text        not null default 'running',  -- running | ok | failed
+    error         text,
+    tables        int,
+    requested_by  text,
+    started_at    timestamptz not null default now(),
+    finished_at   timestamptz,
+    constraint discovery_pk primary key (discovery_id, src_database)
+);
+
+create table if not exists lakefed_ingest.discovered_table (
+    discovery_id          text        not null,
+    src_database          text        not null,
+    src_schema            text        not null,
+    src_table             text        not null,
+    row_count             bigint,
+    size_mb               numeric,
+    ct_enabled            boolean,
+    primary_key           text,
+    select_list           text,
+    excluded_columns      text,
+    rowversion_column     text,
+    identity_column       text,
+    load_type             text,                    -- recommended: ct | cursor | full
+    cursor_column         text,
+    partition_candidate   text,                    -- column a partitioned seed could split on
+    notes                 text,
+    discovered_at         timestamptz not null default now(),
+    constraint discovered_table_pk primary key (discovery_id, src_database, src_schema, src_table)
+);

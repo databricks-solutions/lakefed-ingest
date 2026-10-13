@@ -192,3 +192,124 @@ def control_params(row: dict) -> tuple:
             return v or None
         return v
     return tuple(clean(row.get(c)) for c in CONTROL_INSERT_COLUMNS)
+
+
+# ---- bulk import (table discovery) --------------------------------------------------------------
+
+DEFAULT_PARTITION_THRESHOLD_MB = 1024   # tables at least this large get a partitioned seed / full load
+DEFAULT_PARTITION_SIZE_MB = 512
+
+
+def discoveries_sql() -> str:
+    """Recent discoveries, one row each. Param: limit."""
+    return (f"select discovery_id, min(started_at) as started_at, max(finished_at) as finished_at, "
+            f"min(src_host) as src_host, count(*) as databases, "
+            f"count(*) filter (where status = 'ok') as ok, count(*) filter (where status = 'failed') as failed, "
+            f"count(*) filter (where status = 'running') as running, coalesce(sum(tables), 0) as tables, "
+            f"min(requested_by) as requested_by "
+            f"from {SCHEMA}.discovery group by discovery_id order by min(started_at) desc limit %s")
+
+
+def discovery_databases_sql() -> str:
+    """Per-database status of one discovery. Param: discovery_id."""
+    return (f"select src_database, status, tables, error, started_at, finished_at "
+            f"from {SCHEMA}.discovery where discovery_id = %s order by src_database")
+
+
+def discovered_tables_sql() -> str:
+    """Discovered tables of one discovery, with the source connection and any existing control row
+    for the same source table (``registered_id``). Param: discovery_id."""
+    return (f"select dt.*, d.src_type, d.src_host, d.src_port, d.secret_key, "
+            f"(select min(c.id) from {SCHEMA}.control c where lower(c.src_host) = lower(d.src_host) "
+            f"   and lower(c.src_database) = lower(dt.src_database) and lower(c.src_schema) = lower(dt.src_schema) "
+            f"   and lower(c.src_table) = lower(dt.src_table)) as registered_id "
+            f"from {SCHEMA}.discovered_table dt join {SCHEMA}.discovery d "
+            f"  on d.discovery_id = dt.discovery_id and d.src_database = dt.src_database "
+            f"where dt.discovery_id = %s order by dt.src_database, dt.src_schema, dt.src_table")
+
+
+def parse_databases(text: Optional[str]) -> List[str]:
+    """Database names from a comma- / newline-separated list (order kept, duplicates dropped)."""
+    seen, out = set(), []
+    for part in str(text or "").replace("\n", ",").split(","):
+        name = part.strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def identifier(text: str) -> str:
+    """A safe, lower-case Delta identifier part (letters, digits, underscores)."""
+    import re
+    out = re.sub(r"[^a-z0-9_]+", "_", str(text).lower()).strip("_")
+    return out or "t"
+
+
+def render(template: Optional[str], database: str, schema: str, table: str, as_identifier: bool = True):
+    """Fill {database} / {schema} / {table} in a template; blank template -> None."""
+    if not str(template or "").strip():
+        return None
+    f = identifier if as_identifier else (lambda v: v)
+    return (str(template).replace("{database}", f(database)).replace("{schema}", f(schema))
+            .replace("{table}", f(table)).strip())
+
+
+def recommended_partitioning(size_mb, partition_candidate, threshold_mb: float, partition_size_mb: int):
+    """(load_partitioned, partition_col, partition_size_mb) for a discovered table."""
+    if partition_candidate and float(size_mb or 0) >= float(threshold_mb):
+        return True, partition_candidate, int(partition_size_mb)
+    return False, None, None
+
+
+def review_rows(discovered: List[dict], shared: dict) -> List[dict]:
+    """The review grid: one editable row per discovered table, from the recommendations plus the
+    shared fields (sink templates, client_id template, partition threshold). Registered tables and
+    tables with no readable columns start excluded."""
+    rows = []
+    for t in discovered:
+        db, sch, tbl = t["src_database"], t["src_schema"], t["src_table"]
+        part, pcol, psize = recommended_partitioning(t.get("size_mb"), t.get("partition_candidate"),
+                                                     shared.get("partition_threshold_mb", DEFAULT_PARTITION_THRESHOLD_MB),
+                                                     shared.get("partition_size_mb", DEFAULT_PARTITION_SIZE_MB))
+        registered = t.get("registered_id")
+        rows.append({
+            "include": bool(shared.get("include_default", True)) and not registered and bool(t.get("select_list")),
+            "src_database": db, "src_schema": sch, "src_table": tbl,
+            "rows": t.get("row_count"), "size_mb": float(t.get("size_mb") or 0),
+            "ct_enabled": bool(t.get("ct_enabled")),
+            "load_type": t.get("load_type"), "primary_key": t.get("primary_key"),
+            "cursor_column": t.get("cursor_column"),
+            "load_partitioned": part, "partition_col": pcol, "partition_size_mb": psize,
+            "sink_catalog": render(shared.get("sink_catalog"), db, sch, tbl),
+            "sink_schema": render(shared.get("sink_schema"), db, sch, tbl),
+            "sink_table": render(shared.get("sink_table"), db, sch, tbl),
+            "client_id": render(shared.get("client_id"), db, sch, tbl, as_identifier=False),
+            "registered_id": registered, "notes": t.get("notes"),
+            # carried through, not shown for editing
+            "_select_list": t.get("select_list"), "_src_type": t.get("src_type"), "_src_host": t.get("src_host"),
+            "_src_port": t.get("src_port"), "_secret_key": t.get("secret_key"),
+        })
+    return rows
+
+
+def control_row_from_review(row: dict, task_collection: str) -> dict:
+    """A control row (for validate_control_row / control_params) from an edited review row."""
+    return {
+        "task_collection": task_collection, "src_type": row["_src_type"], "src_host": row["_src_host"],
+        "src_port": row["_src_port"], "secret_key": row["_secret_key"], "src_database": row["src_database"],
+        "src_schema": row["src_schema"], "src_table": row["src_table"], "select_list": row["_select_list"],
+        "primary_key": row.get("primary_key"), "load_type": row.get("load_type"),
+        "cursor_column": row.get("cursor_column") if row.get("load_type") == "cursor" else None,
+        "sink_catalog": row.get("sink_catalog"), "sink_schema": row.get("sink_schema"),
+        "sink_table": row.get("sink_table"), "client_id": row.get("client_id"),
+        "load_partitioned": bool(row.get("load_partitioned")),
+        "partition_col": row.get("partition_col") if row.get("load_partitioned") else None,
+        "partition_size_mb": row.get("partition_size_mb") if row.get("load_partitioned") else None,
+    }
+
+
+def insert_control_if_absent_sql() -> str:
+    """Like insert_control_sql, but a row whose sink (or sink + client_id) is already taken is skipped
+    (the unique index) instead of failing the whole import."""
+    return insert_control_sql().replace(" returning id", " on conflict do nothing returning id")
