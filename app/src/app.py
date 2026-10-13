@@ -1,10 +1,13 @@
 """lakefed_ingest operations app (optional): observe runs and tables, manage control rows, run jobs.
 
-Pages: Overview, Runs, Tables, Jobs, Add table. Reads Lakebase directly (lakebase.py) and the Jobs
+Pages: Overview, Runs, Tables, Jobs, Add table, Bulk import (discover source tables, review, register). Reads Lakebase directly (lakebase.py) and the Jobs
 API as the app's service principal (jobs.py). Every write asks for confirmation.
 """
 
 from __future__ import annotations
+
+import json
+import uuid
 
 import streamlit as st
 
@@ -52,7 +55,8 @@ def collections() -> list:
 # ---- sidebar ------------------------------------------------------------------------------------
 
 st.sidebar.title("lakefed_ingest")
-page = st.sidebar.radio("Page", ["Overview", "Runs", "Tables", "Jobs", "Add table"], label_visibility="collapsed")
+page = st.sidebar.radio("Page", ["Overview", "Runs", "Tables", "Jobs", "Add table", "Bulk import"],
+                        label_visibility="collapsed")
 stale_minutes = st.sidebar.number_input("Stale after (minutes)", min_value=5, value=60, step=5,
                                         help="A table counts as stale when its last successful ingest is older than this.")
 if st.sidebar.button("Refresh", width="stretch"):
@@ -249,3 +253,134 @@ elif page == "Add table":
                     refresh(); st.success(f"Added control row {new_id}.")
                 except Exception as ex:
                     show_error(ex)
+
+
+# ---- Bulk import --------------------------------------------------------------------------------
+
+elif page == "Bulk import":
+    st.header("Bulk import")
+    st.caption("Discover a server's tables, review the recommended settings, and register the ones you want. "
+               "Discovery runs as a job on the ingestion network path and reads catalog metadata only.")
+    if not jobs.DISCOVER_JOB_ID:
+        st.warning("DISCOVER_JOB_ID isn't configured for this app.")
+        st.stop()
+
+    with st.expander("1. Discover tables", expanded=not st.session_state.get("discovery_id")):
+        with st.form("discover"):
+            a = st.columns(3)
+            host = a[0].text_input("src_host*")
+            port = a[1].number_input("src_port (0 = default)", min_value=0, value=0)
+            a[2].selectbox("src_type", ["sqlserver"], help="Discovery supports SQL Server for now.")
+            dbs = st.text_area("Databases* (comma- or newline-separated)")
+            b = st.columns(2)
+            key = b[0].text_input("Secret key template*", value="{database}",
+                                  help="Secret holding JSON {user, password}; {database} is replaced per database.")
+            ok = b[1].checkbox("Confirm: start a discovery job")
+            if st.form_submit_button("Discover") and ok:
+                names = q.parse_databases(dbs)
+                if not host or not names or not key:
+                    st.error("src_host, at least one database and the secret key template are required.")
+                else:
+                    did = uuid.uuid4().hex[:12]
+                    spec = {"src_type": "sqlserver", "src_host": host.strip(), "src_port": int(port) or None,
+                            "databases": names, "secret_key_template": key.strip(),
+                            "requested_by": st.context.headers.get("X-Forwarded-Email", "")}
+                    rid = jobs.run_now(jobs.DISCOVER_JOB_ID, {"discovery_id": did, "spec": json.dumps(spec)})
+                    st.session_state["discovery_id"] = did
+                    refresh()
+                    st.success(f"Discovery {did} started for {len(names)} databases (job run {rid}). "
+                               "Results appear below in a few minutes.")
+
+    st.subheader("2. Review")
+    try:
+        recent = read(q.discoveries_sql(), (50,))
+    except Exception as e:
+        show_error(e); st.stop()
+    if not len(recent):
+        st.info("No discoveries yet."); st.stop()
+    ids = recent["discovery_id"].tolist()
+    default = ids.index(st.session_state["discovery_id"]) if st.session_state.get("discovery_id") in ids else 0
+    did = st.selectbox("Discovery", ids, index=default, format_func=lambda i: (
+        lambda r: f"{i}: {r['src_host']}, {r['databases']} databases, {r['tables']} tables, started {r['started_at']:%Y-%m-%d %H:%M}"
+    )(recent[recent["discovery_id"] == i].iloc[0]))
+    dbstat = read(q.discovery_databases_sql(), (did,))
+    if (dbstat["status"] == "running").any():
+        st.info(f"{int((dbstat['status'] == 'running').sum())} databases still running. Press Refresh in a moment.")
+    if (dbstat["status"] == "failed").any():
+        st.error("Some databases failed:")
+        st.dataframe(dbstat[dbstat["status"] == "failed"][["src_database", "error"]], hide_index=True, width="stretch")
+    discovered = read(q.discovered_tables_sql(), (did,))
+    if not len(discovered):
+        st.stop()
+
+    st.markdown("**Shared fields.** Templates can use `{database}`, `{schema}` and `{table}`. "
+                "Changing these resets edits in the grid below, so set them first.")
+    f = st.columns(4)
+    coll = f[0].text_input("task_collection*")
+    sink_catalog = f[1].text_input("sink_catalog*", value="main")
+    sink_schema = f[2].text_input("sink_schema*", value="bronze_{database}")
+    sink_table = f[3].text_input("sink_table*", value="{table}")
+    g = st.columns(4)
+    client_id = g[0].text_input("client_id (consolidate)", value="",
+                                help="e.g. {database} with a shared sink_schema to consolidate databases into one table each")
+    threshold = g[1].number_input("Partition tables larger than (MB)", min_value=1,
+                                  value=q.DEFAULT_PARTITION_THRESHOLD_MB, step=256)
+    psize = g[2].number_input("partition_size_mb", min_value=1, value=q.DEFAULT_PARTITION_SIZE_MB, step=64)
+    include_default = g[3].checkbox("Include new tables by default", value=True)
+    shared = dict(sink_catalog=sink_catalog, sink_schema=sink_schema, sink_table=sink_table, client_id=client_id,
+                  partition_threshold_mb=threshold, partition_size_mb=psize, include_default=include_default)
+
+    h = st.columns([3, 1, 1])
+    search = h[0].text_input("Filter tables", placeholder="database, schema or table")
+    hide_registered = h[1].checkbox("Hide registered", value=True)
+    min_mb = h[2].number_input("Min size (MB)", min_value=0.0, value=0.0)
+    rows = q.review_rows(discovered.to_dict("records"), shared)
+    if search:
+        rows = [r for r in rows if search.lower() in f"{r['src_database']}.{r['src_schema']}.{r['src_table']}".lower()]
+    if hide_registered:
+        rows = [r for r in rows if not r["registered_id"]]
+    rows = [r for r in rows if r["size_mb"] >= min_mb]
+    import pandas as pd
+    grid = pd.DataFrame(rows)
+    if not len(grid):
+        st.info("No tables match the filters."); st.stop()
+    shown = [c for c in grid.columns if not c.startswith("_")]
+    edit_key = "review_" + did + "_" + str(abs(hash(json.dumps(shared, sort_keys=True, default=str) + search + str(hide_registered) + str(min_mb))))
+    edited = st.data_editor(
+        grid[shown], key=edit_key, hide_index=True, width="stretch", num_rows="fixed",
+        disabled=["src_database", "src_schema", "src_table", "rows", "size_mb", "ct_enabled", "registered_id", "notes"],
+        column_config={
+            "include": st.column_config.CheckboxColumn("include"),
+            "load_type": st.column_config.SelectboxColumn("load_type", options=list(q.LOAD_TYPES)),
+            "load_partitioned": st.column_config.CheckboxColumn("partitioned"),
+            "size_mb": st.column_config.NumberColumn("size_mb", format="%.1f"),
+        })
+    chosen = [dict(grid.iloc[i].to_dict(), **edited.iloc[i].to_dict()) for i in range(len(edited)) if edited.iloc[i]["include"]]
+    st.caption(f"{len(chosen)} of {len(edited)} shown tables selected "
+               f"({sum(1 for r in chosen if r['load_partitioned'])} partitioned).")
+
+    st.subheader("3. Register")
+    to_insert, problems = [], []
+    for r in chosen:
+        row = q.control_row_from_review(r, coll)
+        errs = q.validate_control_row(row)
+        (problems.append({"table": f"{r['src_database']}.{r['src_schema']}.{r['src_table']}", "problems": "; ".join(errs)})
+         if errs else to_insert.append(row))
+    if problems:
+        st.warning(f"{len(problems)} selected tables need fixes before they can be registered:")
+        st.dataframe(pd.DataFrame(problems), hide_index=True, width="stretch")
+    confirm = st.checkbox(f"Register {len(to_insert)} tables in collection '{coll or '?'}'")
+    if st.button("Register tables", disabled=not (confirm and to_insert and coll)):
+        added = skipped = 0
+        try:
+            for row in to_insert:
+                res = db.execute_returning(q.insert_control_if_absent_sql(), q.control_params(row))
+                added, skipped = (added + 1, skipped) if res else (added, skipped + 1)
+            refresh()
+            st.success(f"Registered {added} tables in '{coll}'." + (
+                f" Skipped {skipped} whose sink is already used by another control row." if skipped else "")
+                + " Their first run seeds them.")
+        except Exception as e:
+            show_error(e)
+            if added:
+                st.info(f"{added} tables were registered before the error.")

@@ -74,6 +74,8 @@ JDBC with per-database credentials (JSON `{user,password}`) from a secret scope 
 - `lakefed_ingest` → task `ingest` → `ingest.ipynb`: one run ingests a `task_collection`. Parameters:
   `task_collection`, `parallelism` (single budget of concurrent query units), `secret_scope`,
   `detection_chunk`, `trust_server_certificate`, `db_instance`, `db_name`.
+- `lakefed_ingest_discover` → `discover_tables.ipynb`: table discovery for bulk onboarding (params
+  `discovery_id`, `spec` JSON); writes `discovery` / `discovered_table`.
 - `lakefed_ingest_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
   instance, its UC catalog, and the secret scope (`database_instances.lakebase`,
   `database_catalogs.lakebase_catalog`, `secret_scopes.secret_scope`).
@@ -104,6 +106,7 @@ JDBC with per-database credentials (JSON `{user,password}`) from a secret scope 
 | `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning (no Spark/DB; unit-tested with fakes) |
 | `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget |
 | `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |
+| `src/lakefed_ingest/discovery.py` | Table discovery for bulk onboarding (catalog queries + recommended control-row settings); run by `discover_tables.ipynb` / job `lakefed_ingest_discover` |
 | `src/lakefed_ingest/state_store.py` | Lakebase accessor (psycopg, SDK-minted OAuth token) + pure helpers |
 | `tests/conftest.py` | Puts `src/lakefed_ingest` on `sys.path` |
 | `tests/synthetic/` | Synthetic SQL Server DB generator, change generator, reconcile |

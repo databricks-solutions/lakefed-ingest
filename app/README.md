@@ -12,6 +12,7 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 | **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag). Filter by collection, text, or failing / stale / seeding / disabled. Select rows to **enable**, **disable** or **force a reseed** |
 | **Jobs** | The ingestion job's schedule; active and recent runs; **start a run** for a collection; **cancel** a run; run the schema setup job |
 | **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop) |
+| **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
 
 Every write asks for confirmation. The app never deletes rows. It's built with Streamlit; the SQL is
 in `src/queries.py` (parameterized, unit-tested in `tests/`).
@@ -20,8 +21,8 @@ in `src/queries.py` (parameterized, unit-tested in `tests/`).
 
 The app runs as its own service principal (created with the app):
 
-- **Jobs:** `CAN_MANAGE_RUN` on the ingestion and setup jobs, through app resources: view, run and
-  cancel, but not edit or delete.
+- **Jobs:** `CAN_MANAGE_RUN` on the ingestion, setup and discovery jobs, through app resources: view,
+  run and cancel, but not edit or delete.
 - **Lakebase:** granted by the `lakefed_ingest_app_grants` job:
   - `CAN_USE` on the instance (to mint its own short-lived credential);
   - a Postgres role;
@@ -41,7 +42,7 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
 1. Add a target to `app/databricks.yml` for your workspace (the committed `dev` / `prod` hosts are
    placeholders). Set the variables that differ from the defaults:
    - `lakebase_instance`, `lakebase_database`: the ingestion bundle's values.
-   - `ingest_job_id`, `setup_job_id`: looked up by job name. In development mode the ingestion
+   - `ingest_job_id`, `setup_job_id`, `discover_job_id`: looked up by job name. In development mode the ingestion
      bundle prefixes job names (`[dev your_name] lakefed_ingest`), so set the ids or the prefixed
      names for dev targets.
    - `app_name`: 30 characters max.
