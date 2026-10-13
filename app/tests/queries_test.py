@@ -9,7 +9,7 @@ def test_every_statement_is_parameterized_and_schema_qualified():
                 q.collections_sql(), q.set_enabled_sql(), q.force_reseed_sql(), q.log_reseed_sql(),
                 q.insert_control_sql()):
         assert "lakefed_ingest." in sql
-    assert q.collections_overview_sql().count("%s") == 1
+    assert "%s" not in q.collections_overview_sql()   # the SLA is per table, from control
 
 
 def test_runs_sql_optional_collection_and_limit():
@@ -21,26 +21,27 @@ def test_runs_sql_optional_collection_and_limit():
 
 @pytest.mark.parametrize("flt,frag", [
     ("failing", "cp.status = 'failed'"),
-    ("stale", "make_interval(mins => %s)"),
+    ("sla_breached", "make_interval(mins => t.freshness_sla_minutes)"),
+    ("no_sla", "t.freshness_sla_minutes is null"),
     ("seeding", "cp.phase = 'seeding'"),
     ("disabled", "not t.task_enabled"),
 ])
 def test_table_filters(flt, frag):
-    sql, params = q.tables_sql("c1", "orders", flt, 60, 100)
+    sql, params = q.tables_sql("c1", "orders", flt, 100)
     assert frag in sql and "ilike %s" in sql
     assert params[0] == "c1" and params[1] == "%orders%" and params[-1] == 100
     assert sql.count("%s") == len(params)
 
 
 def test_table_filter_all_and_invalid():
-    sql, params = q.tables_sql(None, None, "all", 60, 5)
+    sql, params = q.tables_sql(None, None, "all", 5)
     assert "where" not in sql and params == (5,)
     with pytest.raises(ValueError):
-        q.tables_sql(None, None, "bogus", 60, 5)
+        q.tables_sql(None, None, "bogus", 5)
 
 
 def test_search_text_is_a_parameter_not_sql():
-    sql, params = q.tables_sql(None, "x'; drop table control; --", "all", 60, 5)
+    sql, params = q.tables_sql(None, "x'; drop table control; --", "all", 5)
     assert "drop table" not in sql and params[0] == "%x'; drop table control; --%"
 
 
@@ -192,3 +193,38 @@ def test_update_sql_whitelists_columns():
     with pytest.raises(AssertionError):
         q.update_control_sql(["id; drop table control"])
     assert q.collection_lock_key("c1") == "lakefed_ingest:c1"
+
+
+def test_sla_breach_rule_uses_control_sla_and_creation_for_never_succeeded():
+    rule = q.SLA_BREACHED
+    assert "t.task_enabled" in rule and "t.freshness_sla_minutes is not null" in rule
+    assert "coalesce(cp.last_success_at, t.created_at)" in rule
+    assert rule in q.collections_overview_sql()
+    sql, _ = q.tables_sql(None, None, "all", 5)
+    assert "as sla_breached" in sql and "as sla_min" in sql
+
+
+@pytest.mark.parametrize("value,ok", [(None, True), ("", True), (15, True), ("30", True),
+                                      (0, False), (-5, False), ("abc", False), (2.5, False)])
+def test_validate_freshness_sla(value, ok):
+    row = {"task_collection": "c", "src_type": "sqlserver", "src_host": "h", "secret_key": "k", "src_database": "d",
+           "src_schema": "dbo", "src_table": "t", "select_list": "a", "primary_key": "a", "load_type": "ct",
+           "sink_catalog": "c", "sink_schema": "s", "sink_table": "t", "freshness_sla_minutes": value}
+    errs = [e for e in q.validate_control_row(row) if "freshness_sla_minutes" in e]
+    assert (not errs) == ok
+
+
+def test_sla_is_a_cosmetic_bulk_edit_and_flows_through_bulk_import():
+    assert "freshness_sla_minutes" in q.BULK_EDIT_FIELDS and "freshness_sla_minutes" not in q.RESEED_FIELDS
+    row = {"id": 1, "task_collection": "c", "task_enabled": True, "src_type": "sqlserver", "src_host": "h",
+           "secret_key": "k", "src_database": "d", "src_schema": "dbo", "src_table": "t", "select_list": "a",
+           "primary_key": "a", "load_type": "ct", "sink_catalog": "c", "sink_schema": "s", "sink_table": "t",
+           "freshness_sla_minutes": None}
+    [p] = q.plan_edit([row], {"freshness_sla_minutes": "30"}, bulk=True)
+    assert p["changes"] == {"freshness_sla_minutes": [None, 30]} and p["reseed"] is None and not p["errors"]
+    discovered = [{"src_database": "d", "src_schema": "dbo", "src_table": "t", "select_list": "a", "primary_key": "a",
+                   "load_type": "ct", "src_type": "sqlserver", "src_host": "h", "secret_key": "k"}]
+    [r] = q.review_rows(discovered, {"sink_catalog": "c", "sink_schema": "s", "sink_table": "{table}",
+                                     "freshness_sla_minutes": 45})
+    assert q.control_row_from_review(r, "c")["freshness_sla_minutes"] == 45
+    assert "freshness_sla_minutes" in q.CONTROL_INSERT_COLUMNS

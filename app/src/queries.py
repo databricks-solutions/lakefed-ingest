@@ -13,11 +13,19 @@ from typing import List, Optional, Tuple
 SCHEMA = "lakefed_ingest"
 
 
+# ---- freshness SLA ------------------------------------------------------------------------------
+
+# An enabled table with control.freshness_sla_minutes breaches its SLA when its last success (or, if
+# it has never succeeded, its control row's creation) is older than the SLA. Tables without an SLA
+# are never flagged. Aliases: t = control, cp = checkpoint.
+SLA_BREACHED = ("(t.task_enabled and t.freshness_sla_minutes is not null "
+                "and coalesce(cp.last_success_at, t.created_at) < now() - make_interval(mins => t.freshness_sla_minutes))")
+
+
 # ---- overview -----------------------------------------------------------------------------------
 
 def collections_overview_sql() -> str:
-    """One row per task_collection: table counts, the latest run, and current health.
-    Param: stale threshold in minutes."""
+    """One row per task_collection: table counts, the latest run, and current health."""
     return f"""
 with tables as (
     select t.task_collection,
@@ -25,7 +33,8 @@ with tables as (
            count(*)                                                                 as all_tables,
            count(*) filter (where t.task_enabled and cp.status = 'failed')          as failing_tables,
            count(*) filter (where t.task_enabled and (cp.control_id is null or cp.phase = 'seeding')) as seeding_tables,
-           count(*) filter (where t.task_enabled and cp.last_success_at < now() - make_interval(mins => %s)) as stale_tables,
+           count(*) filter (where t.task_enabled and t.freshness_sla_minutes is null) as no_sla_tables,
+           count(*) filter (where {SLA_BREACHED})                                   as sla_breached_tables,
            max(cp.last_success_at)                                                  as last_success_at
     from {SCHEMA}.control t
     left join {SCHEMA}.checkpoint cp on cp.control_id = t.id
@@ -38,7 +47,7 @@ last_run as (
     order by task_collection, started_at desc
 )
 select tb.task_collection, tb.enabled_tables, tb.all_tables, tb.failing_tables, tb.seeding_tables,
-       tb.stale_tables, tb.last_success_at,
+       tb.sla_breached_tables, tb.no_sla_tables, tb.last_success_at,
        r.run_id as last_run_id, r.status as last_run_status, r.started_at as last_run_started,
        r.finished_at as last_run_finished, r.ok as last_run_ok, r.failed as last_run_failed
 from tables tb
@@ -85,11 +94,11 @@ def recent_errors_sql() -> str:
 
 # ---- tables (control + checkpoint) --------------------------------------------------------------
 
-TABLE_FILTERS = ("all", "failing", "stale", "seeding", "disabled")
+TABLE_FILTERS = ("all", "failing", "sla_breached", "no_sla", "seeding", "disabled")
 
 
 def tables_sql(collection: Optional[str], search: Optional[str], status_filter: str,
-               stale_minutes: int, limit: int) -> Tuple[str, tuple]:
+               limit: int) -> Tuple[str, tuple]:
     """Control rows joined with their checkpoint. Returns (sql, params)."""
     if status_filter not in TABLE_FILTERS:
         raise ValueError(f"status_filter must be one of {TABLE_FILTERS}")
@@ -104,9 +113,10 @@ def tables_sql(collection: Optional[str], search: Optional[str], status_filter: 
         params.append(f"%{search}%")
     if status_filter == "failing":
         conds.append("cp.status = 'failed'")
-    elif status_filter == "stale":
-        conds.append("t.task_enabled and cp.last_success_at < now() - make_interval(mins => %s)")
-        params.append(int(stale_minutes))
+    elif status_filter == "sla_breached":
+        conds.append(SLA_BREACHED)
+    elif status_filter == "no_sla":
+        conds.append("t.task_enabled and t.freshness_sla_minutes is null")
     elif status_filter == "seeding":
         conds.append("(cp.control_id is null or cp.phase = 'seeding')")
     elif status_filter == "disabled":
@@ -117,6 +127,7 @@ def tables_sql(collection: Optional[str], search: Optional[str], status_filter: 
            f"t.sink_catalog || '.' || t.sink_schema || '.' || t.sink_table as sink, t.client_id, "
            f"cp.phase, cp.status, cp.last_success_at, "
            f"round(extract(epoch from (now() - cp.last_success_at)) / 60)::int as lag_min, "
+           f"t.freshness_sla_minutes as sla_min, {SLA_BREACHED} as sla_breached, "
            f"cp.position, cp.detail "
            f"from {SCHEMA}.control t left join {SCHEMA}.checkpoint cp on cp.control_id = t.id "
            f"{where}order by t.task_collection, t.src_database, t.src_schema, t.src_table limit %s")
@@ -152,6 +163,7 @@ CONTROL_INSERT_COLUMNS = (
     "task_collection", "src_type", "src_host", "src_port", "secret_key", "src_database", "src_schema",
     "src_table", "select_list", "primary_key", "load_type", "cursor_column", "sink_catalog",
     "sink_schema", "sink_table", "client_id", "load_partitioned", "partition_col", "partition_size_mb",
+    "freshness_sla_minutes",
 )
 
 
@@ -177,6 +189,14 @@ def validate_control_row(row: dict) -> List[str]:
         errs.append("select_list must list explicit columns (* isn't supported)")
     if row.get("load_partitioned") and (not row.get("partition_col") or not row.get("partition_size_mb")):
         errs.append("partitioned loads need partition_col and partition_size_mb")
+    sla = row.get("freshness_sla_minutes")
+    if sla not in (None, ""):
+        try:
+            ok = int(sla) > 0 and float(sla) == int(sla)
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            errs.append("freshness_sla_minutes must be a whole number of minutes greater than 0 (blank = no SLA)")
     cid = row.get("client_id")
     if cid not in (None, "") and not re.match(r"^[A-Za-z0-9_.:-]{1,128}$", str(cid)):
         errs.append("client_id may only use letters, digits and _ . : - (1-128 characters)")
@@ -300,6 +320,7 @@ def review_rows(discovered: List[dict], shared: dict) -> List[dict]:
             "sink_schema": render(shared.get("sink_schema"), db, sch, tbl),
             "sink_table": render(shared.get("sink_table"), db, sch, tbl),
             "client_id": render(shared.get("client_id"), db, sch, tbl, as_identifier=False),
+            "freshness_sla_minutes": shared.get("freshness_sla_minutes") or None,
             "registered_id": registered, "notes": t.get("notes"),
             # carried through, not shown for editing
             "_select_list": t.get("select_list"), "_src_type": t.get("src_type"), "_src_host": t.get("src_host"),
@@ -321,6 +342,7 @@ def control_row_from_review(row: dict, task_collection: str) -> dict:
         "load_partitioned": bool(row.get("load_partitioned")),
         "partition_col": row.get("partition_col") if row.get("load_partitioned") else None,
         "partition_size_mb": row.get("partition_size_mb") if row.get("load_partitioned") else None,
+        "freshness_sla_minutes": row.get("freshness_sla_minutes"),
     }
 
 
@@ -332,7 +354,7 @@ def insert_control_if_absent_sql() -> str:
 
 EDITABLE_REVIEW_FIELDS = ("include", "load_type", "primary_key", "cursor_column", "load_partitioned",
                           "partition_col", "partition_size_mb", "sink_catalog", "sink_schema", "sink_table",
-                          "client_id")
+                          "client_id", "freshness_sla_minutes")
 
 
 def review_key(row: dict) -> tuple:
@@ -367,17 +389,17 @@ CONTROL_EDIT_COLUMNS = (
     "task_collection", "task_enabled", "tier", "priority", "src_type", "src_host", "src_port", "secret_key",
     "src_database", "src_schema", "src_table", "select_list", "primary_key", "load_type", "cursor_column",
     "sink_catalog", "sink_schema", "sink_table", "client_id", "load_partitioned", "partition_col",
-    "partition_size_mb", "jdbc_options",
+    "partition_size_mb", "jdbc_options", "freshness_sla_minutes",
 )
-BULK_EDIT_FIELDS = ("task_collection", "task_enabled", "tier", "priority", "load_partitioned", "partition_col",
-                    "partition_size_mb", "jdbc_options", "sink_catalog", "sink_schema")
+BULK_EDIT_FIELDS = ("task_collection", "task_enabled", "tier", "priority", "freshness_sla_minutes", "load_partitioned",
+                    "partition_col", "partition_size_mb", "jdbc_options", "sink_catalog", "sink_schema")
 RESEED_FIELDS = {
     "src_type": "source_changed", "src_host": "source_changed", "src_port": "source_changed",
     "src_database": "source_changed", "src_schema": "source_changed", "src_table": "source_changed",
     "sink_catalog": "sink_changed", "sink_schema": "sink_changed", "sink_table": "sink_changed",
     "client_id": "sink_changed", "primary_key": "primary_key_changed",
 }
-INT_FIELDS = {"src_port", "priority", "partition_size_mb"}
+INT_FIELDS = {"src_port", "priority", "partition_size_mb", "freshness_sla_minutes"}
 BOOL_FIELDS = {"task_enabled", "load_partitioned"}
 DEFAULT_PORTS = {"sqlserver": 1433, "oracle": 1521, "postgresql": 5432, "mysql": 3306}
 CASE_INSENSITIVE = {"src_host", "src_database", "src_schema", "src_table", "sink_catalog", "sink_schema",

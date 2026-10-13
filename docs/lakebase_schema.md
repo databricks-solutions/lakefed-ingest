@@ -40,6 +40,8 @@ erDiagram
         text select_list
         text cursor_column
         boolean task_enabled
+        int freshness_sla_minutes
+        timestamptz created_at
     }
     checkpoint {
         bigint control_id PK
@@ -98,6 +100,8 @@ for the run's `task_collection`). See "Control rows" in the [README](../README.m
 | `task_collection` | Which run ingests this row. One job run = one collection |
 | `task_enabled` | `false` skips the row without deleting its state |
 | `tier`, `priority` | Order within a run (`tier`, then `priority`, then `id`) |
+| `freshness_sla_minutes` | Optional freshness SLA: an enabled table breaches it when its `checkpoint.last_success_at` (or, if it has never succeeded, `created_at`) is older than this many minutes. NULL = no SLA, never flagged. Monitoring only (the operations app and DBSQL alerts); the ingestion job doesn't read it. Set it to the collection's schedule plus run time plus slack, e.g. 45 for a 15-minute schedule |
+| `created_at` | When the row was added (rows that predate this column show the migration time) |
 | `src_type` | Source adapter: `sqlserver` \| `oracle` \| `postgresql` \| `mysql` |
 | `src_host`, `src_port` | Source server; NULL port = the engine's default |
 | `src_database`, `src_schema`, `src_table` | Source table (Oracle: `src_database` is the service name) |
@@ -119,7 +123,8 @@ for the run's `task_collection`). See "Control rows" in the [README](../README.m
 - `cursor` without `cursor_column`;
 - partitioned settings that are incomplete;
 - `jdbc_options` that isn't a JSON object;
-- a malformed `client_id`.
+- a malformed `client_id`;
+- a `freshness_sla_minutes` that isn't positive.
 
 A unique index allows only one row per sink, or one row per (sink, `client_id`) for shared sinks,
 so two rows can never overwrite each other's data.

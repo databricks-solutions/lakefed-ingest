@@ -1,4 +1,4 @@
-import { createContext, useContext, useState } from "react";
+import { createContext, useContext } from "react";
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Config } from "./api";
@@ -10,8 +10,8 @@ import AddTable from "./pages/AddTable";
 import BulkImport from "./pages/BulkImport";
 import Changes from "./pages/Changes";
 
-interface Settings { staleMinutes: number; config?: Config }
-const SettingsContext = createContext<Settings>({ staleMinutes: 60 });
+interface Settings { config?: Config }
+const SettingsContext = createContext<Settings>({});
 export const useSettings = () => useContext(SettingsContext);
 
 const NAV = [
@@ -20,11 +20,10 @@ const NAV = [
 ] as const;
 
 export default function App() {
-  const [staleMinutes, setStaleMinutes] = useState<number>(() => Number(localStorage.getItem("staleMinutes")) || 60);
   const config = useQuery({ queryKey: ["config"], queryFn: () => api.get<Config>("/config") });
   const qc = useQueryClient();
   return (
-    <SettingsContext.Provider value={{ staleMinutes, config: config.data }}>
+    <SettingsContext.Provider value={{ config: config.data }}>
       <div className="layout">
         <aside className="sidebar">
           <div className="brand">lakefed_ingest</div>
@@ -34,11 +33,6 @@ export default function App() {
             ))}
           </nav>
           <div className="sidebar-foot">
-            <label>
-              Stale after (minutes)
-              <input type="number" min={5} step={5} value={staleMinutes}
-                onChange={(e) => { const v = Math.max(5, Number(e.target.value) || 60); setStaleMinutes(v); localStorage.setItem("staleMinutes", String(v)); }} />
-            </label>
             <button className="ghost" onClick={() => qc.invalidateQueries()}>Refresh data</button>
             {config.data && (
               <div className="muted small">

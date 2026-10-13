@@ -59,12 +59,27 @@ WHERE run_id = (
 ORDER BY finished_at DESC;
 ```
 
-Per-table freshness / lag (SLA tracking):
+Per-table freshness / lag:
 ```sql
 SELECT src_database, src_schema, src_table, strategy, last_success_at,
        timestampdiff(MINUTE, last_success_at, current_timestamp()) AS lag_minutes
 FROM lakefed_ingest_lakebase.lakefed_ingest.checkpoint
 ORDER BY last_success_at NULLS FIRST;
+```
+
+Freshness SLA breaches. The SLA is per table, in `control.freshness_sla_minutes` (NULL = no SLA). An
+enabled table breaches it when its last success, or its creation if it has never succeeded, is older
+than the SLA. The operations app applies the same rule, so an alert on this query (trigger when it
+returns rows) matches what the app shows:
+```sql
+SELECT c.task_collection, c.src_database, c.src_schema, c.src_table, c.freshness_sla_minutes,
+       cp.last_success_at,
+       timestampdiff(MINUTE, coalesce(cp.last_success_at, c.created_at), current_timestamp()) AS lag_minutes
+FROM lakefed_ingest_lakebase.lakefed_ingest.control c
+LEFT JOIN lakefed_ingest_lakebase.lakefed_ingest.checkpoint cp ON cp.control_id = c.id
+WHERE c.task_enabled AND c.freshness_sla_minutes IS NOT NULL
+  AND timestampdiff(MINUTE, coalesce(cp.last_success_at, c.created_at), current_timestamp()) > c.freshness_sla_minutes
+ORDER BY lag_minutes DESC;
 ```
 
 Per-run throughput and outcome (`skipped` counts unchanged tables; `detail.detection` has the skip-no-change stats):
