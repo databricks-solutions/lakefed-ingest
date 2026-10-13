@@ -53,3 +53,9 @@ button.ghost { background: transparent; }
 .alert .hint { margin-top: 4px; color: var(--text); }
 .muted { color: var(--muted); } .small { font-size: 12px; }
 p.small { margin: 0 0 10px; }
+.drawer { position: fixed; top: 0; right: 0; width: min(920px, 92vw); height: 100vh; overflow-y: auto; background: #fff;
+  border-left: 1px solid var(--border); box-shadow: -8px 0 24px rgba(0,0,0,0.08); padding: 20px; z-index: 50; }
+.drawer-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.drawer h3 { font-size: 14px; margin: 18px 0 8px; }
+label.changed { color: var(--accent) !important; font-weight: 600; }
+label.changed input, label.changed select { border-color: var(--accent); }

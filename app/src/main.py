@@ -43,6 +43,31 @@ def _user(request: Request) -> str:
     return request.headers.get("X-Forwarded-Email") or request.headers.get("X-Forwarded-User") or ""
 
 
+def _lock_collections(cur, collections):
+    """Take each collection's run lock for this transaction, or refuse: changing tables while their
+    collection is running could race the run's own checkpoint writes."""
+    for c in sorted({c for c in collections if c}):
+        cur.execute(q.collection_lock_sql(), (q.collection_lock_key(c),))
+        if not cur.fetchone()[0]:
+            raise HTTPException(409, f"collection '{c}' is running; try again after the run finishes")
+
+
+def _log(cur, user, action, control_id, collection, field=None, old=None, new=None, reseed=None, batch=None):
+    as_text = lambda v: None if v is None else str(v)
+    cur.execute(q.log_change_sql(), (user or None, action, control_id, collection, field, as_text(old),
+                                     as_text(new), reseed, batch))
+
+
+def _locked_rows(cur, ids):
+    cur.execute(q.control_rows_for_update_sql(), (list(ids),))
+    cols = [d.name for d in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    missing = set(ids) - {r["id"] for r in rows}
+    if missing:
+        raise HTTPException(404, f"control rows not found: {sorted(missing)}")
+    return rows
+
+
 # ---- context / overview -----------------------------------------------------------------------------
 
 @app.get("/api/config")
@@ -102,24 +127,113 @@ class EnableRequest(Ids):
 
 
 @app.post("/api/tables/enable")
-def set_enabled(body: EnableRequest):
-    return {"updated": db.execute(q.set_enabled_sql(), (body.enabled, body.ids))}
+def set_enabled(body: EnableRequest, request: Request):
+    batch = uuid.uuid4().hex[:12]
+    with db.transaction() as cur:
+        rows = _locked_rows(cur, body.ids)
+        _lock_collections(cur, [r["task_collection"] for r in rows])
+        cur.execute(q.set_enabled_sql(), (body.enabled, body.ids))
+        for r in rows:
+            if bool(r["task_enabled"]) != body.enabled:
+                _log(cur, _user(request), "enable" if body.enabled else "disable", r["id"], r["task_collection"],
+                     "task_enabled", r["task_enabled"], body.enabled, batch=batch)
+    return {"updated": len(rows)}
 
 
 @app.post("/api/tables/reseed")
-def reseed(body: Ids):
-    n = db.execute(q.force_reseed_sql(), (body.ids,))
-    db.execute(q.log_reseed_sql(), ("manual", body.ids))
+def reseed(body: Ids, request: Request):
+    batch = uuid.uuid4().hex[:12]
+    with db.transaction() as cur:
+        rows = _locked_rows(cur, body.ids)
+        _lock_collections(cur, [r["task_collection"] for r in rows])
+        cur.execute(q.force_reseed_sql(), (body.ids,))
+        n = cur.rowcount
+        cur.execute(q.log_reseed_sql(), ("manual", body.ids))
+        for r in rows:
+            _log(cur, _user(request), "reseed", r["id"], r["task_collection"], reseed="manual", batch=batch)
     return {"updated": n}
 
 
 @app.post("/api/tables")
-def add_table(row: dict):
+def add_table(row: dict, request: Request):
     errs = q.validate_control_row(row)
     if errs:
         raise HTTPException(422, {"errors": errs})
-    new = db.execute_returning(q.insert_control_sql(), q.control_params(row))
-    return {"id": new[0]}
+    with db.transaction() as cur:
+        cur.execute(q.insert_control_sql(), q.control_params(row))
+        new_id = cur.fetchone()[0]
+        _log(cur, _user(request), "add", new_id, row.get("task_collection"))
+    return {"id": new_id}
+
+
+@app.get("/api/tables/{control_id}")
+def table_detail(control_id: int):
+    rows = db.query(q.control_row_sql(), (int(control_id),))
+    if not rows:
+        raise HTTPException(404, f"control row {control_id} not found")
+    cp = db.query(q.checkpoint_for_sql(), (int(control_id),))
+    csql, cparams = q.changes_sql(int(control_id), 100)
+    return {"control": rows[0], "checkpoint": cp[0] if cp else None, "changes": db.query(csql, cparams)}
+
+
+class EditRequest(BaseModel):
+    ids: List[int] = Field(min_length=1)
+    changes: dict = Field(min_length=1)
+    dry_run: bool = True
+
+
+@app.post("/api/tables/edit")
+def edit_tables(body: EditRequest, request: Request):
+    """Preview (dry_run, the default) or apply an edit to one or many control rows. Applying is all
+    or nothing, in one transaction: it refuses while an affected collection is running, flips tables
+    whose source, sink or key changed to seeding, checks sink ownership, and logs every change."""
+    import psycopg
+    bulk = len(body.ids) > 1
+    batch = uuid.uuid4().hex[:12]
+    try:
+        with db.transaction() as cur:
+            rows = _locked_rows(cur, body.ids)
+            plans = q.plan_edit(rows, body.changes, bulk=bulk)
+            summary = {"rows": len(plans), "changed": sum(1 for p in plans if p["changes"]),
+                       "reseed": sum(1 for p in plans if p["reseed"]),
+                       "errors": sum(1 for p in plans if p["errors"]), "applied": False}
+            if body.dry_run or summary["errors"] or not summary["changed"]:
+                cur.connection.rollback()
+                return {"summary": summary, "plans": plans}
+            new_coll = body.changes.get("task_collection")
+            _lock_collections(cur, [r["task_collection"] for r in rows] + ([new_coll] if new_coll else []))
+            by_id = {r["id"]: r for r in rows}
+            user = _user(request)
+            for p in plans:
+                if not p["changes"]:
+                    continue
+                fields = list(p["changes"])
+                cur.execute(q.update_control_sql(fields), [p["changes"][f][1] for f in fields] + [p["id"]])
+                coll = p["changes"].get("task_collection", [None, by_id[p["id"]]["task_collection"]])[1]
+                for f in fields:
+                    _log(cur, user, "edit", p["id"], coll, f, p["changes"][f][0], p["changes"][f][1],
+                         reseed=p["reseed"], batch=batch)
+                if p["reseed"]:
+                    cur.execute(q.flip_to_seeding_sql(), (f"reseed after edit: {p['reseed']}", [p["id"]]))
+                    cur.execute(q.log_reseed_sql(), (f"edit:{p['reseed']}", [p["id"]]))
+            sinks = sorted({".".join(str(r[k]).lower() for k in ("sink_catalog", "sink_schema", "sink_table"))
+                            for r in (dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans)})
+            cur.execute(q.mixed_sinks_for_sql(), (sinks,))
+            mixed = [r[0] for r in cur.fetchall()]
+            if mixed:
+                raise HTTPException(409, f"sink {mixed[0]} would be claimed by a dedicated row and by other rows; "
+                                         "a sink is either dedicated to one source table or shared by client_id")
+            summary["applied"] = True
+            return {"summary": summary, "plans": plans}
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(409, "another control row already writes that sink (or that sink and client_id); "
+                                 "nothing was changed")
+
+
+@app.get("/api/changes")
+def changes(control_id: Optional[int] = None, limit: int = 200):
+    sql, params = q.changes_sql(control_id, limit)
+    return db.query(sql, params)
 
 
 # ---- jobs ---------------------------------------------------------------------------------------
@@ -221,7 +335,7 @@ class RegisterRequest(BaseModel):
 
 
 @app.post("/api/discoveries/{discovery_id}/register")
-def register(discovery_id: str, body: RegisterRequest):
+def register(discovery_id: str, body: RegisterRequest, request: Request):
     """Validate (dry_run) or register the included tables. Rows are rebuilt from the stored discovery
     and only the reviewer's editable fields are applied (queries.merge_review_edits)."""
     discovered = db.query(q.discovered_tables_sql(), (discovery_id,))
@@ -236,12 +350,17 @@ def register(discovery_id: str, body: RegisterRequest):
             results.append({"table": name, "status": "invalid", "errors": errs})
         else:
             valid.append((name, row))
-    if not body.dry_run:
-        for name, row in valid:
-            res = db.execute_returning(q.insert_control_if_absent_sql(), q.control_params(row))
-            results.append({"table": name, "status": "registered" if res else "skipped",
-                            "id": res[0] if res else None,
-                            "errors": [] if res else ["sink already used by another control row"]})
+    if not body.dry_run and valid:
+        batch = uuid.uuid4().hex[:12]
+        with db.transaction() as cur:
+            for name, row in valid:
+                cur.execute(q.insert_control_if_absent_sql(), q.control_params(row))
+                res = cur.fetchone()
+                if res:
+                    _log(cur, _user(request), "register", res[0], body.task_collection, batch=batch)
+                results.append({"table": name, "status": "registered" if res else "skipped",
+                                "id": res[0] if res else None,
+                                "errors": [] if res else ["sink already used by another control row"]})
     else:
         results += [{"table": name, "status": "valid", "errors": []} for name, _ in valid]
     counts = {}

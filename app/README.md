@@ -9,12 +9,41 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 |---|---|
 | **Overview** | Per-collection health: enabled, failing, seeding and stale tables; the last run; runs in progress; failed tables in the last 24 hours |
 | **Runs** | Recent runs (filter by collection); select one to see its per-table events and errors |
-| **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag). Filter by collection, text, or failing / stale / seeding / disabled. Select rows to **enable**, **disable** or **force a reseed** |
+| **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag). Filter by collection, text, or failing / stale / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection), **enable**, **disable** or **force a reseed** |
 | **Jobs** | The ingestion job's schedule; active and recent runs; **start a run** for a collection; **cancel** a run; run the schema setup job |
+| **Changes** | The change log: every add, register, edit, enable / disable and reseed made in the app, with who, what and when |
 | **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop) |
 | **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
 
 Every write asks for confirmation. The app never deletes rows.
+
+## Guard rails for edits
+
+Data integrity comes first, so edits go through the server's rules, not the browser's:
+
+- **Preview first.** An edit shows, per table, what changes, whether the table reseeds and why,
+  warnings, and validation errors. Apply is only offered for a clean preview of exactly that edit.
+- **All or nothing.** An edit is one transaction: if any table fails validation, or a sink would
+  collide with another control row, nothing changes.
+- **Reseed when the meaning changes.** For `ct` and `cursor` tables, changing the source (host,
+  port, database, schema, table, engine), the sink (catalog, schema, table, `client_id`) or the
+  primary key flips the table to seeding in the same transaction. Without that, the next run would
+  merge only new changes into the new place or match on the wrong key. Cosmetic changes (case, an
+  explicit default port) don't reseed. Moving a table to another collection, credentials, priority
+  and partition settings don't reseed.
+- **Warnings for what an edit leaves behind.** For example, the old sink table after a sink change,
+  rows of the old `client_id` in a shared sink, and removed `select_list` columns that stay in the sink.
+- **Not while running.** Edits, enable / disable and reseeds are refused while an affected collection
+  is running (they take that collection's run lock), so they can't race the run's own checkpoint writes.
+- **Bulk edits are limited** to fields that are safe across many tables: collection, enabled, tier,
+  priority, partition settings, `jdbc_options`, sink catalog and schema. Source, key and sink table
+  name changes are made one table at a time.
+- **Change log.** Every change is recorded in `lakefed_ingest.control_change` with the signed-in
+  user, in the same transaction.
+
+The ingestion job backs this up for changes made outside the app (for example with SQL): each
+checkpoint records the source, sink and key it was written for, and a table that now points
+elsewhere, or whose sink table no longer exists, is reseeded instead of silently leaving a gap.
 
 ## How it's built
 

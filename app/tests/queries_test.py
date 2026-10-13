@@ -139,3 +139,56 @@ def test_merge_review_edits_takes_only_editable_fields():
     assert merged[0]["_secret_key"] == "creds-tenant-01" and merged[0]["_src_host"] == "h"   # never from the client
     assert merged[1] == review[1]                                                           # untouched row
     assert not any(k.startswith("_") for k in q.public_review_row(merged[0]))
+
+
+# ---- editing ----------------------------------------------------------------------------------
+
+ROW = dict(id=1, task_collection="c1", task_enabled=True, tier=None, priority=None, src_type="sqlserver", src_host="Srv",
+           src_port=None, secret_key="k", src_database="db", src_schema="dbo", src_table="t", select_list="id, v",
+           primary_key="id", load_type="ct", cursor_column=None, sink_catalog="main", sink_schema="bronze",
+           sink_table="t", client_id=None, load_partitioned=False, partition_col=None, partition_size_mb=None,
+           jdbc_options=None)
+
+
+def test_plan_edit_reseed_reasons_and_notes():
+    (p,) = q.plan_edit([ROW], {"sink_schema": "silver"}, bulk=False)
+    assert p["reseed"] == "sink_changed" and any("old sink main.bronze.t is left in place" in n for n in p["notes"])
+    (p,) = q.plan_edit([ROW], {"primary_key": "id, v"}, bulk=False)
+    assert p["reseed"] == "primary_key_changed"
+    (p,) = q.plan_edit([ROW], {"src_host": "other"}, bulk=False)
+    assert p["reseed"] == "source_changed"
+    (p,) = q.plan_edit([dict(ROW, load_type="full", primary_key=None)], {"sink_table": "t2"}, bulk=False)
+    assert p["reseed"] is None and p["changes"]          # full reloads every run: no reseed needed
+
+
+def test_plan_edit_ignores_cosmetic_changes():
+    for change in ({"src_host": "SRV"}, {"src_port": 1433}, {"primary_key": " ID "}, {"sink_table": "T"}, {"tier": ""}):
+        (p,) = q.plan_edit([ROW], change, bulk=False)
+        assert p["changes"] == {} and p["reseed"] is None, change
+
+
+def test_plan_edit_move_secret_and_select_list_notes():
+    (p,) = q.plan_edit([ROW], {"task_collection": "c2", "secret_key": "k2"}, bulk=False)
+    assert p["reseed"] is None and any("moves to collection c2" in n for n in p["notes"])
+    (p,) = q.plan_edit([ROW], {"select_list": "id, w"}, bulk=False)
+    assert any("new columns w" in n for n in p["notes"]) and any("removed columns v stay in the sink" in n for n in p["notes"])
+
+
+def test_plan_edit_bulk_whitelist_types_and_validation():
+    (p,) = q.plan_edit([ROW], {"src_table": "x"}, bulk=True)
+    assert p["errors"] == ["cannot be changed in bulk: src_table"]
+    (p,) = q.plan_edit([ROW], {"priority": "5", "task_enabled": "false"}, bulk=True)
+    assert p["changes"] == {"priority": [None, 5], "task_enabled": [True, False]} and p["errors"] == []
+    (p,) = q.plan_edit([ROW], {"priority": "high"}, bulk=True)
+    assert p["errors"] and "invalid value" in p["errors"][0]
+    (p,) = q.plan_edit([ROW], {"jdbc_options": "[1]"}, bulk=True)
+    assert "jdbc_options must be a JSON object" in p["errors"]
+    (p,) = q.plan_edit([ROW], {"client_id": "a b"}, bulk=False)
+    assert any("client_id may only use" in e for e in p["errors"])
+
+
+def test_update_sql_whitelists_columns():
+    assert q.update_control_sql(["sink_table", "tier"]) == "update lakefed_ingest.control set sink_table = %s, tier = %s where id = %s"
+    with pytest.raises(AssertionError):
+        q.update_control_sql(["id; drop table control"])
+    assert q.collection_lock_key("c1") == "lakefed_ingest:c1"
