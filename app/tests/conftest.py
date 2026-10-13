@@ -1,4 +1,4 @@
-"""Put app/src on sys.path so the app's pure modules import without Streamlit or a database."""
+"""Put app/src on sys.path so the app modules import without a database."""
 import os
 import sys
 

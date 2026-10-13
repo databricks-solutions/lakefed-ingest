@@ -14,8 +14,23 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 | **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop) |
 | **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
 
-Every write asks for confirmation. The app never deletes rows. It's built with Streamlit; the SQL is
-in `src/queries.py` (parameterized, unit-tested in `tests/`).
+Every write asks for confirmation. The app never deletes rows.
+
+## How it's built
+
+| Part | Where | What |
+|---|---|---|
+| Backend | `src/main.py` (FastAPI) | JSON API under `/api` (OpenAPI docs at `/api/docs`); serves the built frontend for every other path |
+| Data access | `src/lakebase.py`, `src/jobs.py` | Lakebase (psycopg, SDK-minted credential) and the Jobs API, as the app's service principal |
+| SQL and rules | `src/queries.py` | Every statement (parameterized), form validation, bulk-import review logic |
+| Frontend | `src/frontend/` (React, TypeScript, Vite) | Pages under `src/frontend/src/pages/`; React Router, TanStack Query, AG Grid Community for the grids |
+
+Bulk registration is validated and merged on the server: the browser sends only the editable fields
+(include, load type, keys, partitioning, sink, client_id). Connection details, secret keys and select
+lists always come from the stored discovery.
+
+Databricks Apps builds the frontend at deploy time (`npm install`, then `npm run build` into
+`src/static/`), so build output isn't committed. `package-lock.json` pins every dependency.
 
 ## Security model
 
@@ -64,13 +79,19 @@ tables the same owner adds later, so schema upgrades don't need it.
 ## Develop locally
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r app/src/requirements.txt
 cd app/src
-DATABRICKS_CONFIG_PROFILE=<profile> LAKEBASE_INSTANCE=<instance> LAKEBASE_DATABASE=<db> \
-INGEST_JOB_ID=<id> SETUP_JOB_ID=<id> ../../.venv/bin/streamlit run app.py
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest httpx
+npm install
+export DATABRICKS_CONFIG_PROFILE=<profile> LAKEBASE_INSTANCE=<instance> LAKEBASE_DATABASE=<db> \
+       INGEST_JOB_ID=<id> SETUP_JOB_ID=<id> DISCOVER_JOB_ID=<id>
+.venv/bin/python main.py          # API on :8000 (serves the built frontend from static/)
+npm run dev                       # frontend with hot reload on :5173, proxying /api to :8000
+npm run check                     # type-check + production build
 ```
 
-Locally the app connects as you. Unit tests: `pytest app/tests` (run by the repo's `pytest`).
+Locally the app connects as you. Tests:
+- `pytest app/tests` covers the SQL and review logic, and runs as part of the repo's `pytest`;
+- the API tests (`tests/api_test.py`) also run when FastAPI and httpx are installed, as in the venv above.
 
 ## Not in this version
 

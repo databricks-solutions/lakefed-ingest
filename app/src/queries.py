@@ -1,7 +1,7 @@
 """SQL for the operations app — pure builders over the Lakebase schema (docs/lakebase_schema.md).
 
 Every statement is parameterized (psycopg %s); nothing user-supplied is formatted into SQL. Kept
-free of Streamlit / database imports so it is unit-tested in app/tests/queries_test.py.
+free of web-framework and database imports so it is unit-tested in app/tests/queries_test.py.
 """
 
 from __future__ import annotations
@@ -313,3 +313,29 @@ def insert_control_if_absent_sql() -> str:
     """Like insert_control_sql, but a row whose sink (or sink + client_id) is already taken is skipped
     (the unique index) instead of failing the whole import."""
     return insert_control_sql().replace(" returning id", " on conflict do nothing returning id")
+
+
+EDITABLE_REVIEW_FIELDS = ("include", "load_type", "primary_key", "cursor_column", "load_partitioned",
+                          "partition_col", "partition_size_mb", "sink_catalog", "sink_schema", "sink_table",
+                          "client_id")
+
+
+def review_key(row: dict) -> tuple:
+    return (row["src_database"], row["src_schema"], row["src_table"])
+
+
+def merge_review_edits(review: List[dict], edits: List[dict]) -> List[dict]:
+    """Overlay a reviewer's edits on the server-computed review rows, by source table. Only
+    EDITABLE_REVIEW_FIELDS are taken from the client; connection, secret and select_list always come
+    from the stored discovery. Tables without an edit keep their computed values."""
+    by_key = {review_key(e): e for e in edits}
+    out = []
+    for r in review:
+        e = by_key.get(review_key(r))
+        out.append({**r, **{f: e[f] for f in EDITABLE_REVIEW_FIELDS if e is not None and f in e}})
+    return out
+
+
+def public_review_row(row: dict) -> dict:
+    """A review row without the server-only fields (connection, secret key, select_list)."""
+    return {k: v for k, v in row.items() if not k.startswith("_")}

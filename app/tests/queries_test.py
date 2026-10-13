@@ -128,3 +128,14 @@ def test_identifier_and_insert_if_absent():
 
 def test_parse_databases():
     assert q.parse_databases(" a, b\nc,,a ") == ["a", "b", "c"] and q.parse_databases(None) == []
+
+
+def test_merge_review_edits_takes_only_editable_fields():
+    review = q.review_rows([_disc(), _disc(src_table="Other")], SHARED)
+    edits = [{"src_database": "Tenant-01", "src_schema": "dbo", "src_table": "Orders", "include": False,
+              "sink_table": "x", "_secret_key": "stolen", "_src_host": "evil", "notes": "ignored"}]
+    merged = q.merge_review_edits(review, edits)
+    assert merged[0]["include"] is False and merged[0]["sink_table"] == "x"
+    assert merged[0]["_secret_key"] == "creds-tenant-01" and merged[0]["_src_host"] == "h"   # never from the client
+    assert merged[1] == review[1]                                                           # untouched row
+    assert not any(k.startswith("_") for k in q.public_review_row(merged[0]))
