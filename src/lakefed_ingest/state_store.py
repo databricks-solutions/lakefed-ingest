@@ -202,6 +202,35 @@ def select_list_added_columns(control_select_list: str,
     return [c for c in select_list_columns(control_select_list) if c not in have]
 
 
+def source_identity(cfg: dict) -> str:
+    """Where a control row reads from: engine, server, port (adapter default when NULL), database,
+    schema, table. Lower-cased so cosmetic case edits don't look like a different source."""
+    import source_adapters as sa
+    adapter = sa.get_adapter(cfg.get("src_type"))
+    host = str(cfg.get("src_host") or cfg.get("src_connection") or "").strip().lower()
+    port = int(cfg.get("src_port") or adapter.default_port)
+    parts = [str(cfg.get(k) or "").strip().lower() for k in ("src_database", "src_schema", "src_table")]
+    return f"{adapter.src_type}://{host}:{port}/" + "/".join(parts)
+
+
+def sink_identity(cfg: dict) -> str:
+    """Where a control row writes: the sink table, plus the client slice of a consolidated sink."""
+    sink = ".".join(str(cfg.get(k) or "").strip().lower() for k in ("sink_catalog", "sink_schema", "sink_table"))
+    cid = str(cfg.get("client_id") or "").strip()
+    return f"{sink}#{cid}" if cid else sink
+
+
+def merge_key(cfg: dict) -> Optional[str]:
+    """The MERGE key (normalized primary_key), or None when the row has none."""
+    cols = [c.strip().lower() for c in str(cfg.get("primary_key") or "").split(",") if c.strip()]
+    return ",".join(cols) or None
+
+
+def identity_values(cfg: dict) -> tuple:
+    """(source_identity, sink_identity, merge_key) recorded on every checkpoint write."""
+    return (source_identity(cfg), sink_identity(cfg), merge_key(cfg))
+
+
 def task_identity(cfg: dict) -> tuple:
     """(control_id, src_database, src_schema, src_table) for a control-row dict — the key + the
     readable source identity written alongside every checkpoint/status/reseed row."""
@@ -258,28 +287,32 @@ def get_checkpoints_sql() -> str:
     """Checkpoints for MANY control tasks in one round trip (the sweep's planning phase).
     Param: list of control ids (bound as a Postgres array)."""
     return (f"select control_id, position, phase, status, select_list, strategy, ct_begin_version, "
-            f"pending_position, pending_run_id, last_success_at from {CHECKPOINT_TABLE} "
-            "where control_id = any(%s)")
+            f"pending_position, pending_run_id, last_success_at, source_identity, sink_identity, merge_key "
+            f"from {CHECKPOINT_TABLE} where control_id = any(%s)")
 
 
 def upsert_checkpoint_sql() -> str:
     """Insert-or-update a checkpoint (keyed by control_id): set strategy + position, phase/status,
-    and record the select_list the sink was written with (kept when NULL is passed). Clears a
-    pending append (see ``record_pending_sql``): the checkpoint now says where the sink is.
+    record the select_list the sink was written with (kept when NULL is passed), and record the
+    source / sink / merge key it was written for (identity_values) so a later control-row edit that
+    points elsewhere is detected and reseeded instead of silently leaving a gap. Clears a pending
+    append (see ``record_pending_sql``): the checkpoint now says where the sink is.
 
     Params: control_id, src_database, src_schema, src_table, strategy, position, phase, status,
-    detail, select_list.
+    detail, select_list, source_identity, sink_identity, merge_key.
     """
     return (
         f"insert into {CHECKPOINT_TABLE} "
         "(control_id, src_database, src_schema, src_table, strategy, position, phase, status, detail, "
-        "select_list, updated_at) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
+        "select_list, source_identity, sink_identity, merge_key, updated_at) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
         "on conflict (control_id) do update set "
         "strategy = excluded.strategy, position = excluded.position, phase = excluded.phase, "
         "status = excluded.status, detail = excluded.detail, "
         f"select_list = coalesce(excluded.select_list, checkpoint.select_list), "
         "pending_position = null, pending_run_id = null, "
-        "updated_at = now()"
+        "source_identity = excluded.source_identity, sink_identity = excluded.sink_identity, "
+        "merge_key = excluded.merge_key, updated_at = now()"
     )
 
 
@@ -309,14 +342,16 @@ def bulk_advance_unchanged_sql() -> str:
     trigger a false reseed once retention passes. A table with a pending append is never advanced
     here: the planner sends it to the worker, which checks whether that append committed.
     Params: CT version (captured), select_list (or NULL to keep), CT begin_version (recorded only
-    when not yet known — legacy rows), control_id.
+    when not yet known — legacy rows), source_identity, sink_identity, merge_key (each recorded only
+    when not yet known; the planner reseeds a table whose recorded value differs), control_id.
     """
     return (
         f"update {CHECKPOINT_TABLE} set "
         "position = greatest(coalesce(position, '0')::bigint, %s::bigint)::text, "
         "status = 'ok', detail = null, "
         "select_list = coalesce(%s, select_list), ct_begin_version = coalesce(ct_begin_version, %s), "
-        "last_success_at = now(), updated_at = now() "
+        "source_identity = coalesce(source_identity, %s), sink_identity = coalesce(sink_identity, %s), "
+        "merge_key = coalesce(merge_key, %s), last_success_at = now(), updated_at = now() "
         "where control_id = %s and phase = 'incremental' and strategy = 'ct' and pending_run_id is null"
     )
 
@@ -713,7 +748,8 @@ class StateStore:
             rows = cur.fetchall()
         return {int(r[0]): {"position": r[1], "phase": r[2], "status": r[3], "select_list": r[4],
                             "strategy": r[5], "ct_begin_version": r[6], "pending_position": r[7],
-                            "pending_run_id": r[8], "last_success_at": r[9]} for r in rows}
+                            "pending_run_id": r[8], "last_success_at": r[9], "source_identity": r[10],
+                            "sink_identity": r[11], "merge_key": r[12]} for r in rows}
 
     def advance_checkpoint(self, cfg: dict, position, phase=INCREMENTAL, status="ok", detail=None,
                            select_list=None, strategy=None):
@@ -724,7 +760,7 @@ class StateStore:
         with self._cursor() as cur:
             cur.execute(upsert_checkpoint_sql(),
                         (*task_identity(cfg), strategy or strategy_name(cfg), position_text(position),
-                         phase, status, detail, select_list))
+                         phase, status, detail, select_list, *identity_values(cfg)))
 
     def record_pending(self, cfg: dict, position, run_id) -> None:
         """Record an append write about to start (see ``record_pending_sql``). Call BEFORE the write."""
@@ -744,7 +780,7 @@ class StateStore:
         """``advance_checkpoint`` (status ok, recording each row's select_list) for many rows:
         items = [(cfg, position, phase, detail)]. Call ONLY after their write committed."""
         params = [(*task_identity(cfg), strategy_name(cfg), position_text(pos), phase, "ok", detail,
-                   cfg.get("select_list")) for cfg, pos, phase, detail in items]
+                   cfg.get("select_list"), *identity_values(cfg)) for cfg, pos, phase, detail in items]
         if params:
             with self._cursor() as cur:
                 cur.executemany(upsert_checkpoint_sql(), params)
@@ -776,8 +812,11 @@ class StateStore:
 
     def bulk_advance_unchanged(self, rows) -> int:
         """Advance many unchanged CT tables in one executemany: rows = [(control_id, ct_version,
-        select_list_or_None[, ct_begin_version_or_None]), ...]. Returns the number of rows submitted."""
-        params = [(int(r[1]), r[2], (r[3] if len(r) > 3 else None), int(r[0])) for r in rows]
+        select_list_or_None[, ct_begin_version_or_None[, (source, sink, merge_key) identity]]), ...].
+        Returns the number of rows submitted."""
+        def ident(r):
+            return tuple(r[4]) if len(r) > 4 and r[4] else (None, None, None)
+        params = [(int(r[1]), r[2], (r[3] if len(r) > 3 else None), *ident(r), int(r[0])) for r in rows]
         if not params:
             return 0
         with self._cursor() as cur:
@@ -801,7 +840,8 @@ class StateStore:
         with self._cursor() as cur:
             cur.execute(enqueue_reseed_sql(), (*ident, reason))
             cur.execute(upsert_checkpoint_sql(),
-                        (*ident, strategy_name(cfg), None, SEEDING, "reseed_queued", reason, None))
+                        (*ident, strategy_name(cfg), None, SEEDING, "reseed_queued", reason, None,
+                         *identity_values(cfg)))
 
     # ---- Observability / telemetry -----------------------------------------------------
     def start_run(self, task_collection, job_run_id, cluster_id, parallelism) -> int:

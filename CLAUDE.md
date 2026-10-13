@@ -110,6 +110,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
    checkpoint ahead of current version → reseed; CT disabled on the DB → fail loudly. Per-table CT
    status (`sys.change_tracking_tables`, read with the version, before the fast exit): CT off on a table,
    retention lapsed, or `begin_version` ≠ `checkpoint.ct_begin_version` (CT re-enabled) → reseed.
+   Identity backstop (ct / cursor): control row's source / sink / primary key ≠ the checkpoint's recorded
+   `source_identity` / `sink_identity` / `merge_key`, or the sink table is missing (one
+   `information_schema` query per sink catalog) → reseed. Never merge into a new, empty sink.
 3. Unchanged tables: one bulk Lakebase checkpoint advance.
 4. Per-table worker: full reload (`load_strategies.FullStrategy` → `ct_engine.seed`), seed (capture V0
    before seed; partitioned seed via staging + atomic swap),
@@ -149,6 +152,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 - No SQL warehouse dependency in the default version.
 - Checkpoints advance only after the Delta commit (at-least-once + idempotent MERGE). An append is
   not idempotent: record the pending append (`store.record_pending`) before it; the advance clears it.
+- App writes to `control` / `checkpoint` run in one transaction that takes the affected collections'
+  run locks (`pg_try_advisory_xact_lock`, same key as the job), flips tables to seeding when source /
+  sink / key change (`queries.plan_edit`), and logs to `control_change`.
 - Every sink write must be client-scoped when `client_id` is set: tag rows (`ct_engine._tag`, with
   `append_meta(cfg, ...)` for append writes), write `write_columns(cfg)`, MERGE on `merge_keys(cfg)`,
   overwrite via `insert_overwrite_sql(..., cfg)` (REPLACE WHERE client_id) or, in append mode, append

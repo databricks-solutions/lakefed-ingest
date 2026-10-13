@@ -1,4 +1,6 @@
 """Skip-no-change planner: routing, per-database versions, and per-database failure isolation."""
+import pytest
+
 import planner
 import state_store as ss
 
@@ -50,7 +52,7 @@ def test_each_group_uses_its_own_version():
     outs = [planner.detect_group(m, current_version, detect) for m in (g1, g2)]
     agg = planner.merge_group_results(outs)
     # unchanged rows carry THEIR database's version — never one value across databases
-    assert sorted(agg["unchanged"]) == [(2, 150, None, None), (12, 9, None, None)]
+    assert sorted(u[:4] for u in agg["unchanged"]) == [(2, 150, None, None), (12, 9, None, None)]
     merges = {p["cfg"]["id"]: p["cur"] for p in agg["plans"] if p["route"] == "merge"}
     assert merges == {1: 150, 11: 9}
     assert agg["queries"] == 4 and agg["failed"] == []
@@ -61,7 +63,7 @@ def test_fast_exit_skips_detection():
     called = []
     out = planner.detect_group(g1, lambda c: 100, lambda c, i: called.append(1))
     assert out["fast_exit"] and called == []
-    assert out["unchanged"] == [(1, 100, None, None), (2, 100, None, None)] and out["queries"] == 1
+    assert [u[:4] for u in out["unchanged"]] == [(1, 100, None, None), (2, 100, None, None)] and out["queries"] == 1
 
 
 def test_failing_database_is_isolated():
@@ -78,7 +80,7 @@ def test_failing_database_is_isolated():
     assert [c["id"] for c, _, _ in agg["failed"]] == [11, 12]
     assert all("Login failed" in err for _, _, err in agg["failed"])
     # the healthy database is classified and bookkept exactly as if alone
-    assert sorted(agg["unchanged"]) == [(1, 150, None, None), (2, 150, None, None)]
+    assert sorted(u[:4] for u in agg["unchanged"]) == [(1, 150, None, None), (2, 150, None, None)]
     assert agg["failed_databases"] == 1
 
 
@@ -105,7 +107,7 @@ def test_reseed_classification_and_legacy_select_list_recording():
     out = planner.detect_group(g1, lambda c: 150, lambda c, i: ({1: (120, None), 2: (1, 0)}, [], 1),
                                record_sl={2})
     assert [p["route"] for p in out["plans"]] == ["retention_reseed"]
-    assert out["unchanged"] == [(2, 150, "id, v", None)]
+    assert [u[:4] for u in out["unchanged"]] == [(2, 150, "id, v", None)]
 
 
 # ---- review fixes: CT disabled at the database; CT versions reset ---------------------------------
@@ -277,7 +279,7 @@ def test_legacy_checkpoint_records_current_begin_version_on_advance():
     g = [(_cfg(1, "d1", "a"), _cp(100))]            # no recorded begin_version yet
     out = planner.detect_group(g, lambda c: 100, lambda c, i: ({}, [], 0),
                                ct_status=lambda c: {("dbo", "a"): (0, 7)})
-    assert out["unchanged"] == [(1, 100, None, 7)]
+    assert [u[:4] for u in out["unchanged"]] == [(1, 100, None, 7)]
 
 
 def test_merge_plan_carries_begin_version():
@@ -363,7 +365,7 @@ def test_new_columns_carry_on_when_reseed_on_new_columns_is_off():
 def test_unchanged_rows_record_a_select_list_that_differs_from_the_recorded_one():
     g = [(_cfg(1, "d1", "a", sl="id, v, w"), _cp(100)), (_cfg(2, "d1", "b"), _cp(100))]
     out = planner.detect_group(g, lambda c: 100, lambda c, i: ({}, [], 0))
-    assert out["unchanged"] == [(1, 100, "id, v, w", None), (2, 100, None, None)]
+    assert [u[:4] for u in out["unchanged"]] == [(1, 100, "id, v, w", None), (2, 100, None, None)]
 
 
 def test_append_config_errors():
@@ -439,3 +441,78 @@ def test_a_read_through_a_connection_needs_the_connection_and_no_snapshot_isolat
     assert planner.config_error(dict(remote, use_remote_query=False), snapshot_isolation=True) is None
     plans, candidates, _ = planner.route_tables([remote], {1: _cp(5)}, snapshot_isolation=True)
     assert [p["route"] for p in plans] == ["unsupported"] and candidates == []
+
+
+# ---- identity backstop: the control row now points elsewhere than its checkpoint ------------------
+
+def _ident_cfg(**kw):
+    base = dict(_cfg(1, "d1", "a"), src_type="sqlserver", src_host="Srv1", src_port=None,
+                sink_catalog="main", sink_schema="bronze", sink_table="a", primary_key="id")
+    base.update(kw)
+    return base
+
+
+def _ident_cp(cfg, **kw):
+    src, sink, key = ss.identity_values(cfg)
+    return dict(_cp(5), source_identity=src, sink_identity=sink, merge_key=key, **kw)
+
+
+@pytest.mark.parametrize("change,reason", [
+    ({"sink_table": "a2"}, "sink_changed"),
+    ({"client_id": "c9"}, "sink_changed"),
+    ({"src_host": "srv2"}, "source_changed"),
+    ({"src_port": 1544}, "source_changed"),
+    ({"src_table": "other"}, "source_changed"),
+    ({"primary_key": "id, v"}, "primary_key_changed"),
+])
+def test_edited_control_row_routes_to_reseed(change, reason):
+    cfg = _ident_cfg()
+    plans, candidates, _ = planner.route_tables([dict(cfg, **change)], {1: _ident_cp(cfg)})
+    assert [(p["route"], p["reason"]) for p in plans] == [("reseed", reason)] and candidates == []
+
+
+def test_cosmetic_edits_do_not_reseed():
+    cfg = _ident_cfg()
+    for change in ({"src_host": "SRV1"}, {"src_port": 1433}, {"primary_key": " ID "}, {"sink_schema": "BRONZE"},
+                   {"task_collection": "moved"}, {"secret_key": "new-creds"}):
+        plans, candidates, _ = planner.route_tables([dict(cfg, **change)], {1: _ident_cp(cfg)})
+        assert plans == [] and len(candidates) == 1, change
+
+
+def test_unrecorded_identity_never_reseeds_and_is_recorded_on_advance():
+    cfg = _ident_cfg()
+    plans, candidates, _ = planner.route_tables([dict(cfg, sink_table="zz")], {1: _cp(5)})   # legacy cp
+    assert plans == [] and len(candidates) == 1
+    out = planner.detect_group([(cfg, _cp(100))], lambda c: 100, lambda c, i: ({}, [], 0))
+    assert out["unchanged"][0][4] == ss.identity_values(cfg)
+
+
+def test_cursor_tables_get_the_same_backstop():
+    import cursor_engine
+    cfg = _ident_cfg(load_type="cursor", cursor_column="rv")
+    cp = _ident_cp(cfg)
+    cp.update(position=cursor_engine.encode_position("rv", "timestamp", "9"), strategy="cursor")
+    plans, _, _ = planner.route_tables([dict(cfg, sink_schema="silver")], {1: cp})
+    assert [(p["route"], p["reason"]) for p in plans] == [("reseed", "sink_changed")]
+    assert planner.position_from(plans[0]) is None
+
+
+def test_missing_sink_reseeds_incremental_tables_only():
+    cfg = _ident_cfg()
+    plans, candidates, _ = planner.route_tables([cfg], {1: _ident_cp(cfg)}, existing_sinks=set())
+    assert [(p["route"], p["reason"]) for p in plans] == [("reseed", "sink_missing")] and candidates == []
+    plans, candidates, _ = planner.route_tables([cfg], {1: _ident_cp(cfg)}, existing_sinks={"main.bronze.a"})
+    assert plans == [] and len(candidates) == 1
+    plans, candidates, _ = planner.route_tables([cfg], {1: _ident_cp(cfg)}, existing_sinks=None)   # unknown: skip
+    assert plans == [] and len(candidates) == 1
+    full = dict(cfg, load_type="full")
+    plans, _, _ = planner.route_tables([full], {}, existing_sinks=set())
+    assert [p["route"] for p in plans] == ["full"]
+    seed, _, _ = planner.route_tables([cfg], {}, existing_sinks=set())                     # no checkpoint: seed
+    assert [p["route"] for p in seed] == ["seed"]
+
+
+def test_legacy_checkpoint_pointed_at_a_new_sink_is_caught_by_missing_sink():
+    cfg = _ident_cfg(sink_table="moved")
+    plans, _, _ = planner.route_tables([cfg], {1: _cp(5)}, existing_sinks={"main.bronze.a"})
+    assert [(p["route"], p["reason"]) for p in plans] == [("reseed", "sink_missing")]
