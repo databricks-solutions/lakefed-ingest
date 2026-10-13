@@ -1,0 +1,46 @@
+# OPTIONAL Databricks asset bundle: the lakefed_ingest operations app (a Databricks App).
+# Deploy it only if your workspace allows Databricks Apps. The ingestion bundle (repo root) doesn't
+# depend on it. Deploy the ingestion bundle first; this app uses its Lakebase database and jobs.
+# See README.md in this directory.
+bundle:
+  name: lakefed_ingest_app
+
+include:
+  - resources/*.yml
+
+variables:
+  app_name:
+    description: App name (lowercase letters, digits and dashes; 30 characters max).
+    default: lakefed-ingest-ops
+  lakebase_instance:
+    description: Lakebase instance of the ingestion bundle (its `lakebase_instance` variable).
+    default: lakefed-ingest
+  lakebase_database:
+    description: Postgres database on that instance (the ingestion bundle's `lakebase_database`).
+    default: lakefed_ingest
+  ingest_job_id:
+    description: Id of the ingestion job. Looked up by name; in development mode the ingestion
+      bundle prefixes job names (e.g. "[dev your_name] lakefed_ingest"), so override per target.
+    lookup:
+      job: lakefed_ingest
+  setup_job_id:
+    description: Id of the schema setup job (looked up by name, like ingest_job_id).
+    lookup:
+      job: lakefed_ingest_setup
+  node_type_id:
+    description: Node type for the single-node grant job.
+    default: Standard_D4ds_v5
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://company-dev.cloud.databricks.com/
+
+
+  prod:
+    mode: production
+    workspace:
+      host: https://company-prd.cloud.databricks.com/
+      root_path: /Workspace/${bundle.name}

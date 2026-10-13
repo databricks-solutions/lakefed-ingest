@@ -20,6 +20,10 @@ version doesn't support yet. Use the default version when you have many source d
 consolidated into shared tables, or need Change Tracking (incremental loads without a reliable
 watermark column, deletes included).
 
+An optional **operations app** (a Databricks App) for the default version is in [`app/`](app/README.md):
+run and table observability, control-row management, and starting or cancelling runs. It's a
+separate bundle, so workspaces that haven't approved Databricks Apps simply don't deploy it.
+
 > **Upgrading from an earlier release (deploy-path change).** The original version moved from the
 > repo root to [`job_orchestration/`](job_orchestration/README.md), unchanged and with the same bundle
 > name and uuid, so deploying it **from `job_orchestration/`** updates your existing jobs in place.

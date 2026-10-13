@@ -1,0 +1,4 @@
+streamlit>=1.40
+pandas
+psycopg[binary]>=3.2
+databricks-sdk==0.145.0
