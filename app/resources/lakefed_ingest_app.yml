@@ -1,0 +1,71 @@
+# The operations app and its one-time grant job.
+#
+# The app runs as its own service principal, with least privilege:
+#   - ingestion and setup jobs: CAN_MANAGE_RUN through app resources (view, run, cancel; not edit);
+#   - Lakebase: granted by the lakefed_ingest_app_grants job below (run once after the first deploy,
+#     as the instance manager / tables' owner): CAN_USE on the instance, a Postgres role, and
+#     SELECT / INSERT / UPDATE on the lakefed_ingest tables. The app has no `database` resource:
+#     some workspaces refuse to attach one even for the instance's manager, and the job works everywhere.
+# Everyone with CAN_USE on the app acts with these privileges, so grant CAN_USE only to operators.
+resources:
+  apps:
+    lakefed_ingest_app:
+      name: ${var.app_name}
+      description: "lakefed_ingest operations: runs, tables, errors, control rows, jobs."
+      source_code_path: ../src
+      config:
+        command: ["streamlit", "run", "app.py"]
+        env:
+          - name: LAKEBASE_INSTANCE
+            value: ${var.lakebase_instance}
+          - name: LAKEBASE_DATABASE
+            value: ${var.lakebase_database}
+          - name: INGEST_JOB_ID
+            value_from: ingest-job
+          - name: SETUP_JOB_ID
+            value_from: setup-job
+      resources:
+        - name: ingest-job
+          description: The lakefed_ingest ingestion job.
+          job:
+            id: ${var.ingest_job_id}
+            permission: CAN_MANAGE_RUN
+        - name: setup-job
+          description: The lakefed_ingest_setup schema job.
+          job:
+            id: ${var.setup_job_id}
+            permission: CAN_MANAGE_RUN
+
+  jobs:
+    lakefed_ingest_app_grants:
+      name: "lakefed_ingest_app_grants"
+      description: "Grant the operations app's service principal access to the lakefed_ingest Lakebase tables. Run as the tables' owner; idempotent."
+      job_clusters:
+        - job_cluster_key: grants_cluster
+          new_cluster:
+            spark_version: 18.x-scala2.13
+            data_security_mode: SINGLE_USER
+            node_type_id: ${var.node_type_id}
+            num_workers: 0
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            custom_tags:
+              ResourceClass: SingleNode
+              project: lakefed_ingest
+      tasks:
+        - task_key: grant_app_access
+          job_cluster_key: grants_cluster
+          notebook_task:
+            notebook_path: ../notebooks/grant_app_access.ipynb
+            base_parameters:
+              app_name: ${resources.apps.lakefed_ingest_app.name}
+              db_instance: ${var.lakebase_instance}
+              db_name: ${var.lakebase_database}
+          libraries:
+            - pypi:
+                package: "psycopg[binary]"
+            - pypi:
+                package: "databricks-sdk==0.145.0"
+      queue:
+        enabled: false

@@ -10,6 +10,9 @@ Databricks Delta tables. Each is its own Databricks Asset Bundle:
 | **Default** | repo root (`databricks.yml`, `resources/`, `src/lakefed_ingest/`, `tests/`) | `lakefed_ingest_v2` | One job task per `task_collection`, in-process threads + FAIR pools on a job cluster; Lakebase (Postgres) state; Spark JDBC; source adapters (SQL Server, Oracle, PostgreSQL, MySQL) + load strategies (SQL Server Change Tracking and watermark cursor, full reload) |
 | **Job orchestration** | `job_orchestration/` | `lakefed_ingest` | Jobs `for_each` tasks; SQL warehouse + notebooks; Delta control table; Lakehouse Federation / `remote_query` |
 
+An optional operations app (Databricks App, Streamlit) for the default version is its own bundle
+in `app/` (`lakefed_ingest_app`); see `app/README.md`.
+
 Never run bundle commands for one version from the other's directory. Local bundle state
 (`.databricks/bundle/<target>/`) is keyed by target only, so each version keeps its own cache in its
 own directory.
