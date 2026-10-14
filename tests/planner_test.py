@@ -5,7 +5,7 @@ import state_store as ss
 
 def _cfg(cid, db, table, host="h1", sl="id, v"):
     return {"id": cid, "src_host": host, "src_port": 1433, "src_database": db, "secret_key": f"k-{db}",
-            "src_schema": "dbo", "src_table": table, "select_list": sl}
+            "src_schema": "dbo", "src_table": table, "select_list": sl, "primary_key": "id"}
 
 
 def _cp(v, phase=ss.INCREMENTAL, sl="id, v", strategy="ct", begin=None):
@@ -325,3 +325,14 @@ def test_consolidated_row_must_not_select_client_id_and_must_be_valid():
     errs = {p["cfg"]["id"]: p.get("error") for p in plans}
     assert "remove it from select_list" in errs[1] and "invalid client_id" in errs[2]
     assert errs[3] is None and errs[4] is None
+
+
+def test_missing_primary_key_fails_at_plan_for_merge_strategies_only():
+    ct = dict(_cfg(1, "d1", "a"), primary_key="")
+    cursor = dict(_cfg(2, "d1", "b"), load_type="cursor", cursor_column="v", primary_key=None)
+    full = dict(_cfg(3, "d1", "c"), load_type="full", primary_key=None)
+    assert "needs a primary_key" in planner.config_error(ct)
+    assert "needs a primary_key" in planner.config_error(cursor)
+    assert planner.config_error(full) is None
+    plans, _, _ = planner.route_tables([ct, full], {})
+    assert {p["cfg"]["id"]: p["route"] for p in plans} == {1: "unsupported", 3: "full"}

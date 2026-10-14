@@ -24,7 +24,8 @@ the CT strategy.
 from __future__ import annotations
 
 import re
-from typing import List, Optional
+import threading
+from typing import Callable, List, Optional
 
 SCHEMA = "lakefed_ingest"
 CONTROL_TABLE = f"{SCHEMA}.control"
@@ -407,8 +408,21 @@ class StateStore:
     password), and optional sslmode (default 'require').
     """
 
-    def __init__(self, conn):
+    def __init__(self, conn, reconnect: Optional[Callable[[], object]] = None):
         self._conn = conn
+        # Optional factory for a fresh connection: a dropped connection (network blip, failover,
+        # idle timeout) is replaced before the next statement instead of failing the rest of the run.
+        # The statement that hit the drop still fails (and its table retries next run), so nothing
+        # is ever executed twice. Never set for the lock connection: a dropped lock must stay dropped.
+        self._reconnect = reconnect
+        self._reconnect_lock = threading.Lock()
+
+    def _cursor(self):
+        if self._reconnect is not None and (self._conn.closed or self._conn.broken):
+            with self._reconnect_lock:
+                if self._conn.closed or self._conn.broken:
+                    self._conn = self._reconnect()
+        return self._conn.cursor()
 
     @property
     def connection(self):
@@ -417,12 +431,16 @@ class StateStore:
 
     @classmethod
     def connect_lakebase(cls, instance_name: str, dbname: str, user: str = None,
-                         host: str = None, application_name: str = None) -> "StateStore":
+                         host: str = None, application_name: str = None,
+                         reconnect: bool = False) -> "StateStore":
         """Connect using a short-lived Databricks-minted Lakebase OAuth token (no stored password).
 
         Resolves the instance DNS and the run principal via the Databricks SDK and mints a fresh
         credential each call, so there is no password secret to manage or rotate. Runs on cluster
         compute (the run identity must be a Postgres role on the instance).
+
+        Token expiry is checked only at login, so an open connection outlives its token. With
+        ``reconnect`` a dropped connection is reopened with a freshly minted token.
         """
         import uuid
         import psycopg
@@ -435,15 +453,16 @@ class StateStore:
             host = w.database.get_database_instance(name=instance_name).read_write_dns
         if user is None:
             user = w.current_user.me().user_name
-        cred = w.database.generate_database_credential(
-            request_id=str(uuid.uuid4()), instance_names=[instance_name]
-        )
-        conn = psycopg.connect(
-            host=host, port=5432, dbname=dbname, user=user, password=cred.token,
-            sslmode="require", autocommit=True,
-            **({"application_name": application_name} if application_name else {}),
-        )
-        return cls(conn)
+        def _open():
+            cred = w.database.generate_database_credential(
+                request_id=str(uuid.uuid4()), instance_names=[instance_name]
+            )
+            return psycopg.connect(
+                host=host, port=5432, dbname=dbname, user=user, password=cred.token,
+                sslmode="require", autocommit=True,
+                **({"application_name": application_name} if application_name else {}),
+            )
+        return cls(_open(), reconnect=_open if reconnect else None)
 
     @classmethod
     def connect(cls, config: dict) -> "StateStore":
@@ -463,7 +482,7 @@ class StateStore:
 
     def get_task(self, task_id) -> dict:
         """Return one config row as a dict keyed by CONTROL_COLUMNS (empty dict if not found)."""
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(get_task_sql(), (int(task_id),))
             row = cur.fetchone()
         return dict(zip(CONTROL_COLUMNS, row)) if row else {}
@@ -472,20 +491,20 @@ class StateStore:
         """Return the full config rows (dicts keyed by CONTROL_COLUMNS) for a collection's
         enabled tasks. The sweep loads these once, then ingests them in-process (threaded),
         instead of one job run per table."""
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(list_task_configs_sql(), (task_collection,))
             return [dict(zip(CONTROL_COLUMNS, row)) for row in cur.fetchall()]
 
     def mixed_sinks(self) -> set:
         """{(catalog, schema, table)} lower-cased — see ``mixed_sinks_sql``."""
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(mixed_sinks_sql())
             return {tuple(r) for r in cur.fetchall()}
 
     def get_checkpoint(self, control_id) -> dict:
         """Return {'position', 'phase', 'status', 'strategy'} for a control task, or seeding
         defaults. ``position`` is the raw text; the owning strategy decodes it."""
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(get_checkpoint_sql(), (int(control_id),))
             row = cur.fetchone()
         if row is None:
@@ -498,7 +517,7 @@ class StateStore:
         ids = [int(i) for i in control_ids]
         if not ids:
             return {}
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(get_checkpoints_sql(), (ids,))
             rows = cur.fetchall()
         return {int(r[0]): {"position": r[1], "phase": r[2], "status": r[3], "select_list": r[4],
@@ -510,7 +529,7 @@ class StateStore:
         committed (cross-system at-least-once: re-reading one window on crash is harmless).
         ``position`` is stored as text (None -> NULL); ``strategy`` defaults to the row's load_type.
         ``select_list`` records the columns the sink was written with (None keeps the old value)."""
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(upsert_checkpoint_sql(),
                         (*task_identity(cfg), strategy or strategy_name(cfg), position_text(position),
                          phase, status, detail, select_list))
@@ -521,7 +540,7 @@ class StateStore:
         params = [(int(r[1]), r[2], (r[3] if len(r) > 3 else None), int(r[0])) for r in rows]
         if not params:
             return 0
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.executemany(bulk_advance_unchanged_sql(), params)
         return len(params)
 
@@ -529,17 +548,17 @@ class StateStore:
         """Record the table's CT begin_version on its checkpoint (seed time, or first time seen)."""
         if begin_version is None:
             return
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(record_ct_begin_version_sql(), (int(begin_version), int(cfg["id"])))
 
     def set_status(self, cfg: dict, status, detail=None):
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(set_status_sql(), (*task_identity(cfg), strategy_name(cfg), status, detail))
 
     def enqueue_reseed(self, cfg: dict, reason="retention_miss"):
         """Mark the table for a full reseed and flip its phase back to seeding (position cleared)."""
         ident = task_identity(cfg)
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(enqueue_reseed_sql(), (*ident, reason))
             cur.execute(upsert_checkpoint_sql(),
                         (*ident, strategy_name(cfg), None, SEEDING, "reseed_queued", reason, None))
@@ -547,7 +566,7 @@ class StateStore:
     # ---- Observability / telemetry -----------------------------------------------------
     def start_run(self, task_collection, job_run_id, cluster_id, parallelism) -> int:
         """Open an ingest_run row; returns its run_id."""
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(start_run_sql(),
                         (task_collection, job_run_id, cluster_id, int(parallelism)))
             return int(cur.fetchone()[0])
@@ -555,7 +574,7 @@ class StateStore:
     def record_event_start(self, run_id, cfg, action, phase, pool) -> int:
         """Open an ingest_event row for one (run, table) from a control-row dict; returns id."""
         sink_fqn = f"{cfg.get('sink_catalog')}.{cfg.get('sink_schema')}.{cfg.get('sink_table')}"
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(record_event_start_sql(), (
                 int(run_id), cfg.get("task_collection"), cfg.get("id"),
                 cfg.get("src_database"), cfg.get("src_schema"), cfg.get("src_table"),
@@ -569,7 +588,7 @@ class StateStore:
         """Finalize an ingest_event row; on 'ok' also stamp checkpoint.last_success_at.
         Positions are stored as text. ``action`` (optional) corrects the provisional action set at
         start (e.g. 'reseed'); ``pool`` (optional) records the FAIR pool(s) the table's units ran in."""
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(record_event_finish_sql(), (
                 status, stage, rows_read, rows_merged, position_text(position_from),
                 position_text(position_to),
@@ -594,7 +613,7 @@ class StateStore:
                            cfg.get("src_database"), cfg.get("src_schema"), cfg.get("src_table"),
                            sink, action, (cp or {}).get("phase"), stage, e))
             statuses.append((*task_identity(cfg), strategy_name(cfg), "failed", e[:500]))
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.executemany(record_event_failed_sql(), events)
             cur.executemany(set_status_sql(), statuses)
         return len(items)
@@ -602,7 +621,7 @@ class StateStore:
     def finish_run(self, run_id, total, ok, failed, skipped=0, reseeded=0,
                    status="completed", detail=None) -> None:
         """Finalize an ingest_run row with roll-up counts."""
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(finish_run_sql(), (
                 status, total, ok, failed, skipped, reseeded, detail, int(run_id),
             ))
@@ -610,12 +629,12 @@ class StateStore:
     # ---- per-collection run lock (hold on a DEDICATED connection for the whole sweep) -------
     def try_lock_collection(self, task_collection: str) -> bool:
         """True iff this connection now holds the collection's lock (non-blocking)."""
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(try_lock_collection_sql(), (collection_lock_key(task_collection),))
             return bool(cur.fetchone()[0])
 
     def unlock_collection(self, task_collection: str) -> None:
-        with self._conn.cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(unlock_collection_sql(), (collection_lock_key(task_collection),))
 
     def is_alive(self) -> bool:

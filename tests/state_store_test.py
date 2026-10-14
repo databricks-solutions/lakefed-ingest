@@ -566,3 +566,29 @@ def test_mixed_sinks_query_counts_every_row_and_maps_tuples():
 
 def test_control_columns_include_client_id():
     assert "client_id" in ss.CONTROL_COLUMNS
+
+
+class _FakeConn:
+    def __init__(self, name):
+        self.name, self.closed, self.broken = name, False, False
+    def cursor(self):
+        return self.name
+
+
+def test_dropped_connection_is_replaced_before_the_next_statement():
+    opened = []
+    def reopen():
+        opened.append(_FakeConn(f"c{len(opened) + 2}"))
+        return opened[-1]
+    store = ss.StateStore(_FakeConn("c1"), reconnect=reopen)
+    assert store._cursor() == "c1" and not opened          # healthy: no new connection
+    store._conn.broken = True
+    assert store._cursor() == "c2" and len(opened) == 1    # dropped: reopened once
+    assert store._cursor() == "c2"
+
+
+def test_without_reconnect_a_dropped_connection_stays_dropped():
+    # The lock connection: losing it means the advisory lock is gone, which must not be hidden.
+    store = ss.StateStore(_FakeConn("c1"))
+    store._conn.closed = True
+    assert store._cursor() == "c1" and store.is_alive() is False

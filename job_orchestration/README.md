@@ -169,6 +169,10 @@ Run the controller by providing `task_collection` as a parameter. Non-partitione
 
 ## Deployment
 
+Run bundle commands from this directory (`job_orchestration/`). This version used to live at the
+repo root; the root is now the default version, a different bundle (`lakefed_ingest_v2`). Update any
+deploy automation that ran from the root.
+
 ### Deploy to Development Environment
 ```bash
 $ databricks bundle deploy --target dev --profile DEFAULT

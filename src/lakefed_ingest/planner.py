@@ -62,7 +62,14 @@ def sink_key(cfg: dict) -> tuple:
 def config_error(cfg: dict, mixed_sinks=frozenset()) -> Optional[str]:
     """Sink-ownership problems that would let one row overwrite another's data — checked per table
     before any work: an invalid client_id, a consolidated row whose select_list already has a
-    __client_id__ column, or a sink shared by a dedicated row and consolidated rows."""
+    __client_id__ column, or a sink shared by a dedicated row and consolidated rows. Also a missing
+    primary key for a strategy that MERGEs by it (the database CHECK constraints enforce this too;
+    this gives a clear per-table error if a row ever gets past them)."""
+    try:
+        if ls.get_strategy(cfg.get("load_type")).requires_pk and not ct_engine._split(cfg.get("primary_key")):
+            return f"load_type {cfg.get('load_type') or 'ct'} needs a primary_key (it MERGEs by it)"
+    except ValueError:
+        pass   # an unknown load_type is reported by unsupported_reason
     try:
         cid = ct_engine.client_id(cfg)
     except ValueError as e:

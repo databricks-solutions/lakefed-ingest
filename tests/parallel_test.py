@@ -174,3 +174,12 @@ def test_workslots_without_tracking_records_nothing():
     with slots.acquire():
         pass
     assert slots.tracked_pools() == []
+
+
+def test_failing_set_pool_fails_that_item_not_the_batch():
+    def set_pool(pool):
+        if pool == "pool0":
+            raise RuntimeError("JVM_ATTRIBUTE_NOT_SUPPORTED")
+    res = parallel.run_parallel([1, 2, 3, 4], worker=lambda x: x * 10, max_parallel=2, set_pool=set_pool)
+    assert [r["status"] for r in res] == ["failed", "ok", "failed", "ok"]
+    assert "JVM_ATTRIBUTE_NOT_SUPPORTED" in res[0]["detail"] and res[1]["detail"] == 20

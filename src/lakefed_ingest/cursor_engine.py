@@ -90,8 +90,8 @@ def _obj(cfg: dict) -> str:
 
 
 def column_type_sql(cfg: dict) -> str:
-    """System type name of ``cursor_column`` (no row when the column doesn't exist)."""
-    return ("SELECT TYPE_NAME(c.system_type_id) AS typ FROM sys.columns c "
+    """System type name and nullability of ``cursor_column`` (no row when the column doesn't exist)."""
+    return ("SELECT TYPE_NAME(c.system_type_id) AS typ, c.is_nullable AS nullable FROM sys.columns c "
             f"WHERE c.object_id = OBJECT_ID({_obj(cfg)}) AND c.name = {ct_engine.quote_nstr(cfg['cursor_column'])}")
 
 
@@ -153,7 +153,11 @@ def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
 # ---- source access ---------------------------------------------------------------------------------
 
 def column_type(cfg: dict, slots=None) -> str:
-    """The cursor column's SQL Server type; raises a clear error if missing or unsupported."""
+    """The cursor column's SQL Server type; raises a clear error if missing, unsupported or nullable.
+
+    A nullable cursor column is refused: incremental reads select ``col > lo AND col <= hi``, so a
+    row whose cursor value is NULL would never be read (the seed copies it, later changes to it
+    would be silently missed)."""
     with ct_engine._unit(slots):
         row = ct_engine._read(ct_engine._spark(), cfg, column_type_sql(cfg)).first()
     if row is None or row["typ"] is None:
@@ -161,6 +165,10 @@ def column_type(cfg: dict, slots=None) -> str:
                          f"{cfg['src_schema']}.{cfg['src_table']}")
     typ = str(row["typ"]).lower()
     _kind(typ)
+    if row["nullable"]:
+        raise ValueError(f"cursor_column '{cfg['cursor_column']}' on {cfg['src_schema']}.{cfg['src_table']} "
+                         "is nullable: rows with a NULL value would never be read incrementally. Use a NOT NULL "
+                         "column (rowversion recommended), or load_type ct or full")
     return typ
 
 

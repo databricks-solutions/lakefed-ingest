@@ -20,6 +20,16 @@ version doesn't support yet. Use the default version when you have many source d
 consolidated into shared tables, or need Change Tracking (incremental loads without a reliable
 watermark column, deletes included).
 
+> **Upgrading from an earlier release (deploy-path change).** The original version moved from the
+> repo root to [`job_orchestration/`](job_orchestration/README.md), unchanged and with the same bundle
+> name and uuid, so deploying it **from `job_orchestration/`** updates your existing jobs in place.
+> The repo root is now the default version, a different bundle (`lakefed_ingest_v2`): a
+> `databricks bundle deploy` run from the root — including CI or scripts written for the old layout —
+> doesn't touch your existing jobs, but creates the default version's resources, including a
+> billable Lakebase instance. Update deploy automation to `cd job_orchestration` first. If you
+> deployed a preview of the default version, follow
+> [Upgrading a preview deployment](docs/deploy.md) before deploying either version.
+
 The rest of this README covers the default version.
 
 ## Why one task per collection
@@ -140,6 +150,8 @@ column, `cursor_column` (a PK is required — increments are MERGEd by it):
   - A transaction that commits a value *below* an already-read watermark after the read is missed.
     `rowversion` avoids this: the watermark is capped below `MIN_ACTIVE_ROWVERSION()`, so rows from
     still-open transactions wait for the next run.
+- The column must be `NOT NULL`: a row with a NULL value is never `> checkpoint`, so increments
+  would silently miss it. A nullable `cursor_column` fails the table with a clear error.
 - Changing `cursor_column` re-seeds the table; adding columns to `select_list` reseeds it, as for
   `ct`. Nothing is `.cache()`d; Delta MERGE materializes the JDBC source
 once (`materializeSource=auto`).
@@ -341,7 +353,8 @@ pytest tests                        # default version only
 pytest job_orchestration/tests      # job orchestration version only
 ```
 
-Unit tests need no cluster. `tests/validation_test.py` runs against a live SQL Server when the
+Run `pytest` from the repo root (`pytest.ini` there sets the test paths for both versions). Unit
+tests need no cluster. `tests/validation_test.py` runs against a live SQL Server when the
 `LAKEFED_TEST_SQLSERVER_*` environment variables are set and is skipped otherwise.
 
 ## Not yet supported

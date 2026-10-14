@@ -88,11 +88,21 @@ def test_column_type_lookup_errors_clearly(monkeypatch):
     monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([]))
     with pytest.raises(ValueError, match="cursor_column 'updated_at' not found on dbo.orders"):
         cur.column_type(CFG)
-    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "float"}]))
+    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "float", "nullable": False}]))
     with pytest.raises(ValueError, match="not supported"):
         cur.column_type(CFG)
-    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "DateTime2"}]))
+    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "DateTime2", "nullable": False}]))
     assert cur.column_type(CFG) == "datetime2"
+
+
+def test_nullable_cursor_column_is_refused(monkeypatch):
+    # A NULL cursor value is never > lo, so such rows would be silently missed by every increment.
+    import ct_engine
+    monkeypatch.setattr(ct_engine, "_spark", lambda: None)
+    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"typ": "datetime2", "nullable": True}]))
+    with pytest.raises(ValueError, match="is nullable"):
+        cur.column_type(CFG)
+    assert "c.is_nullable AS nullable" in cur.column_type_sql(CFG)
 
 
 # ---- read_and_merge: one read feeding one MERGE, per-call temp view, always dropped -----------------

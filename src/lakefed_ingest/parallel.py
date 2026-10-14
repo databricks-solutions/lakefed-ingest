@@ -113,10 +113,12 @@ def run_parallel(
     def _run(pair):
         idx, item = pair
         pool = f"pool{idx % max_parallel}"
-        if set_pool is not None:
-            set_pool(pool)
         rec = {"item": id_of(item), "pool": pool, "status": "ok", "detail": None}
         try:
+            # Inside the try: a failing set_pool (e.g. a cluster access mode without
+            # sparkContext) fails this item, never the batch.
+            if set_pool is not None:
+                set_pool(pool)
             rec["detail"] = worker(item)
         except Exception as e:  # isolate: one bad item must not fail the batch
             rec["status"] = "failed"
