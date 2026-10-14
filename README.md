@@ -348,3 +348,27 @@ Unit tests need no cluster. `tests/validation_test.py` runs against a live SQL S
 
 The `cdc` load strategy (placeholder with a documented contract in `load_strategies.py`),
 `cursor` and `cdc` for sources other than SQL Server (placeholders), and production alerting.
+
+## Help
+
+Databricks support does not cover this project. For questions or bugs, open a GitHub issue and the
+team will help on a best-effort basis.
+
+## License
+
+&copy; 2026 Databricks, Inc. All rights reserved. The source in this repository is provided subject to the Databricks License [https://databricks.com/db-license-source]. All included or referenced third party libraries are subject to the licenses set forth below.
+
+| library | description | license | source |
+|---|---|---|---|
+| certifi | Mozilla CA bundle (live SQL Server validation tests) | MPL-2.0 | https://pypi.org/project/certifi/ |
+| databricks-sdk | Databricks SDK for Python | Apache-2.0 | https://pypi.org/project/databricks-sdk/ |
+| ibm_db | IBM Db2 driver (Db2 test data generator, job orchestration version) | Apache-2.0 | https://pypi.org/project/ibm-db/ |
+| Microsoft JDBC Driver for SQL Server | SQL Server JDBC driver (included in Databricks Runtime) | MIT | https://github.com/microsoft/mssql-jdbc |
+| MySQL Connector/J | MySQL JDBC driver (optional cluster library) | GPL-2.0 with Universal FOSS Exception | https://github.com/mysql/mysql-connector-j |
+| Oracle JDBC driver (ojdbc11) | Oracle JDBC driver (optional cluster library) | Oracle Free Use Terms and Conditions | https://www.oracle.com/downloads/licenses/oracle-free-license.html |
+| pandas | Data manipulation and analysis (table profiler notebook) | BSD-3-Clause | https://pypi.org/project/pandas/ |
+| PostgreSQL JDBC Driver | PostgreSQL JDBC driver (included in Databricks Runtime) | BSD-2-Clause | https://github.com/pgjdbc/pgjdbc |
+| psycopg | PostgreSQL database adapter (v3), for Lakebase | LGPL-3.0 | https://pypi.org/project/psycopg/ |
+| pyspark | Apache Spark Python API (provided by Databricks Runtime) | Apache-2.0 | https://pypi.org/project/pyspark/ |
+| pytest | Testing framework | MIT | https://pypi.org/project/pytest/ |
+| python-tds | SQL Server TDS client (live SQL Server validation tests) | MIT | https://pypi.org/project/python-tds/ |
