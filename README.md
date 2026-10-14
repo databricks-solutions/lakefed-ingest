@@ -151,7 +151,8 @@ column, `cursor_column` (a PK is required — increments are MERGEd by it):
     `rowversion` avoids this: the watermark is capped below `MIN_ACTIVE_ROWVERSION()`, so rows from
     still-open transactions wait for the next run.
 - The column must be `NOT NULL`: a row with a NULL value is never `> checkpoint`, so increments
-  would silently miss it. A nullable `cursor_column` fails the table with a clear error.
+  would silently miss it. A nullable `cursor_column` fails the table with a clear error, checked on
+  every run (a column altered to NULL after the seed is caught too).
 - Changing `cursor_column` re-seeds the table; adding columns to `select_list` reseeds it, as for
   `ct`. Nothing is `.cache()`d; Delta MERGE materializes the JDBC source
 once (`materializeSource=auto`).

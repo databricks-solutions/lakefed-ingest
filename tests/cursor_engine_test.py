@@ -26,7 +26,7 @@ def test_type_lookup_sql_quotes_names():
     ("datetime2", "CONVERT(VARCHAR(64), MAX([updated_at]), 126)"),
 ])
 def test_high_watermark_sql(typ, expr):
-    assert cur.high_watermark_sql(CFG, typ) == f"SELECT {expr} AS hi FROM [dbo].[orders]"
+    assert cur.high_watermark_sql(CFG, typ) == f"SELECT {expr} AS hi, {cur.nullable_sql(CFG)} AS nullable FROM [dbo].[orders]"
 
 
 @pytest.mark.parametrize("typ", ["timestamp", "rowversion"])
@@ -34,8 +34,8 @@ def test_rowversion_high_watermark_capped_below_min_active_rowversion(typ):
     # Never past the oldest open transaction: rows it commits later must not fall below the watermark.
     mx, mar = "CAST(MAX([updated_at]) AS BIGINT)", "CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)"
     assert cur.high_watermark_sql(CFG, typ) == (
-        f"SELECT CONVERT(VARCHAR(20), CASE WHEN {mx} < {mar} THEN {mx} ELSE {mar} - 1 END) AS hi "
-        "FROM [dbo].[orders]")
+        f"SELECT CONVERT(VARCHAR(20), CASE WHEN {mx} < {mar} THEN {mx} ELSE {mar} - 1 END) AS hi, "
+        f"{cur.nullable_sql(CFG)} AS nullable FROM [dbo].[orders]")
 
 
 @pytest.mark.parametrize("typ", ["float", "real", "nvarchar", "uniqueidentifier", "bit"])
@@ -205,3 +205,15 @@ def test_consolidated_cursor_read_is_tagged_and_merged_on_client(monkeypatch):
     _merge(monkeypatch, spark, cfg=dict(CFG, client_id="t1"))
     assert seen["tagged"] == ("lit(t1) AS __client_id__", "id", "amount", "updated_at")
     assert "AND tgt.`__client_id__` = 't1' " in spark.statements[0]
+
+
+def test_every_run_rechecks_nullability(monkeypatch):
+    # A column altered to NULL after the seed is caught by the steady-state run's watermark query.
+    import ct_engine
+    monkeypatch.setattr(ct_engine, "_spark", lambda: None)
+    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"hi": "20", "nullable": 0}]))
+    assert cur.high_watermark(CFG, "int") == "20"
+    monkeypatch.setattr(ct_engine, "_read", lambda sp, cfg, q, **kw: _Rows([{"hi": "20", "nullable": 1}]))
+    with pytest.raises(ValueError, match="is nullable"):
+        cur.high_watermark(CFG, "int")
+    assert "c.is_nullable" in cur.nullable_sql(CFG) and "N'updated_at'" in cur.nullable_sql(CFG)

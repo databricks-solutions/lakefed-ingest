@@ -95,9 +95,17 @@ def column_type_sql(cfg: dict) -> str:
             f"WHERE c.object_id = OBJECT_ID({_obj(cfg)}) AND c.name = {ct_engine.quote_nstr(cfg['cursor_column'])}")
 
 
+def nullable_sql(cfg: dict) -> str:
+    """Scalar subquery: 1 if ``cursor_column`` is nullable (checked on every run, not just at seed —
+    a column can be altered to NULL after the table was seeded)."""
+    return ("(SELECT CAST(c.is_nullable AS INT) FROM sys.columns c "
+            f"WHERE c.object_id = OBJECT_ID({_obj(cfg)}) AND c.name = {ct_engine.quote_nstr(cfg['cursor_column'])})")
+
+
 def high_watermark_sql(cfg: dict, typ: str) -> str:
-    """One row ``hi``: the cursor column's high watermark as SQL Server text (NULL on an empty table).
-    rowversion is capped below MIN_ACTIVE_ROWVERSION() so open transactions are never skipped."""
+    """One row ``hi``, ``nullable``: the cursor column's high watermark as SQL Server text (NULL on an
+    empty table) and its nullability (one query per run for both). rowversion is capped below
+    MIN_ACTIVE_ROWVERSION() so open transactions are never skipped."""
     col = ct_engine.quote_ident(cfg["cursor_column"])
     kind = _kind(typ)
     if kind == "numeric":
@@ -108,7 +116,7 @@ def high_watermark_sql(cfg: dict, typ: str) -> str:
         mx, mar = f"CAST(MAX({col}) AS BIGINT)", "CAST(MIN_ACTIVE_ROWVERSION() AS BIGINT)"
         expr = f"CONVERT(VARCHAR(20), CASE WHEN {mx} < {mar} THEN {mx} ELSE {mar} - 1 END)"
     table = ct_engine.quote_ident(cfg["src_schema"]) + "." + ct_engine.quote_ident(cfg["src_table"])
-    return f"SELECT {expr} AS hi FROM {table}"
+    return f"SELECT {expr} AS hi, {nullable_sql(cfg)} AS nullable FROM {table}"
 
 
 def literal(value: str, typ: str) -> str:
@@ -165,16 +173,22 @@ def column_type(cfg: dict, slots=None) -> str:
                          f"{cfg['src_schema']}.{cfg['src_table']}")
     typ = str(row["typ"]).lower()
     _kind(typ)
-    if row["nullable"]:
+    _refuse_nullable(cfg, row["nullable"])
+    return typ
+
+
+def _refuse_nullable(cfg: dict, nullable) -> None:
+    if nullable:
         raise ValueError(f"cursor_column '{cfg['cursor_column']}' on {cfg['src_schema']}.{cfg['src_table']} "
                          "is nullable: rows with a NULL value would never be read incrementally. Use a NOT NULL "
                          "column (rowversion recommended), or load_type ct or full")
-    return typ
 
 
 def high_watermark(cfg: dict, typ: str, slots=None) -> Optional[str]:
     with ct_engine._unit(slots):
         row = ct_engine._read(ct_engine._spark(), cfg, high_watermark_sql(cfg, typ)).first()
+    if row is not None:
+        _refuse_nullable(cfg, row["nullable"])
     return None if row is None or row["hi"] is None else str(row["hi"])
 
 
