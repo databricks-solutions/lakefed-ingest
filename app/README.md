@@ -128,3 +128,8 @@ Locally the app connects as you. Tests:
 - Changing job schedules: needs `CAN_MANAGE` on the job; use the Jobs UI.
 - Per-user authorization: everyone with `CAN_USE` acts as the app's service principal.
 - Bulk import of control rows: use `notebooks/load_control_example.ipynb`.
+
+## License
+
+See [Help and License](../README.md#help) in the repo README, including the licenses of the
+third-party libraries this app uses.
