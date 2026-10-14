@@ -108,3 +108,11 @@ def test_discover_database_retries_connection_failures_only(monkeypatch):
     with pytest.raises(RuntimeError, match="Login failed"):
         d.discover_database({"src_type": "sqlserver"}, sleep=sleeps.append)
     assert len(sleeps) == 1                                   # non-connection errors are not retried
+
+
+def test_nullable_rowversion_is_not_a_cursor_candidate():
+    cols = _cols(("id", "int"), ("rv", "timestamp"))
+    cols[1]["is_nullable"] = 1
+    rec = d.recommend({"ct_enabled": 0}, cols, ["id"])
+    assert rec["load_type"] == "full" and rec["cursor_column"] is None
+    assert "is_nullable" in d.COLUMNS_SQL

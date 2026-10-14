@@ -44,7 +44,7 @@ TABLES_SQL = (
 COLUMNS_SQL = (
     "SELECT c.object_id AS oid, c.column_id AS pos, c.name AS col, "
     "TYPE_NAME(c.system_type_id) AS base_type, TYPE_NAME(c.user_type_id) AS user_type, "
-    "CAST(c.is_identity AS INT) AS is_identity "
+    "CAST(c.is_identity AS INT) AS is_identity, CAST(c.is_nullable AS INT) AS is_nullable "
     "FROM sys.columns c JOIN sys.tables t ON t.object_id = c.object_id WHERE t.is_ms_shipped = 0"
 )
 
@@ -79,7 +79,10 @@ def recommend(table: dict, columns: List[dict], pk: List[str]) -> dict:
     if excluded:
         notes.append(f"excluded unsupported columns: {', '.join(excluded)}")
     by_name = {c["col"]: c for c in cols}
-    rowversion = next((c["col"] for c in keep if str(c["base_type"]).lower() in ROWVERSION_TYPES), None)
+    # A cursor column must be NOT NULL (the ingestion job refuses a nullable one: NULL rows would never
+    # be read incrementally), so a nullable rowversion isn't a cursor candidate.
+    rowversion = next((c["col"] for c in keep if str(c["base_type"]).lower() in ROWVERSION_TYPES
+                       and not int(c.get("is_nullable") or 0)), None)
     identity = next((c["col"] for c in keep if int(c.get("is_identity") or 0)), None)
     pk = [p for p in pk if p in by_name]
     if pk and any(p in excluded for p in pk):
