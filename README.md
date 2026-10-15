@@ -358,6 +358,10 @@ Run `pytest` from the repo root (`pytest.ini` there sets the test paths for both
 tests need no cluster. `tests/validation_test.py` runs against a live SQL Server when the
 `LAKEFED_TEST_SQLSERVER_*` environment variables are set and is skipped otherwise.
 
+For a dev or test source, `tests/synthetic/` builds a SQL Server database with 1,800 CT-enabled
+tables, applies changes to it, and reconciles the sinks with the source; see
+[tests/synthetic/README.md](tests/synthetic/README.md).
+
 ## Not yet supported
 
 The `cdc` load strategy (placeholder with a documented contract in `load_strategies.py`),

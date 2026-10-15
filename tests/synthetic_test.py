@@ -85,6 +85,15 @@ def test_change_tracking_sql():
     assert ps.enable_ct_table_sql(CAT[0]).endswith("ENABLE CHANGE_TRACKING WITH (TRACK_COLUMNS_UPDATED = OFF)")
 
 
+
+def test_jdbc_url_port_and_certificate():
+    assert ps.jdbc_url("db.example.com", "tenant1") == (
+        "jdbc:sqlserver://db.example.com:1433;databaseName=tenant1;encrypt=true;"
+        "trustServerCertificate=false;loginTimeout=60")
+    url = ps.jdbc_url("10.0.0.5", "tenant1", port=14330, trust_server_certificate=True)
+    assert url.startswith("jdbc:sqlserver://10.0.0.5:14330;") and "trustServerCertificate=true" in url
+    assert "hostNameInCertificate" not in url
+
 # ---- change generator + reconcile builders ---------------------------------------------------
 import synth_changes as ch  # noqa: E402
 

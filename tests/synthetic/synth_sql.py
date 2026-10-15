@@ -98,6 +98,14 @@ def batches(table: Table, scale_factor: float, batch_rows: int = 1_000_000) -> L
     return [(s, min(s + batch_rows, n) - 1) for s in range(0, n, batch_rows)]
 
 
+def jdbc_url(host: str, database: str, port: int = 1433, trust_server_certificate: bool = False) -> str:
+    """SQL Server JDBC URL for the synthetic notebooks: encrypted, works with Azure SQL, SQL Server on a VM
+    or on-premises. ``trust_server_certificate`` skips certificate validation (dev servers with a
+    self-signed certificate only), as the ingestion job's parameter of the same name does."""
+    return (f"jdbc:sqlserver://{host}:{int(port)};databaseName={database};encrypt=true;"
+            f"trustServerCertificate={'true' if trust_server_certificate else 'false'};loginTimeout=60")
+
+
 def enable_ct_database_sql(database: str, retention_days: int = 3) -> str:
     return (f"ALTER DATABASE [{database}] SET CHANGE_TRACKING = ON "
             f"(CHANGE_RETENTION = {retention_days} DAYS, AUTO_CLEANUP = ON)")

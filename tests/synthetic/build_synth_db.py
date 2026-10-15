@@ -9,7 +9,9 @@
 # MAGIC
 # MAGIC Runs on a cluster; talks to SQL Server through the JDBC driver bundled with Databricks Runtime
 # MAGIC (py4j `DriverManager`), one connection per worker thread. Credentials come from a secret holding
-# MAGIC JSON `{"user": ..., "password": ...}` — supply host/database/scope/key as widget values.
+# MAGIC JSON `{"user": ..., "password": ...}` — supply host/database/scope/key as widget values
+# MAGIC (`port` and `trust_server_certificate` are optional). Works with Azure SQL Database, SQL Server on a
+# MAGIC VM, or on-premises SQL Server; see `README.md` in this folder.
 
 # COMMAND ----------
 
@@ -23,11 +25,13 @@ if ("/Workspace" + nb_dir) not in sys.path:
 import synth_catalog as pc
 import synth_sql as ps
 
-for name, default in [("host", ""), ("database", ""), ("secret_scope", ""), ("secret_key", ""),
+for name, default in [("host", ""), ("port", "1433"), ("trust_server_certificate", "false"),
+                      ("database", ""), ("secret_scope", ""), ("secret_key", ""),
                       ("scale_factor", "0.1"), ("threads", "12"), ("seed", "42"),
                       ("batch_rows", "1000000"), ("ct_retention_days", "3")]:
     dbutils.widgets.text(name, default)
-W = {k: dbutils.widgets.get(k) for k in ["host", "database", "secret_scope", "secret_key", "scale_factor",
+W = {k: dbutils.widgets.get(k) for k in ["host", "port", "trust_server_certificate", "database",
+                                         "secret_scope", "secret_key", "scale_factor",
                                          "threads", "seed", "batch_rows", "ct_retention_days"]}
 assert W["host"] and W["database"] and W["secret_scope"] and W["secret_key"], "host/database/secret_* required"
 SF, THREADS, SEED, BATCH = float(W["scale_factor"]), int(W["threads"]), int(W["seed"]), int(W["batch_rows"])
@@ -35,8 +39,8 @@ SF, THREADS, SEED, BATCH = float(W["scale_factor"]), int(W["threads"]), int(W["s
 _creds = json.loads(dbutils.secrets.get(W["secret_scope"], W["secret_key"]))
 _USER = next(_creds[k] for k in ("user", "username", "login") if k in _creds)
 _PWD = next(_creds[k] for k in ("password", "pwd") if k in _creds)
-URL = (f"jdbc:sqlserver://{W['host']}:1433;databaseName={W['database']};encrypt=true;"
-       "trustServerCertificate=false;hostNameInCertificate=*.database.windows.net;loginTimeout=60")
+URL = ps.jdbc_url(W["host"], W["database"], int(W["port"] or 1433),
+                  W["trust_server_certificate"].strip().lower() == "true")
 JVM = spark._sc._gateway.jvm
 TRANSIENT = ("40613", "40197", "40501", "10928", "10929", "49918", "49919", "49920", "4060",
              "connection", "Connection reset", "timed out")

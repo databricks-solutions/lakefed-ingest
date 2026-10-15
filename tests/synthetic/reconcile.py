@@ -18,20 +18,23 @@ if ("/Workspace" + nb_dir) not in sys.path:
     sys.path.append("/Workspace" + nb_dir)
 import synth_catalog as sc
 import synth_changes as ch
+import synth_sql as ps
 
-for name, default in [("host", ""), ("database", ""), ("secret_scope", ""), ("secret_key", ""),
+for name, default in [("host", ""), ("port", "1433"), ("trust_server_certificate", "false"),
+                      ("database", ""), ("secret_scope", ""), ("secret_key", ""),
                       ("seed", "42"), ("bronze_schema", ""), ("manifest_table", ""), ("run_label", ""),
                       ("threads", "8")]:
     dbutils.widgets.text(name, default)
-W = {k: dbutils.widgets.get(k) for k in ["host", "database", "secret_scope", "secret_key", "seed",
+W = {k: dbutils.widgets.get(k) for k in ["host", "port", "trust_server_certificate", "database",
+                                         "secret_scope", "secret_key", "seed",
                                          "bronze_schema", "manifest_table", "run_label", "threads"]}
 assert W["host"] and W["database"] and W["secret_scope"] and W["secret_key"] and W["bronze_schema"], \
     "host/database/secret_*/bronze_schema required"
 _creds = json.loads(dbutils.secrets.get(W["secret_scope"], W["secret_key"]))
 _USER = next(_creds[k] for k in ("user", "username", "login") if k in _creds)
 _PWD = next(_creds[k] for k in ("password", "pwd") if k in _creds)
-URL = (f"jdbc:sqlserver://{W['host']}:1433;databaseName={W['database']};encrypt=true;"
-       "trustServerCertificate=false;hostNameInCertificate=*.database.windows.net;loginTimeout=60")
+URL = ps.jdbc_url(W["host"], W["database"], int(W["port"] or 1433),
+                  W["trust_server_certificate"].strip().lower() == "true")
 JVM = spark._sc._gateway.jvm
 _local = threading.local()
 
