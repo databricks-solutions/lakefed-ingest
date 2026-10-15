@@ -1,18 +1,43 @@
-# This is a Databricks asset bundle definition for lakefed_ingest.
+# Databricks asset bundle for lakefed_ingest (default version): ingestion that sweeps many tables per
+# job task on cluster compute, with control / checkpoint / telemetry state in Lakebase.
+# The original task-orchestrated (DBSQL warehouse) version is a separate bundle in job_orchestration/.
 # See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
 bundle:
-  name: lakefed_ingest
-  uuid: 988e06fe-e6fb-4a5f-9c09-47ebf5ea2636
+  name: lakefed_ingest_v2
+  uuid: bcc77784-ecf3-4a61-9436-2f404328a013
 
 include:
   - resources/*.yml
 
-# Variable declarations. These variables are assigned in the dev/prod targets below.
+# Variable declarations. Defaults suit most deployments; override per target.
 variables:
-  warehouse_id:
-    description: Lookup ID of an existing warehouse
-  concurrency:
-    description: Concurrency of for each tasks. Can be overridden during deployment.
+  # Compute (warehouse-free; jobs run on job clusters). The sweep is DRIVER-bound — per-table MERGE
+  # planning + Delta commits run on the driver — so size the driver up and keep workers modest.
+  # Defaults are Azure node types; override per target. Note: the defaults need ~32 cores (16-core
+  # driver + 2 x 8-core workers); a subscription with a small vCPU quota must use smaller nodes or
+  # raise the quota first.
+  node_type_id:
+    description: Worker (and setup single-node) node type.
+    default: Standard_D8ds_v5
+  driver_node_type_id:
+    description: Driver node type for the ingestion job (driver-bound; size this up first).
+    default: Standard_D16ds_v5
+  num_workers:
+    description: Worker count for the ingestion job cluster.
+    default: 2
+  # State (Lakebase) and credentials.
+  lakebase_instance:
+    description: Lakebase instance holding control, checkpoint, and telemetry state.
+    default: lakefed-ingest
+  lakebase_database:
+    description: Postgres database on the Lakebase instance.
+    default: lakefed_ingest
+  lakebase_catalog:
+    description: Unity Catalog catalog the Lakebase database is registered as (for DBSQL monitoring).
+    default: lakefed_ingest_lakebase
+  secret_scope:
+    description: Secret scope holding per-database source credentials (may be Azure Key Vault-backed).
+    default: lakefed_ingest
 
 targets:
   dev:
@@ -24,11 +49,7 @@ targets:
     default: true
     workspace:
       host: https://company-dev.cloud.databricks.com/
-    variables:
-      warehouse_id:
-        lookup:
-          warehouse: "Serverless Warehouse"
-      concurrency: 16
+
 
   prod:
     mode: production
@@ -37,7 +58,3 @@ targets:
       # Use fixed location to make sure we only have a single copy.
       # If this path results in an error, please make sure you have a recent version of the CLI installed.
       root_path: /Workspace/${bundle.name}
-    variables:
-      cluster_id: 0709-132523-cnhxf2p6
-      warehouse_id: 4b9b953939869799
-      concurrency: 16

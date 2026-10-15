@@ -2,32 +2,123 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+The repo holds **two versions** of a metadata-driven framework that ingests external databases into
+Databricks Delta tables. Each is its own Databricks Asset Bundle:
+
+| Version | Location | Bundle | Orchestration / compute / state |
+|---|---|---|---|
+| **Default** | repo root (`databricks.yml`, `resources/`, `src/lakefed_ingest/`, `tests/`) | `lakefed_ingest_v2` | One job task per `task_collection`, in-process threads + FAIR pools on a job cluster; Lakebase (Postgres) state; Spark JDBC; source adapters (SQL Server, Oracle, PostgreSQL, MySQL) + load strategies (SQL Server Change Tracking and watermark cursor, full reload) |
+| **Job orchestration** | `job_orchestration/` | `lakefed_ingest` | Jobs `for_each` tasks; SQL warehouse + notebooks; Delta control table; Lakehouse Federation / `remote_query` |
+
+Never run bundle commands for one version from the other's directory. Local bundle state
+(`.databricks/bundle/<target>/`) is keyed by target only, so each version keeps its own cache in its
+own directory.
+
 ## Commands
 
 ### Setup
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-dev.txt
+pip install pytest            # unit tests need nothing else; tests/validation_test.py also needs pytds
 ```
 
 ### Run Tests
 ```bash
-pytest                        # all tests
-pytest tests/udtf_test.py     # single file
-pytest tests/udtf_test.py::test_eval  # single test
+pytest                                   # both versions (pytest.ini testpaths)
+pytest tests                             # default version
+pytest tests/planner_test.py::test_name  # single test
+pytest job_orchestration/tests           # job orchestration version
 ```
 
 ### Deploy
 ```bash
-databricks bundle deploy                        # dev (default target)
+# Default version (repo root)
+databricks bundle deploy -t <target> -p <profile>
+databricks bundle run lakefed_ingest_setup -t <target> -p <profile>   # apply/migrate Lakebase schema
+databricks bundle run lakefed_ingest -t <target> -p <profile> --params task_collection=<name>
+
+# Job orchestration version
+cd job_orchestration
 databricks bundle deploy --target prod --profile PROD
 databricks bundle run --target prod --profile PROD
 ```
 
-## Architecture
+## Default version (repo root)
 
-This is a **metadata-driven ingestion framework** that moves data from external databases into Databricks Delta tables using Lakehouse Federation. All execution happens in Databricks Workflows (SQL Warehouse + notebooks) — there is no Python application server.
+Warehouse-free: everything runs on cluster compute. No UC connections — source reads use Spark
+JDBC with per-database credentials (JSON `{user,password}`) from a secret scope named by
+`control.secret_key`. See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase_schema.md`.
+
+### Lakebase state (`src/lakefed_ingest/lakebase_schema.sql`, schema `lakefed_ingest`)
+- `control` — one row per (source database, table): `task_collection`, `src_type` (source adapter:
+  `sqlserver` | `oracle` | `postgresql` | `mysql`), `src_host`/`src_port`, `src_database`, `src_schema`,
+  `src_table`, `secret_key`, `primary_key`, `select_list` (explicit columns), sink, `load_type` (load
+  strategy: `ct` | `full` | `cursor` (SQL Server; placeholder elsewhere); `cdc` is a placeholder), partitioned-seed settings,
+  `cursor_column`, `cdc_capture_instance`, `jdbc_options` (JSON), `client_id` (optional: consolidated
+  sink shared by many source DBs; written to sink column `__client_id__`). CHECK constraints enforce valid combos; a unique index allows one
+  row per (sink, client_id).
+- `checkpoint` — generic: `strategy` + `position` (text; CT version for `ct`, JSON {col,type,value} for
+  `cursor`), phase (`seeding → incremental` for ct and cursor, `loaded` for full), status, freshness,
+  `ct_begin_version`. `reseed_queue` (ct, cursor).
+- `ingest_run`, `ingest_event` — telemetry (`run_id`, `position_from/to`). The DB is registered in UC
+  (default catalog `lakefed_ingest_lakebase`) for DBSQL monitoring.
+- DDL is applied by `apply_lakebase_schema.ipynb`, which splits on `;` — no `DO $$` blocks. Migrations
+  must be idempotent (`if not exists`, `drop constraint if exists`). Renames (no IF EXISTS form in
+  Postgres) go in `state_store.RENAMES`; the applier runs only the pending ones before the DDL.
+
+### Jobs (`resources/`)
+- `lakefed_ingest` → task `ingest` → `ingest.ipynb`: one run ingests a `task_collection`. Parameters:
+  `task_collection`, `parallelism` (single budget of concurrent query units), `secret_scope`,
+  `detection_chunk`, `trust_server_certificate`, `db_instance`, `db_name`.
+- `lakefed_ingest_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
+  instance, its UC catalog, and the secret scope (`database_instances.lakebase`,
+  `database_catalogs.lakebase_catalog`, `secret_scopes.secret_scope`).
+
+### Run flow (`ingest.ipynb`)
+1. Per-collection Lakebase advisory lock (duplicate run exits `skipped`).
+2. Plan (`planner.py`, pure): unsupported (`src_type`, `load_type`) pair → fail per table (stage
+   `plan`); `full` → reload; `cursor` → `cursor_seed` / schema_reseed / `cursor` (per-table high
+   watermark, `cursor_engine`); CT tables → seed / schema_reseed / detection candidate; group by
+   (source database, load_type); capture CT current version once per DB → fast exit if all checkpoints current,
+   else batched detection (`detection_chunk` tables per query); failed chunk → per-table fallback;
+   checkpoint ahead of current version → reseed; CT disabled on the DB → fail loudly. Per-table CT
+   status (one `sys.change_tracking_tables` query per DB, before the fast exit): CT off on a table,
+   retention lapsed, or `begin_version` ≠ `checkpoint.ct_begin_version` (CT re-enabled) → reseed.
+3. Unchanged tables: one bulk Lakebase checkpoint advance.
+4. Per-table worker: full reload (`load_strategies.FullStrategy` → `ct_engine.seed`), seed (capture V0
+   before seed; partitioned seed via staging + atomic swap),
+   reseed enqueue, or CHANGETABLE read + idempotent PK MERGE (schema evolution) then checkpoint
+   advance. The change read carries a sessionInitStatement retention guard.
+
+### Modules
+| File | Purpose |
+|---|---|
+| `src/lakefed_ingest/ct_engine.py` | Spark JDBC source ops: CT versions, detection, read + MERGE, seed, sink DDL |
+| `src/lakefed_ingest/source_adapters.py` | Per-engine dialect (`src_type`): JDBC URL/driver/options, quoting, literals, select/size/bounds SQL |
+| `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix (+ placeholder pairs); cdc placeholder |
+| `src/lakefed_ingest/cursor_engine.py` | Cursor (watermark) strategy, SQL Server: type lookup, high watermark (rowversion capped below MIN_ACTIVE_ROWVERSION), typed literals, (lo, hi] read + upsert MERGE |
+| `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning (no Spark/DB; unit-tested with fakes) |
+| `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget |
+| `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |
+| `src/lakefed_ingest/state_store.py` | Lakebase accessor (psycopg, SDK-minted OAuth token) + pure helpers |
+| `tests/conftest.py` | Puts `src/lakefed_ingest` on `sys.path` |
+| `tests/synthetic/` | Synthetic SQL Server DB generator, change generator, reconcile |
+| `tools/source_profile.sql` | Read-only SQL Server profiling script for sizing |
+
+### Engineering rules
+- No `.cache()` / `.persist()`; read each source once per cycle (Delta MERGE materializes the JDBC
+  source itself).
+- No SQL warehouse dependency in the default version.
+- Checkpoints advance only after the Delta commit (at-least-once + idempotent MERGE).
+- Every sink write must be client-scoped when `client_id` is set: tag rows (`ct_engine._tag`), write
+  `write_columns(cfg)`, MERGE on `merge_keys(cfg)`, overwrite via `insert_overwrite_sql(..., cfg)`
+  (REPLACE WHERE client_id), stage via `staging_table_name(sink, cfg)`. Wrap writes in
+  `with_write_retry` (Delta conflict retry, exponential backoff).
+
+## Job orchestration version (`job_orchestration/`)
+
+All paths in this section are relative to `job_orchestration/`.
 
 ### Control Table
 
