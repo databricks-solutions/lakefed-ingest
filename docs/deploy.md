@@ -106,8 +106,9 @@ databricks bundle run lakefed_ingest_setup -t dev   # idempotent; re-run after u
    need `cursor_column` (rowversion recommended). To consolidate many source databases into shared
    sink tables, give their rows the same sink and a distinct `client_id` each (see "Consolidated
    sinks" in the README).
-   - `ct` tables need Change Tracking enabled on the database and the table, a primary key,
-     `ALLOW_SNAPSHOT_ISOLATION ON`, and a `CHANGE_RETENTION` longer than the expected seed time.
+   - `ct` tables need Change Tracking enabled on the database and the table, a primary key, and a
+     `CHANGE_RETENTION` longer than the expected seed time. Snapshot isolation is not required (the
+     reads don't use it).
 5. **Oracle / MySQL sources only: JDBC driver.** Databricks Runtime bundles the SQL Server and
    PostgreSQL drivers but not Oracle's or MySQL's. Uncomment the matching Maven library in
    `resources/lakefed_ingest.yml` (pin an approved version) and redeploy. Connection notes:

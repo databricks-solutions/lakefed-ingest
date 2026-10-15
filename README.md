@@ -305,7 +305,7 @@ sink and reseeds that table so historical rows are backfilled. New sinks get
 | Cluster → Lakebase network path (port 5432) | Workspace IP access list must allow cluster egress, or use Private Link. Verify first. |
 | Per-database source credentials | One JSON secret `{"user","password"}` per source database, named by `control.secret_key`, in the `secret_scope` (may be Azure Key Vault-backed) |
 | Cluster → source network path (SQL Server 1433, Oracle 1521, PostgreSQL 5432, MySQL 3306) | Customer networking |
-| `ct` source tables: CT enabled + primary key, `ALLOW_SNAPSHOT_ISOLATION ON`, `CHANGE_RETENTION` longer than the seed time | Source-side configuration |
+| `ct` source tables: CT enabled + primary key, `CHANGE_RETENTION` longer than the seed time (snapshot isolation is not required) | Source-side configuration |
 | Oracle / MySQL sources: JDBC driver library on the job cluster | Uncomment it in `resources/lakefed_ingest.yml` |
 
 No UC connections, `remote_query`, or SQL warehouse are needed.
