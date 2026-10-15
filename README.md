@@ -1,4 +1,4 @@
-# lakefed_ingest
+# Lakehouse Federation Ingestion Framework
 
 Metadata-driven ingestion from external databases into Delta tables on Databricks. This repo holds
 two versions:
