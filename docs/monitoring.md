@@ -121,6 +121,44 @@ WHERE run_id = :run_id AND status = 'retried'
 ORDER BY finished_at;
 ```
 
+### Scheduled collections
+
+Alert-ready queries over the schedule tables (written by the operations app). Collections whose
+latest run failed:
+```sql
+SELECT m.task_collection, s.name AS schedule, r.run_id, r.started_at, r.failed
+FROM lakefed_ingest_lakebase.lakefed_ingest.schedule_member m
+JOIN lakefed_ingest_lakebase.lakefed_ingest.schedule s ON s.id = m.schedule_id
+JOIN (SELECT *, row_number() OVER (PARTITION BY task_collection ORDER BY started_at DESC) AS rn
+      FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_run) r
+  ON r.task_collection = m.task_collection AND r.rn = 1
+WHERE m.removed_at IS NULL AND s.deleted_at IS NULL AND NOT s.paused AND r.status = 'failed';
+```
+
+Runs longer than their schedule's cadence in the last 24 hours (the next trigger was skipped):
+```sql
+SELECT r.task_collection, s.name AS schedule, s.cadence_minutes, r.run_id, r.started_at,
+       round(timestampdiff(SECOND, r.started_at, coalesce(r.finished_at, current_timestamp())) / 60, 1) AS minutes
+FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_run r
+JOIN lakefed_ingest_lakebase.lakefed_ingest.schedule_member m ON m.task_collection = r.task_collection AND m.removed_at IS NULL
+JOIN lakefed_ingest_lakebase.lakefed_ingest.schedule s ON s.id = m.schedule_id AND s.deleted_at IS NULL
+WHERE r.started_at > current_timestamp() - INTERVAL 24 HOURS
+  AND timestampdiff(SECOND, r.started_at, coalesce(r.finished_at, current_timestamp())) > s.cadence_minutes * 60
+ORDER BY r.started_at DESC;
+```
+
+Scheduled collections with no run started for two cadences (missed or skipped triggers, or a wrapper job
+that is missing or paused outside the app):
+```sql
+SELECT m.task_collection, s.name AS schedule, s.cadence_minutes, max(r.started_at) AS last_started
+FROM lakefed_ingest_lakebase.lakefed_ingest.schedule_member m
+JOIN lakefed_ingest_lakebase.lakefed_ingest.schedule s ON s.id = m.schedule_id
+LEFT JOIN lakefed_ingest_lakebase.lakefed_ingest.ingest_run r ON r.task_collection = m.task_collection
+WHERE m.removed_at IS NULL AND s.deleted_at IS NULL AND NOT s.paused
+GROUP BY m.task_collection, s.name, s.cadence_minutes
+HAVING coalesce(max(r.started_at), TIMESTAMP '1970-01-01') < current_timestamp() - make_interval(0, 0, 0, 0, 0, s.cadence_minutes * 2, 0);
+```
+
 ## Optional: durable history beyond the OLTP store
 
 Lakebase is the live store; if you want run history retained in Delta (e.g. for long-term
@@ -143,9 +181,8 @@ WHEN NOT MATCHED THEN INSERT *;
 Schedule either as a DBSQL query (or a one-statement task) at whatever cadence durable history
 needs. This is optional — the UC-federated reads above work without it.
 
-## Future: a Databricks App
+## The operations app
 
-Both Lakebase tables are app-ready — a lightweight Databricks App can read them (via the same UC
-catalog) for a live operations dashboard (in-flight tables, failures-by-stage, per-table freshness,
-sweep throughput) without any change to the ingestion code. Out of scope for now; noted as a
-follow-on.
+The optional operations app (`app/`) reads the same tables for a live view: collection health, runs in
+progress, a timeline of runs and skipped triggers, schedules with overrun and SLA warnings, and failed
+tables. See `app/README.md`.

@@ -408,7 +408,7 @@ create table if not exists lakefed_ingest.control_change (
     id              bigserial   primary key,
     changed_at      timestamptz not null default now(),
     changed_by      text,                         -- signed-in user (app) or NULL
-    action          text        not null,         -- add | register | edit | enable | disable | reseed
+    action          text        not null,         -- add | register | edit | enable | disable | reseed | schedule_*
     control_id      bigint,                       -- -> control.id
     task_collection text,                         -- the row's collection after the change
     field           text,                         -- edited column (NULL for whole-row actions)
@@ -421,3 +421,44 @@ create index if not exists control_change_control_idx
     on lakefed_ingest.control_change (control_id, changed_at);
 create index if not exists control_change_time_idx
     on lakefed_ingest.control_change (changed_at);
+
+-- ---- Schedules (written by the operations app) -------------------------------------------
+-- A schedule runs one or more collections at a fixed cadence. The app turns each member
+-- (schedule, collection) into a small Databricks job (a cron schedule and one run_job task that
+-- starts the ingestion job with that collection). Soft deletes: the app has no DELETE privilege.
+create table if not exists lakefed_ingest.schedule (
+    id              bigserial   primary key,
+    name            text        not null,
+    cadence_minutes int         not null,                     -- divides 1440: 5 .. 1440
+    timezone        text        not null default 'UTC',
+    parameters      jsonb       not null default '{}'::jsonb, -- ingestion job parameters, e.g. parallelism
+    job_variant     text        not null default 'default',   -- which ingestion job to start
+    stagger         boolean     not null default true,        -- spread members' start times over the cadence
+    paused          boolean     not null default false,
+    notify_emails   text,                                     -- comma-separated, on failure
+    created_by      text,
+    created_at      timestamptz not null default now(),
+    updated_at      timestamptz not null default now(),
+    deleted_at      timestamptz
+);
+create unique index if not exists schedule_name_uq
+    on lakefed_ingest.schedule (lower(name)) where deleted_at is null;
+alter table lakefed_ingest.schedule drop constraint if exists valid_schedule_cadence;
+alter table lakefed_ingest.schedule add constraint valid_schedule_cadence check (
+    cadence_minutes in (5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 720, 1440)
+);
+
+create table if not exists lakefed_ingest.schedule_member (
+    id              bigserial   primary key,
+    schedule_id     bigint      not null references lakefed_ingest.schedule (id),
+    task_collection text        not null,
+    offset_minutes  int         not null default 0,           -- start offset within the cadence
+    job_id          bigint,                                   -- the Databricks job the app created
+    synced_at       timestamptz,
+    sync_error      text,
+    removed_at      timestamptz
+);
+create unique index if not exists schedule_member_uq
+    on lakefed_ingest.schedule_member (schedule_id, task_collection) where removed_at is null;
+create index if not exists schedule_member_collection_idx
+    on lakefed_ingest.schedule_member (task_collection);

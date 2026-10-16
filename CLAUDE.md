@@ -12,7 +12,9 @@ Databricks Delta tables. Each is its own Databricks Asset Bundle:
 
 An optional operations app (Databricks App: FastAPI backend + React/TypeScript frontend) for the
 default version is its own bundle in `app/` (`lakefed_ingest_app`); see `app/README.md`. SQL lives in
-`app/src/queries.py` (unit-tested); Databricks Apps builds the frontend at deploy time.
+`app/src/queries.py` (unit-tested); Databricks Apps builds the frontend at deploy time. Schedules
+(`app/src/schedules.py`): one wrapper job per (schedule, collection), a cron + `run_job` task that starts the
+ingestion job with `task_collection`; `max_concurrent_runs` 1, no queue (overruns skip triggers).
 
 Never run bundle commands for one version from the other's directory. Local bundle state
 (`.databricks/bundle/<target>/`) is keyed by target only, so each version keeps its own cache in its
@@ -72,6 +74,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `ct_begin_version`, `pending_position`/`pending_run_id` (an append in flight). `reseed_queue` (ct, cursor).
 - `ingest_run`, `ingest_event` — telemetry (`run_id`, `position_from/to`). The DB is registered in UC
   (default catalog `lakefed_ingest_lakebase`) for DBSQL monitoring.
+- `schedule`, `schedule_member` — written by the operations app (cadence, members, wrapper `job_id`);
+  soft deletes (`deleted_at`, `removed_at`): the app has no DELETE privilege.
 - DDL is applied by `StateStore.migrate` (from `apply_lakebase_schema.ipynb`, and from `ingest.ipynb`
   when `schema_version` is behind `state_store.SCHEMA_VERSION`, so upgrades are deploy-only): one
   transaction, split on `;` — no `DO $$` blocks, no `CREATE INDEX CONCURRENTLY`. Migrations must be

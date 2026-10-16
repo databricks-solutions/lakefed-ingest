@@ -56,9 +56,22 @@ order by tb.task_collection"""
 
 
 def running_runs_sql() -> str:
-    """Runs still marked running (newest first)."""
-    return (f"select run_id, task_collection, job_run_id, started_at, parallelism "
-            f"from {SCHEMA}.ingest_run where status = 'running' order by started_at desc")
+    """Runs still marked running (newest first), with progress: tables finished so far (unchanged tables
+    are bulk-advanced without events, so these count tables that needed work) and elapsed time against
+    the collection's typical run (median of its last 20 finished runs)."""
+    return f"""
+select r.run_id, r.task_collection, r.job_run_id, r.started_at, r.parallelism,
+       round(extract(epoch from (now() - r.started_at)))::int as elapsed_s,
+       (select count(*) from {SCHEMA}.ingest_event e where e.run_id = r.run_id and e.status = 'ok')      as tables_ok,
+       (select count(*) from {SCHEMA}.ingest_event e where e.run_id = r.run_id and e.status = 'failed')  as tables_failed,
+       (select count(*) from {SCHEMA}.ingest_event e where e.run_id = r.run_id and e.status = 'running') as tables_running,
+       (select round(percentile_cont(0.5) within group (order by extract(epoch from (x.finished_at - x.started_at)))::numeric)
+          from (select started_at, finished_at from {SCHEMA}.ingest_run x
+                where x.task_collection = r.task_collection and x.finished_at is not null and x.status <> 'skipped'
+                order by x.started_at desc limit 20) x)                                                as typical_s
+from {SCHEMA}.ingest_run r
+where r.status = 'running'
+order by r.started_at desc"""
 
 
 # ---- runs / events ------------------------------------------------------------------------------
@@ -543,3 +556,112 @@ def checkpoint_for_sql() -> str:
     """One table's checkpoint. Param: control_id."""
     return (f"select phase, status, position, strategy, detail, last_success_at, updated_at, source_identity, "
             f"sink_identity, merge_key from {SCHEMA}.checkpoint where control_id = %s")
+
+
+# ---- schedules ----------------------------------------------------------------------------------
+
+SCHEDULE_FIELDS = ("name", "cadence_minutes", "timezone", "parameters", "job_variant", "stagger", "paused",
+                   "notify_emails")
+
+
+def schedules_sql() -> str:
+    """Active schedules, by name."""
+    return (f"select id, {', '.join(SCHEDULE_FIELDS)}, created_by, created_at, updated_at, deleted_at "
+            f"from {SCHEMA}.schedule where deleted_at is null order by lower(name)")
+
+
+def schedule_sql() -> str:
+    """One schedule (deleted or not). Param: id."""
+    return (f"select id, {', '.join(SCHEDULE_FIELDS)}, created_by, created_at, updated_at, deleted_at "
+            f"from {SCHEMA}.schedule where id = %s")
+
+
+def schedule_members_sql() -> str:
+    """Members of the given schedules, active and removed. Param: list of schedule ids."""
+    return (f"select id, schedule_id, task_collection, offset_minutes, job_id, synced_at, sync_error, removed_at "
+            f"from {SCHEMA}.schedule_member where schedule_id = any(%s) order by schedule_id, task_collection")
+
+
+def insert_schedule_sql() -> str:
+    cols = SCHEDULE_FIELDS + ("created_by",)
+    vals = ", ".join("%s::jsonb" if c == "parameters" else "%s" for c in cols)
+    return f"insert into {SCHEMA}.schedule ({', '.join(cols)}) values ({vals}) returning id"
+
+
+def update_schedule_sql(fields: List[str]) -> str:
+    bad = [f for f in fields if f not in SCHEDULE_FIELDS]
+    if bad or not fields:
+        raise ValueError(f"not schedule fields: {bad}")
+    sets = ", ".join(f"{f} = %s::jsonb" if f == "parameters" else f"{f} = %s" for f in fields)
+    return f"update {SCHEMA}.schedule set {sets}, updated_at = now() where id = %s and deleted_at is null"
+
+
+def delete_schedule_sql() -> str:
+    """Soft delete (the app has no DELETE privilege). Param: id."""
+    return f"update {SCHEMA}.schedule set deleted_at = now(), updated_at = now() where id = %s and deleted_at is null"
+
+
+def insert_member_sql() -> str:
+    return (f"insert into {SCHEMA}.schedule_member (schedule_id, task_collection, offset_minutes) "
+            f"values (%s, %s, %s) returning id")
+
+
+def update_member_offset_sql() -> str:
+    return f"update {SCHEMA}.schedule_member set offset_minutes = %s where id = %s"
+
+
+def remove_members_sql() -> str:
+    """Soft-remove members (their jobs are deleted by the next sync). Param: list of member ids."""
+    return f"update {SCHEMA}.schedule_member set removed_at = now() where id = any(%s) and removed_at is null"
+
+
+def member_synced_sql() -> str:
+    """Record a sync result. Params: job_id, sync_error, member id."""
+    return f"update {SCHEMA}.schedule_member set job_id = %s, sync_error = %s, synced_at = now() where id = %s"
+
+
+def collection_run_stats_sql() -> str:
+    """Per collection: the latest run, run-time percentiles over 7 days, runs and failures in 24 hours,
+    and the strictest freshness SLA among its enabled tables. Param: list of collections (4 times)."""
+    return f"""
+with r as (
+    select task_collection, status, started_at, finished_at,
+           extract(epoch from (finished_at - started_at)) as dur_s
+    from {SCHEMA}.ingest_run
+    where task_collection = any(%s) and started_at > now() - interval '7 days'
+),
+agg as (
+    select task_collection,
+           round(percentile_cont(0.95) within group (order by dur_s) filter (where finished_at is not null and status <> 'skipped')::numeric) as p95_s,
+           round(percentile_cont(0.5) within group (order by dur_s) filter (where finished_at is not null and status <> 'skipped')::numeric) as p50_s,
+           count(*) filter (where started_at > now() - interval '24 hours')                      as runs_24h,
+           count(*) filter (where started_at > now() - interval '24 hours' and status = 'failed') as failed_24h,
+           count(*) filter (where started_at > now() - interval '24 hours' and status = 'skipped') as lock_skipped_24h
+    from r group by task_collection
+),
+last as (
+    select distinct on (task_collection) task_collection, run_id as last_run_id, status as last_status,
+           started_at as last_started, finished_at as last_finished,
+           round(extract(epoch from (coalesce(finished_at, now()) - started_at)))::int as last_duration_s
+    from {SCHEMA}.ingest_run where task_collection = any(%s)
+    order by task_collection, started_at desc
+),
+sla as (
+    select task_collection, min(freshness_sla_minutes) as min_sla_minutes, count(*) as enabled_tables
+    from {SCHEMA}.control where task_enabled and task_collection = any(%s) group by task_collection
+)
+select c.task_collection, l.last_run_id, l.last_status, l.last_started, l.last_finished, l.last_duration_s,
+       a.p50_s, a.p95_s, coalesce(a.runs_24h, 0) as runs_24h, coalesce(a.failed_24h, 0) as failed_24h,
+       coalesce(a.lock_skipped_24h, 0) as lock_skipped_24h, s.min_sla_minutes, coalesce(s.enabled_tables, 0) as enabled_tables
+from unnest(%s::text[]) as c(task_collection)
+left join last l on l.task_collection = c.task_collection
+left join agg a on a.task_collection = c.task_collection
+left join sla s on s.task_collection = c.task_collection
+order by c.task_collection"""
+
+
+def timeline_runs_sql() -> str:
+    """Runs overlapping a window. Params: window end, window start."""
+    return (f"select run_id, task_collection, status, started_at, finished_at, job_run_id, ok, failed, skipped "
+            f"from {SCHEMA}.ingest_run "
+            f"where started_at < %s and coalesce(finished_at, now()) > %s order by task_collection, started_at")

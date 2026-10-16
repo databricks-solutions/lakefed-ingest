@@ -16,6 +16,7 @@ as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitor
 | `ingest_event` | **Telemetry.** One row per table per run | The ingestion job |
 | `control_change` | **Audit.** Every change the operations app makes to control rows | The operations app |
 | `discovery`, `discovered_table` | **Onboarding.** Tables found by the discovery job, with recommended control-row settings | The discovery job |
+| `schedule`, `schedule_member` | **Scheduling.** Cadences for running collections, and the wrapper job per (schedule, collection) | The operations app |
 | `schema_version` | **Bookkeeping.** Schema versions applied | The setup job, or the first ingestion run after an upgrade |
 
 ```mermaid
@@ -237,7 +238,9 @@ when the watermark hasn't moved.
 
 Written by the operations app in the same transaction as each change. Columns:
 - `changed_at`, `changed_by` (the signed-in user);
-- `action`: `add`, `register`, `edit`, `enable`, `disable` or `reseed`;
+- `action`: `add`, `register`, `edit`, `enable`, `disable` or `reseed`, or for schedules
+  `schedule_create`, `schedule_edit`, `schedule_pause`, `schedule_resume`, `schedule_delete`,
+  `schedule_sync`;
 - `control_id`, and `task_collection` (the row's collection after the change);
 - `field`, `old_value`, `new_value`, for edits;
 - `reseed_reason`, when the change flipped the table to seeding;
@@ -260,6 +263,16 @@ in the operations app's Bulk import page.
   decided at review from a size threshold.
 
 Nothing here is used by ingestion; control rows are created only when a reviewer registers tables.
+
+## `schedule` and `schedule_member` — scheduling
+
+Written by the operations app (see "Schedules" in `app/README.md`); the ingestion job doesn't read them.
+- **`schedule`:** `name` (unique among active schedules), `cadence_minutes` (5, 10, 15, 20, 30, 60, 120,
+  180, 240, 360, 720 or 1440), `timezone`, `parameters` (ingestion job parameters, JSON), `job_variant`,
+  `stagger`, `paused`, `notify_emails`, who created it and when, and `deleted_at` (soft delete).
+- **`schedule_member`:** one row per (schedule, collection): `offset_minutes` (start offset within the
+  cadence), `job_id` (the wrapper job the app created), `synced_at`, `sync_error`, and `removed_at`
+  (soft remove; the next sync deletes the wrapper job).
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.

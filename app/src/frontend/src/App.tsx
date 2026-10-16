@@ -9,13 +9,16 @@ import Jobs from "./pages/Jobs";
 import AddTable from "./pages/AddTable";
 import BulkImport from "./pages/BulkImport";
 import Changes from "./pages/Changes";
+import Schedules from "./pages/Schedules";
+import Timeline from "./pages/Timeline";
 
 interface Settings { config?: Config }
 const SettingsContext = createContext<Settings>({});
 export const useSettings = () => useContext(SettingsContext);
 
 const NAV = [
-  ["/overview", "Overview"], ["/runs", "Runs"], ["/tables", "Tables"], ["/jobs", "Jobs"],
+  ["/overview", "Overview"], ["/runs", "Runs"], ["/timeline", "Timeline"], ["/schedules", "Schedules"],
+  ["/tables", "Tables"], ["/jobs", "Jobs"],
   ["/add", "Add table"], ["/bulk", "Bulk import"], ["/changes", "Changes"],
 ] as const;
 
@@ -49,6 +52,8 @@ export default function App() {
             <Route path="/runs" element={<Runs />} />
             <Route path="/tables" element={<Tables />} />
             <Route path="/jobs" element={<Jobs />} />
+            <Route path="/schedules" element={<Schedules />} />
+            <Route path="/timeline" element={<Timeline />} />
             <Route path="/add" element={<AddTable />} />
             <Route path="/bulk" element={<BulkImport />} />
             <Route path="/changes" element={<Changes />} />

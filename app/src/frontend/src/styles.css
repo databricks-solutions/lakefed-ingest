@@ -59,3 +59,12 @@ p.small { margin: 0 0 10px; }
 .drawer h3 { font-size: 14px; margin: 18px 0 8px; }
 label.changed { color: var(--accent) !important; font-weight: 600; }
 label.changed input, label.changed select { border-color: var(--accent); }
+.checklist { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 4px 12px; max-height: 260px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-top: 6px; }
+.checklist label.checkbox { font-size: 13px; }
+.checklist .muted { margin-left: 4px; }
+.timeline { overflow-x: auto; padding: 8px; }
+.legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 14px; height: 10px; border-radius: 2px; margin-left: 8px; }
+.legend i.tick { width: 1px; height: 12px; background: #9aa5b1; }
+.legend .skipmark { color: var(--bad); margin-left: 8px; }

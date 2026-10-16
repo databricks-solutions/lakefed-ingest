@@ -37,7 +37,21 @@ export default function Overview() {
           options={{ onRowClicked: (e) => nav(`/tables?collection=${encodeURIComponent(e.data.task_collection)}`) }} />
       </Section>
       {!!ov.data?.running.length && (
-        <Section title="Runs in progress"><Grid rows={ov.data.running} height={200} /></Section>
+        <Section title="Runs in progress">
+          <p className="muted small">Tables counts include only tables that needed work (unchanged tables are skipped in bulk).
+            A run is flagged when it has taken more than twice its collection's typical time.</p>
+          <Grid rows={ov.data.running.map((r) => ({
+            collection: r.task_collection, run_id: r.run_id, started: r.started_at,
+            elapsed: `${Math.round(r.elapsed_s / 6) / 10} min`,
+            typical: r.typical_s ? `${Math.round(r.typical_s / 6) / 10} min` : "",
+            status: r.typical_s && r.elapsed_s > 2 * Math.max(r.typical_s, 60) ? "longer than usual" : "running",
+            tables_done: r.tables_ok, tables_failed: r.tables_failed, tables_in_progress: r.tables_running,
+            job_run_id: r.job_run_id,
+          }))} height={200} columns={autoColumns([{ collection: 1, run_id: 1, started: 1, elapsed: 1, typical: 1, status: 1,
+            tables_done: 1, tables_failed: 1, tables_in_progress: 1, job_run_id: 1 }], {
+            status: { cellRenderer: (p: any) => <Badge value={p.value === "running" ? "running" : "failed"} /> },
+          })} />
+        </Section>
       )}
       <Section title="Failed tables in the last 24 hours">
         <ErrorBox error={errors.error} />

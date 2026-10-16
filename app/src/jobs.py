@@ -12,6 +12,24 @@ from lakebase import workspace
 INGEST_JOB_ID = os.environ.get("INGEST_JOB_ID")
 SETUP_JOB_ID = os.environ.get("SETUP_JOB_ID")
 DISCOVER_JOB_ID = os.environ.get("DISCOVER_JOB_ID")
+# Group given CAN_VIEW on the wrapper jobs the app creates for schedules (blank = owner and admins only).
+SCHEDULE_JOB_VIEW_GROUP = os.environ.get("SCHEDULE_JOB_VIEW_GROUP", "users") or None
+
+
+def ingest_variants() -> dict:
+    """Ingestion jobs a schedule can start: 'default' (INGEST_JOB_ID), plus INGEST_JOB_ID_<NAME> variants
+    (e.g. a larger cluster). The app needs CAN_MANAGE_RUN on each (an app `job` resource)."""
+    out = {"default": INGEST_JOB_ID} if INGEST_JOB_ID else {}
+    for k, v in os.environ.items():
+        if k.startswith("INGEST_JOB_ID_") and v:
+            out[k[len("INGEST_JOB_ID_"):].lower()] = v
+    return out
+
+
+def schedule_client():
+    """Jobs API client for schedule sync (plain JSON settings through the SDK's API client)."""
+    import schedules
+    return schedules.JobsClient(workspace().api_client)
 
 
 def _ts(ms) -> Optional[str]:

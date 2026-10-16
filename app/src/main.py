@@ -15,6 +15,7 @@ import json
 import os
 import uuid
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -25,6 +26,7 @@ from pydantic import BaseModel, Field
 import jobs
 import lakebase as db
 import queries as q
+import schedules as sch
 
 app = FastAPI(title="lakefed_ingest operations", docs_url="/api/docs", openapi_url="/api/openapi.json")
 STATIC = Path(__file__).parent / "static"
@@ -368,6 +370,292 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     return {"selected": len(chosen), "counts": counts, "results": results}
+
+
+# ---- schedules ----------------------------------------------------------------------------------
+
+class ScheduleBody(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    cadence_minutes: int
+    timezone: str = "UTC"
+    parameters: dict = {}
+    job_variant: str = "default"
+    stagger: bool = True
+    paused: bool = False
+    notify_emails: Optional[str] = None
+    members: List[str] = Field(min_length=1)
+
+
+def _variant_job_id(variant: str) -> int:
+    jid = jobs.ingest_variants().get(variant or "default")
+    if not jid:
+        raise HTTPException(503, f"no ingestion job configured for variant '{variant}'")
+    return int(jid)
+
+
+def _load_schedule(sid: int):
+    rows = db.query(q.schedule_sql(), (int(sid),))
+    if not rows:
+        raise HTTPException(404, f"schedule {sid} not found")
+    members = db.query(q.schedule_members_sql(), ([int(sid)],))
+    return rows[0], members
+
+
+def _validate_schedule(body: ScheduleBody):
+    known = [r["task_collection"] for r in db.query(q.collections_sql())]
+    errs = sch.validate(body.model_dump(), known, jobs.ingest_variants())
+    if errs:
+        raise HTTPException(422, {"errors": errs})
+
+
+def _sync(sid: int, user: str) -> List[dict]:
+    """Bring the schedule's wrapper jobs in line with Lakebase and record the results."""
+    s, members = _load_schedule(sid)
+    active = [m for m in members if m["removed_at"] is None]
+    # Removed members whose job wasn't deleted yet (synced before removal, or never).
+    ts = lambda v: datetime.fromisoformat(v) if isinstance(v, str) else v
+    removed = [m for m in members if m["removed_at"] is not None and m["job_id"]
+               and (m["synced_at"] is None or ts(m["synced_at"]) < ts(m["removed_at"]))]
+    results = sch.sync(s, active, removed, jobs.schedule_client(), _variant_job_id(s["job_variant"]),
+                       jobs.SCHEDULE_JOB_VIEW_GROUP)
+    by_coll = {m["task_collection"]: m for m in active + removed}
+    batch = uuid.uuid4().hex[:12]
+    with db.transaction() as cur:
+        for r in results:
+            m = by_coll[r.task_collection]
+            cur.execute(q.member_synced_sql(), (r.job_id, r.detail if r.action == "error" else None, m["id"]))
+            if r.action in ("created", "updated", "deleted"):
+                _log(cur, user, "schedule_sync", None, r.task_collection, "job_id", None,
+                     f"{r.action} job {r.job_id}" + (f" ({r.detail})" if r.detail else ""), batch=batch)
+    return [r.__dict__ for r in results]
+
+
+def _members_view(s: dict, members: List[dict], stats: dict, skipped: dict, now: datetime) -> List[dict]:
+    out = []
+    for m in members:
+        st = stats.get(m["task_collection"], {})
+        p95 = st.get("p95_s")
+        out.append({
+            **m,
+            "when": sch.describe(int(s["cadence_minutes"]), int(m["offset_minutes"]), s["timezone"]),
+            "next_run": None if s["paused"] else
+            sch.next_run(int(s["cadence_minutes"]), int(m["offset_minutes"]), s["timezone"], now).isoformat(),
+            "job_url": f"{db.workspace().config.host.rstrip('/')}/jobs/{m['job_id']}" if m.get("job_id") else None,
+            **{k: st.get(k) for k in ("last_run_id", "last_status", "last_started", "last_duration_s", "p50_s",
+                                      "p95_s", "runs_24h", "failed_24h", "lock_skipped_24h", "min_sla_minutes",
+                                      "enabled_tables")},
+            "skipped_24h": skipped.get(m["task_collection"]),
+            "warnings": sch.warnings(int(s["cadence_minutes"]), p95, st.get("min_sla_minutes"),
+                                     skipped.get(m["task_collection"]) or 0),
+        })
+    return out
+
+
+_skipped_cache: dict = {}
+
+
+def _skipped_counts(members: List[dict]) -> dict:
+    """Skipped triggers per member over 24 hours, from the wrapper jobs' runs (cached for a minute)."""
+    now = datetime.now(timezone.utc)
+    since_ms = int((now - timedelta(hours=24)).timestamp() * 1000)
+    client, out = None, {}
+    for m in members:
+        if not m.get("job_id"):
+            continue
+        hit = _skipped_cache.get(m["job_id"])
+        if hit and (now - hit[0]).total_seconds() < 60:
+            out[m["task_collection"]] = hit[1]
+            continue
+        try:
+            client = client or jobs.schedule_client()
+            n = sch.skipped_triggers(client.runs(m["job_id"], since_ms))
+        except Exception:
+            n = None
+        _skipped_cache[m["job_id"]] = (now, n)
+        out[m["task_collection"]] = n
+    return out
+
+
+@app.get("/api/schedules")
+def list_schedules(details: bool = True):
+    """Schedules with their members: when each runs next, its wrapper job, recent runs and warnings."""
+    rows = db.query(q.schedules_sql())
+    members = db.query(q.schedule_members_sql(), ([r["id"] for r in rows],)) if rows else []
+    active = [m for m in members if m["removed_at"] is None]
+    colls = sorted({m["task_collection"] for m in active})
+    stats = {r["task_collection"]: r for r in
+             (db.query(q.collection_run_stats_sql(), (colls, colls, colls, colls)) if colls else [])}
+    skipped = _skipped_counts(active) if details else {}
+    now = datetime.now(timezone.utc)
+    return [{**s, "description": sch.describe(int(s["cadence_minutes"]), 0, s["timezone"]),
+             "members": _members_view(s, [m for m in active if m["schedule_id"] == s["id"]], stats, skipped, now)}
+            for s in rows]
+
+
+@app.get("/api/schedules/options")
+def schedule_options():
+    scheduled = {}
+    rows = db.query(q.schedules_sql())
+    if rows:
+        names = {r["id"]: r["name"] for r in rows}
+        for m in db.query(q.schedule_members_sql(), (list(names),)):
+            if m["removed_at"] is None:
+                scheduled.setdefault(m["task_collection"], []).append(names[m["schedule_id"]])
+    return {"cadences": sch.CADENCES, "parameters": list(sch.PARAMETERS), "variants": sorted(jobs.ingest_variants()),
+            "collections": [r["task_collection"] for r in db.query(q.collections_sql())], "scheduled": scheduled,
+            "view_group": jobs.SCHEDULE_JOB_VIEW_GROUP}
+
+
+@app.post("/api/schedules")
+def create_schedule(body: ScheduleBody, request: Request):
+    import psycopg
+    _validate_schedule(body)
+    user = _user(request)
+    offs = sch.offsets(body.members, body.cadence_minutes, body.stagger)
+    batch = uuid.uuid4().hex[:12]
+    try:
+        with db.transaction() as cur:
+            cur.execute(q.insert_schedule_sql(), (body.name.strip(), body.cadence_minutes, body.timezone,
+                                                  json.dumps(body.parameters), body.job_variant or "default",
+                                                  body.stagger, body.paused, body.notify_emails or None, user or None))
+            sid = cur.fetchone()[0]
+            for c in sorted(body.members):
+                cur.execute(q.insert_member_sql(), (sid, c, offs[c]))
+                _log(cur, user, "schedule_create", None, c, "schedule", None,
+                     f"{body.name} ({sch.describe(body.cadence_minutes, offs[c], body.timezone)})", batch=batch)
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(409, f"a schedule named '{body.name}' already exists")
+    return {"id": sid, "sync": _sync(sid, user)}
+
+
+@app.post("/api/schedules/{sid}")
+def update_schedule(sid: int, body: ScheduleBody, request: Request):
+    """Edit a schedule: fields, and members added or removed. Offsets are recomputed; jobs are synced."""
+    import psycopg
+    _validate_schedule(body)
+    user = _user(request)
+    s, members = _load_schedule(sid)
+    if s["deleted_at"] is not None:
+        raise HTTPException(409, "schedule was deleted")
+    new = body.model_dump()
+    new["notify_emails"] = new["notify_emails"] or None
+    new["job_variant"] = new["job_variant"] or "default"
+    changed = [f for f in q.SCHEDULE_FIELDS if (s[f] or None) != (new[f] or None) and not
+               (f == "parameters" and (s[f] or {}) == (new[f] or {}))]
+    active = {m["task_collection"]: m for m in members if m["removed_at"] is None}
+    added = sorted(set(body.members) - set(active))
+    gone = sorted(set(active) - set(body.members))
+    offs = sch.offsets(body.members, body.cadence_minutes, body.stagger)
+    batch = uuid.uuid4().hex[:12]
+    try:
+        with db.transaction() as cur:
+            if changed:
+                vals = [json.dumps(new[f]) if f == "parameters" else new[f] for f in changed]
+                cur.execute(q.update_schedule_sql(changed), vals + [int(sid)])
+                for f in changed:
+                    _log(cur, user, "schedule_edit", None, None, f"{s['name']}.{f}", s[f], new[f], batch=batch)
+            if gone:
+                cur.execute(q.remove_members_sql(), ([active[c]["id"] for c in gone],))
+                for c in gone:
+                    _log(cur, user, "schedule_edit", None, c, f"{s['name']}.members", c, None, batch=batch)
+            for c in added:
+                cur.execute(q.insert_member_sql(), (int(sid), c, offs[c]))
+                _log(cur, user, "schedule_edit", None, c, f"{s['name']}.members", None, c, batch=batch)
+            for c, m in active.items():
+                if c in offs and int(m["offset_minutes"]) != offs[c]:
+                    cur.execute(q.update_member_offset_sql(), (offs[c], m["id"]))
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(409, f"a schedule named '{body.name}' already exists")
+    return {"id": sid, "changed": changed, "added": added, "removed": gone, "sync": _sync(sid, user)}
+
+
+def _set_paused(sid: int, paused: bool, request: Request):
+    user = _user(request)
+    s, _ = _load_schedule(sid)
+    if s["deleted_at"] is not None:
+        raise HTTPException(409, "schedule was deleted")
+    if bool(s["paused"]) != paused:
+        with db.transaction() as cur:
+            cur.execute(q.update_schedule_sql(["paused"]), (paused, int(sid)))
+            _log(cur, user, "schedule_pause" if paused else "schedule_resume", None, None, f"{s['name']}.paused",
+                 s["paused"], paused)
+    return {"id": sid, "paused": paused, "sync": _sync(sid, user)}
+
+
+@app.post("/api/schedules/{sid}/pause")
+def pause_schedule(sid: int, request: Request):
+    return _set_paused(sid, True, request)
+
+
+@app.post("/api/schedules/{sid}/resume")
+def resume_schedule(sid: int, request: Request):
+    return _set_paused(sid, False, request)
+
+
+@app.post("/api/schedules/{sid}/delete")
+def delete_schedule(sid: int, request: Request):
+    """Delete a schedule and its wrapper jobs (the schedule row is kept, marked deleted)."""
+    user = _user(request)
+    s, members = _load_schedule(sid)
+    active = [m["id"] for m in members if m["removed_at"] is None]
+    with db.transaction() as cur:
+        cur.execute(q.delete_schedule_sql(), (int(sid),))
+        if active:
+            cur.execute(q.remove_members_sql(), (active,))   # their jobs are deleted by the sync below
+        _log(cur, user, "schedule_delete", None, None, s["name"], None, None)
+    return {"id": sid, "deleted": True, "sync": _sync(sid, user)}
+
+
+@app.post("/api/schedules/{sid}/sync")
+def sync_schedule(sid: int, request: Request):
+    """Re-sync the wrapper jobs (recreates missing ones and undoes edits made outside the app)."""
+    return {"id": sid, "sync": _sync(sid, _user(request))}
+
+
+@app.get("/api/schedules/{sid}/check")
+def check_schedule(sid: int):
+    """Drift report for the schedule's wrapper jobs; changes nothing."""
+    s, members = _load_schedule(sid)
+    active = [m for m in members if m["removed_at"] is None]
+    return sch.check(s, active, jobs.schedule_client(), _variant_job_id(s["job_variant"]))
+
+
+@app.get("/api/timeline")
+def timeline(hours: int = 24):
+    """Runs per collection in the last `hours`, planned triggers of scheduled collections, and skipped
+    triggers (from the wrapper jobs' runs)."""
+    hours = max(1, min(int(hours), 168))
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=hours)
+    runs = db.query(q.timeline_runs_sql(), (end, start))
+    scheds = db.query(q.schedules_sql())
+    members = db.query(q.schedule_members_sql(), ([r["id"] for r in scheds],)) if scheds else []
+    by_id = {r["id"]: r for r in scheds}
+    rows = {}
+    for r in runs:
+        rows.setdefault(r["task_collection"], {"task_collection": r["task_collection"], "runs": [], "planned": [],
+                                               "skipped": [], "schedules": []})["runs"].append(r)
+    client = None
+    for m in members:
+        if m["removed_at"] is not None:
+            continue
+        s = by_id[m["schedule_id"]]
+        row = rows.setdefault(m["task_collection"], {"task_collection": m["task_collection"], "runs": [],
+                                                     "planned": [], "skipped": [], "schedules": []})
+        row["schedules"].append(f"{s['name']} ({sch.describe(int(s['cadence_minutes']), int(m['offset_minutes']), s['timezone'])})")
+        if not s["paused"]:
+            row["planned"] += [t.isoformat() for t in
+                               sch.fire_times(int(s["cadence_minutes"]), int(m["offset_minutes"]), s["timezone"], start, end)]
+        if m.get("job_id"):
+            try:
+                client = client or jobs.schedule_client()
+                for jr in client.runs(m["job_id"], int(start.timestamp() * 1000), limit=500):
+                    if sch.skipped_triggers([jr]):
+                        row["skipped"].append(datetime.fromtimestamp(jr["start_time"] / 1000, timezone.utc).isoformat())
+            except Exception:
+                pass
+    return {"start": start.isoformat(), "end": end.isoformat(),
+            "collections": [rows[k] for k in sorted(rows)]}
 
 
 # ---- single-page app ----------------------------------------------------------------------------

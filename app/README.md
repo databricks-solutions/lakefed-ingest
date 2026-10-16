@@ -7,15 +7,55 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 
 | Page | What it does |
 |---|---|
-| **Overview** | Per-collection health: enabled, failing, seeding and SLA-breached tables, and a warning for enabled tables with no freshness SLA; the last run; runs in progress; failed tables in the last 24 hours |
+| **Overview** | Per-collection health: enabled, failing, seeding and SLA-breached tables, and a warning for enabled tables with no freshness SLA; the last run; runs in progress (elapsed against the collection's typical run time, tables done and failed); failed tables in the last 24 hours |
 | **Runs** | Recent runs (filter by collection); select one to see its per-table events and errors |
+| **Timeline** | Runs per collection over a window (6 hours to 7 days): planned triggers, runs colored by outcome, and triggers Databricks skipped because the previous run was still going |
+| **Schedules** | Run collections at a cadence (see [Schedules](#schedules)): create, edit, pause, resume and delete schedules; each member's next run, wrapper job, last run, p95 run time, skipped triggers, and warnings for overruns and SLAs a schedule can't meet |
 | **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag, SLA). Filter by collection, text, or failing / SLA breached / no SLA / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection), **enable**, **disable** or **force a reseed** |
 | **Jobs** | The ingestion job's schedule; active and recent runs; **start a run** for a collection; **cancel** a run; run the schema setup job |
 | **Changes** | The change log: every add, register, edit, enable / disable and reseed made in the app, with who, what and when |
 | **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop) |
 | **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template, freshness SLA), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
 
-Every write asks for confirmation. The app never deletes rows.
+Every write asks for confirmation. The app never deletes rows (deleted schedules are marked deleted); it
+deletes only the wrapper jobs it created for schedules.
+
+## Schedules
+
+A Databricks job schedule can't pass parameters, so the ingestion job's own schedule can only run its
+default collection. Schedules in the app fill that gap:
+
+- **A schedule** has a cadence (every 5 minutes to daily; each cadence divides a day), a time zone,
+  ingestion job parameters (e.g. `parallelism`), optional failure e-mails, and one or more member
+  collections. A collection can be in more than one schedule.
+- **One wrapper job per member.** The app creates a small Databricks job for each (schedule,
+  collection): a cron schedule and one `run_job` task that starts the ingestion job with
+  `task_collection` set. Wrapper jobs need no compute of their own, and every run still happens in the
+  one bundle-deployed ingestion job, so a redeploy upgrades every schedule. They're named
+  `lakefed_ingest schedule: <schedule> / <collection>` and tagged `lakefed_ingest_schedule` and
+  `lakefed_ingest_collection`.
+- **Overlap.** Wrapper jobs allow one run at a time and don't queue: if a collection's run is still going
+  at its next trigger, Databricks skips that trigger (the Timeline marks it), and the next run catches
+  up. Separate jobs per collection mean one slow collection never delays the others. Manual and
+  app-started runs are still guarded by the collection's run lock.
+- **Staggering** (on by default) spreads members' start times over the cadence (e.g. :00 and :07 for two
+  collections every 15 minutes), so cluster starts and source queries don't all land at once.
+- **Sync and drift.** Every create, edit, pause, resume and delete syncs the wrapper jobs right away and is
+  logged on the Changes page. "Check jobs" reports jobs edited or deleted outside the app; "Sync jobs"
+  recreates missing ones and undoes outside edits.
+- **Warnings** per member: p95 run time (7 days) close to or over the cadence (triggers will be skipped),
+  skipped triggers in the last 24 hours, and "can't meet SLA" when the cadence plus the p95 run time is
+  longer than the strictest `freshness_sla_minutes` among the collection's tables.
+
+Permissions: the app's service principal owns the wrapper jobs it creates (creating jobs needs no extra
+entitlement, and `run_job` tasks need no compute) and already has `CAN_MANAGE_RUN` on the ingestion job.
+The group in `SCHEDULE_JOB_VIEW_GROUP` (default `users`; blank for owner and admins only) gets
+`CAN_VIEW` on them. For more ingestion jobs (e.g. a larger cluster), add an app `job` resource and an
+`INGEST_JOB_ID_<NAME>` environment variable; schedules can then pick that variant.
+
+Limits: each running collection counts as one task (2,000 per workspace) plus one parent task while its
+wrapper runs (750 per workspace), all collections are runs of the one ingestion job (its
+`max_concurrent_runs`, default 100, up to 1,000), and each member is a saved job (12,000 per workspace).
 
 ## Guard rails for edits
 
@@ -125,7 +165,6 @@ Locally the app connects as you. Tests:
 ## Not in this version
 
 - Editing an existing control row: disable it and add a corrected one, or use SQL.
-- Changing job schedules: needs `CAN_MANAGE` on the job; use the Jobs UI.
 - Per-user authorization: everyone with `CAN_USE` acts as the app's service principal.
 - Bulk import of control rows: use `notebooks/load_control_example.ipynb`.
 
