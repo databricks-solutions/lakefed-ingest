@@ -644,8 +644,10 @@ def timeline(hours: int = 24):
                                                      "planned": [], "skipped": [], "schedules": []})
         row["schedules"].append(f"{s['name']} ({sch.describe(int(s['cadence_minutes']), int(m['offset_minutes']), s['timezone'])})")
         if not s["paused"]:
+            # The current schedule's triggers, from when the collection joined or the schedule last changed.
+            since = max([start] + [datetime.fromisoformat(v) for v in (m.get("added_at"), s.get("updated_at")) if v])
             row["planned"] += [t.isoformat() for t in
-                               sch.fire_times(int(s["cadence_minutes"]), int(m["offset_minutes"]), s["timezone"], start, end)]
+                               sch.fire_times(int(s["cadence_minutes"]), int(m["offset_minutes"]), s["timezone"], since, end)]
         if m.get("job_id"):
             try:
                 client = client or jobs.schedule_client()

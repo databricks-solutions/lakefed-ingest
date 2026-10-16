@@ -456,8 +456,10 @@ create table if not exists lakefed_ingest.schedule_member (
     job_id          bigint,                                   -- the Databricks job the app created
     synced_at       timestamptz,
     sync_error      text,
+    added_at        timestamptz not null default now(),
     removed_at      timestamptz
 );
+alter table lakefed_ingest.schedule_member add column if not exists added_at timestamptz not null default now();
 create unique index if not exists schedule_member_uq
     on lakefed_ingest.schedule_member (schedule_id, task_collection) where removed_at is null;
 create index if not exists schedule_member_collection_idx

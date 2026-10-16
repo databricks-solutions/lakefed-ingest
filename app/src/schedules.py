@@ -30,7 +30,7 @@ TAG_SCHEDULE = "lakefed_ingest_schedule"
 TAG_COLLECTION = "lakefed_ingest_collection"
 JOB_NAME_PREFIX = "lakefed_ingest schedule"
 _EMAIL = re.compile(r"[^@\s,]+@[^@\s,]+\.[^@\s,]+")
-_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.:-]{0,79}")
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.,:()-]{0,79}")
 
 
 # ---- validation ---------------------------------------------------------------------------------
@@ -43,7 +43,7 @@ def validate(body: dict, known_collections: Iterable[str], variants: Iterable[st
     """Errors in a schedule body (empty list = valid)."""
     errs = []
     if not _NAME.fullmatch(str(body.get("name") or "")):
-        errs.append("name: 1-80 characters (letters, digits, space, _ . : -), starting with a letter or digit")
+        errs.append("name: 1-80 characters (letters, digits, space, _ . , : ( ) -), starting with a letter or digit")
     if body.get("cadence_minutes") not in CADENCES:
         errs.append(f"cadence_minutes must be one of {', '.join(map(str, CADENCES))}")
     try:

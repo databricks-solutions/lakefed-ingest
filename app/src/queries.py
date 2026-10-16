@@ -578,7 +578,7 @@ def schedule_sql() -> str:
 
 def schedule_members_sql() -> str:
     """Members of the given schedules, active and removed. Param: list of schedule ids."""
-    return (f"select id, schedule_id, task_collection, offset_minutes, job_id, synced_at, sync_error, removed_at "
+    return (f"select id, schedule_id, task_collection, offset_minutes, job_id, synced_at, sync_error, added_at, removed_at "
             f"from {SCHEMA}.schedule_member where schedule_id = any(%s) order by schedule_id, task_collection")
 
 

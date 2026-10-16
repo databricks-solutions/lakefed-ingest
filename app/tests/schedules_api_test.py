@@ -39,7 +39,7 @@ class Store:
         if sql.startswith(f"insert into {q.SCHEMA}.schedule_member"):
             mid = len(self.members) + 1
             self.members[mid] = dict(id=mid, schedule_id=params[0], task_collection=params[1], offset_minutes=params[2],
-                                     job_id=None, synced_at=None, sync_error=None, removed_at=None)
+                                     job_id=None, synced_at=None, sync_error=None, added_at=self.now(), removed_at=None)
             return [(mid,)]
         if sql.startswith(f"update {q.SCHEMA}.schedule set deleted_at"):
             self.schedules[params[0]]["deleted_at"] = self.now()
@@ -171,5 +171,9 @@ def test_timeline_has_planned_triggers_for_scheduled_collections(api, monkeypatc
     api.post("/api/schedules", json=BODY)
     t = api.get("/api/timeline?hours=2").json()
     rows = {r["task_collection"]: r for r in t["collections"]}
-    assert set(rows) == {"c1", "c2"} and 7 <= len(rows["c1"]["planned"]) <= 9
+    assert set(rows) == {"c1", "c2"} and len(rows["c1"]["planned"]) <= 1      # only since the schedule began
+    api.store.members[1]["added_at"] = "2020-01-01T00:00:00+00:00"
+    api.store.schedules[1]["updated_at"] = "2020-01-01T00:00:00+00:00"
+    rows = {r["task_collection"]: r for r in api.get("/api/timeline?hours=2").json()["collections"]}
+    assert 7 <= len(rows["c1"]["planned"]) <= 9
     assert rows["c2"]["schedules"] == ["Prod 15 (every 15 minutes at :07 past)"]

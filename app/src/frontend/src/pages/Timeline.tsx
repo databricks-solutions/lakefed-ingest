@@ -39,7 +39,7 @@ export default function TimelinePage() {
         <span className="legend">
           <i style={{ background: COLOR.completed }} /> completed <i style={{ background: COLOR.failed }} /> failed
           <i style={{ background: COLOR.running }} /> running <i style={{ background: COLOR.skipped }} /> skipped (collection already running)
-          <i className="tick" /> planned trigger <b className="skipmark">▼</b> trigger skipped by Databricks
+          <i className="tick" /> planned trigger (current schedule, since its last change) <b className="skipmark">▼</b> trigger skipped by Databricks
         </span>
       </div>
       <ErrorBox error={t.error} />

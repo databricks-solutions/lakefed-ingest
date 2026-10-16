@@ -122,14 +122,17 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
       <ErrorBox error={act.error || check.error} />
       <SyncResult result={act.data} />
       <Grid rows={rows} height={Math.min(90 + rows.length * 42, 380)} columns={[
-        { field: "collection", pinned: "left" }, { field: "starts" }, { field: "next_run" },
-        { field: "last_run", cellRenderer: (p: any) => <Badge value={p.value} /> }, { field: "last_started" }, { field: "last_duration" },
-        { field: "p95_7d", headerName: "p95 (7 days)" }, { field: "runs_24h" }, { field: "failed_24h" }, { field: "skipped_24h" },
-        { field: "strictest_sla" },
-        { field: "job", cellRenderer: (p: any) => (p.value ? <a href={p.value} target="_blank" rel="noreferrer">open</a> : null) },
-        { field: "sync", cellRenderer: (p: any) => <Badge value={p.value === "ok" ? "ok" : "failed"} /> },
-        { field: "sync_drift", headerName: "check", cellRenderer: (p: any) => (p.value ? <Badge value={p.value === "in_sync" ? "ok" : "failed"} /> : null) },
-        { field: "warnings", flex: 1, minWidth: 320, tooltipField: "warnings" },
+        { field: "collection", headerName: "Collection", pinned: "left" }, { field: "starts", headerName: "Starts" },
+        { field: "next_run", headerName: "Next run" },
+        { field: "last_run", headerName: "Last run", cellRenderer: (p: any) => <Badge value={p.value} /> },
+        { field: "last_started", headerName: "Last started" }, { field: "last_duration", headerName: "Last duration" },
+        { field: "p95_7d", headerName: "p95 (7 days)" }, { field: "runs_24h", headerName: "Runs (24 h)" },
+        { field: "failed_24h", headerName: "Failed (24 h)" }, { field: "skipped_24h", headerName: "Skipped triggers (24 h)" },
+        { field: "strictest_sla", headerName: "Strictest SLA" },
+        { field: "job", headerName: "Job", cellRenderer: (p: any) => (p.value ? <a href={p.value} target="_blank" rel="noreferrer">open</a> : null) },
+        { field: "sync", headerName: "Sync", cellRenderer: (p: any) => <Badge value={p.value === "ok" ? "ok" : "failed"} /> },
+        { field: "sync_drift", headerName: "Check", cellRenderer: (p: any) => (p.value ? <Badge value={p.value === "in_sync" ? "ok" : "failed"} /> : null) },
+        { field: "warnings", headerName: "Warnings", flex: 1, minWidth: 320, tooltipField: "warnings" },
       ]} />
     </Section>
   );

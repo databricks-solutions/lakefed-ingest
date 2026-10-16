@@ -50,6 +50,8 @@ def test_validate():
     ok = dict(name="Prod 15", cadence_minutes=15, timezone="UTC", parameters={"parallelism": "32"},
               job_variant="default", members=["c1", "c2"], notify_emails="a@x.com, b@y.org")
     assert sch.validate(ok, ["c1", "c2"], ["default"]) == []
+    assert sch.validate(dict(ok, name="Prod (EMEA), 15 min"), ["c1", "c2"], ["default"]) == []
+    assert sch.validate(dict(ok, name="a/b"), ["c1", "c2"], ["default"])
     bad = dict(ok, name="", cadence_minutes=7, timezone="Mars/Base", parameters={"parallelism": "0", "x": "1"},
                job_variant="large", members=["c1", "c1", "zz"], notify_emails="nope")
     errs = " | ".join(sch.validate(bad, ["c1"], ["default"]))
