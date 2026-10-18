@@ -65,15 +65,17 @@ class CtStrategy(LoadStrategy):
 class FullStrategy(LoadStrategy):
     """Full reload every cycle: one JDBC read streams into a data-only ``INSERT OVERWRITE`` (or the
     staged, atomic partitioned swap when ``load_partitioned``). The table definition (id, grants,
-    clustering, properties) is preserved. No PK and no position."""
+    clustering, properties) is preserved. No PK and no position. With ``write_mode`` append, each
+    cycle's read is appended as a snapshot instead (operation 'S', written by ingest run ``run_id``)."""
 
     name = FULL
     implemented = True
 
-    def load(self, spark, cfg: dict, sink_fqn: str, slots=None, executor=None, guard=None):
+    def load(self, spark, cfg: dict, sink_fqn: str, slots=None, executor=None, guard=None, run_id=None):
         import ct_engine
         ct_engine.ensure_sink_table(spark, cfg, sink_fqn, slots=slots)
-        return ct_engine.seed(spark, cfg, sink_fqn, slots=slots, executor=executor, guard=guard)
+        return ct_engine.seed(spark, cfg, sink_fqn, slots=slots, executor=executor, guard=guard,
+                              run_id=run_id)
 
 
 class CursorStrategy(LoadStrategy):

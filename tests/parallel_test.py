@@ -183,3 +183,149 @@ def test_failing_set_pool_fails_that_item_not_the_batch():
     res = parallel.run_parallel([1, 2, 3, 4], worker=lambda x: x * 10, max_parallel=2, set_pool=set_pool)
     assert [r["status"] for r in res] == ["failed", "ok", "failed", "ok"]
     assert "JVM_ATTRIBUTE_NOT_SUPPORTED" in res[0]["detail"] and res[1]["detail"] == 20
+
+
+# ---- acquire_many: one unit doing several units of query work at once (a batch) -------------------
+
+def test_acquire_many_holds_n_slots_capped_at_capacity_and_returns_them():
+    slots = parallel.WorkSlots(4)
+    with slots.acquire_many(3):
+        assert slots.in_flight == 3
+    with slots.acquire_many(10):                     # capped: a batch never waits for slots that don't exist
+        assert slots.in_flight == 4
+    assert slots.in_flight == 0 and slots.peak == 4
+    with pytest.raises(ValueError):
+        with slots.acquire_many(2):
+            raise ValueError("boom")
+    assert slots.in_flight == 0
+
+
+def test_acquire_many_mixed_with_single_units_never_deadlocks_or_exceeds_capacity():
+    cap = 4
+    slots = parallel.WorkSlots(cap)
+    mu = threading.Lock()
+    state = {"cur": 0, "max": 0}
+
+    def unit(i):
+        n = 1 + i % cap                               # batches of 1..4 slots, interleaved with singles
+        with slots.acquire_many(n):
+            with mu:
+                state["cur"] += n
+                state["max"] = max(state["max"], state["cur"])
+            time.sleep(0.001)
+            with mu:
+                state["cur"] -= n
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        list(ex.map(unit, range(120)))
+    assert state["max"] <= cap and slots.peak <= cap and slots.in_flight == 0
+
+
+# ---- per-source caps (SourceLimiter) ----------------------------------------------------------------
+
+def _peak_per_source(slots, plan, workers=16):
+    """Run ``plan`` (a list of source lists, one per unit) through ``slots``; return the most units
+    seen querying each source at once."""
+    mu, cur, peak = threading.Lock(), {}, {}
+
+    def unit(sources):
+        with (slots.acquire(sources[0]) if len(sources) == 1 else slots.acquire_many(len(sources), sources)):
+            with mu:
+                for s in sources:
+                    cur[s] = cur.get(s, 0) + 1
+                    peak[s] = max(peak.get(s, 0), cur[s])
+            time.sleep(0.002)
+            with mu:
+                for s in sources:
+                    cur[s] -= 1
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(unit, plan))
+    return peak
+
+
+def test_source_limiter_caps_each_source_but_not_the_others():
+    limiter = parallel.SourceLimiter({"a": 2})
+    slots = parallel.WorkSlots(8, sources=limiter)
+    peak = _peak_per_source(slots, [["a"], ["b"]] * 40)
+    assert peak["a"] <= 2 and limiter.peak["a"] == peak["a"] and peak["b"] > 2   # b has no limit
+    assert slots.in_flight == 0
+
+
+def test_source_limiter_admits_a_batch_bigger_than_the_limit_alone():
+    # A batch of 3 reads of a source capped at 2 runs alone on it, rather than never.
+    limiter = parallel.SourceLimiter({"a": 2})
+    slots = parallel.WorkSlots(8, sources=limiter)
+    peak = _peak_per_source(slots, [["a", "a", "a"], ["a"]] * 20)
+    assert peak["a"] == 3 and slots.in_flight == 0
+
+
+def test_source_limiter_never_starves_a_batch_behind_single_queries():
+    limiter = parallel.SourceLimiter({"a": 4})
+    releases = [threading.Event() for _ in range(5)]                # 4 single holders, then the batch
+    batch_in, later_in = threading.Event(), threading.Event()
+
+    def holder(release):
+        with limiter.hold(["a"]):
+            release.wait(5)
+
+    def waiter(sources, admitted, release=None):
+        with limiter.hold(sources):
+            admitted.set()
+            if release is not None:
+                release.wait(5)
+
+    def queued(n):                                                  # requests waiting for admission
+        deadline = time.monotonic() + 5
+        while len(limiter._waiting) < n and time.monotonic() < deadline:
+            time.sleep(0.001)
+        return len(limiter._waiting)
+
+    threads = [threading.Thread(target=holder, args=(r,)) for r in releases[:4]]
+    for t in threads:                                               # take every permit
+        t.start()
+    while limiter._in_use.get("a", 0) < 4:
+        time.sleep(0.001)
+    threads.append(threading.Thread(target=waiter, args=(["a"] * 3, batch_in, releases[4])))
+    threads[-1].start()
+    assert queued(1) == 1                                           # the batch waits first
+    threads.append(threading.Thread(target=waiter, args=(["a"], later_in)))
+    threads[-1].start()
+    assert queued(2) == 2
+    releases[0].set()                                               # 1 free: the later single would fit,
+    assert not later_in.wait(0.05) and not batch_in.is_set()        # but the batch is ahead of it
+    releases[1].set()
+    assert not later_in.wait(0.05) and not batch_in.is_set()
+    releases[2].set()                                               # 3 free: the batch goes in
+    assert batch_in.wait(5) and not later_in.wait(0.05)
+    releases[3].set()                                               # 1 free beside the batch
+    assert later_in.wait(5)
+    releases[4].set()
+    for t in threads:
+        t.join(5)
+    assert limiter.peak == {"a": 4} and limiter._in_use == {"a": 0}
+
+
+def test_source_limiter_follows_its_limit_as_it_changes():
+    limiter = parallel.SourceLimiter({"a": 1})
+    assert limiter.limit("a") == 1 and limiter.limit("b") == 0
+    entered = threading.Event()
+
+    def second():
+        with limiter.hold(["a"]):
+            entered.set()
+
+    with limiter.hold(["a"]):
+        t = threading.Thread(target=second)
+        t.start()
+        assert not entered.wait(0.05)                               # the limit is 1: it waits
+        limiter.set_limit("a", 2)                                   # a share grows: it goes in
+        assert entered.wait(1)
+    t.join(1)
+    assert limiter.peak["a"] == 2
+
+
+def test_workslots_without_a_limiter_ignores_sources():
+    slots = parallel.WorkSlots(2)
+    with slots.acquire("connection:c1"), slots.acquire_many(1, ["connection:c1"]):
+        assert slots.in_flight == 2

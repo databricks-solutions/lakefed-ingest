@@ -29,6 +29,9 @@ variables:
   lakebase_instance:
     description: Lakebase instance holding control, checkpoint, and telemetry state.
     default: lakefed-ingest
+  lakebase_capacity:
+    description: Lakebase instance size (CU_1, CU_2, CU_4 or CU_8). Size up for collections of hundreds of thousands of tables, or many collections sweeping at once.
+    default: CU_1
   lakebase_database:
     description: Postgres database on the Lakebase instance.
     default: lakefed_ingest
@@ -38,6 +41,35 @@ variables:
   secret_scope:
     description: Secret scope holding per-database source credentials (may be Azure Key Vault-backed).
     default: lakefed_ingest
+  # Defaults of the ingestion job's tuning parameters (resources/lakefed_ingest.yml explains each); a
+  # run can still override them.
+  parallelism:
+    description: Units of query work running at once in one run.
+    default: "32"
+  trust_server_certificate:
+    description: Trust the source's TLS certificate without validating it (production false).
+    default: "true"
+  snapshot_isolation:
+    description: Read SQL Server changes under SNAPSHOT isolation (needs ALLOW_SNAPSHOT_ISOLATION ON).
+    default: "false"
+  reseed_on_new_columns:
+    description: Reseed a table whose select_list gained columns (false carries on from the checkpoint).
+    default: "true"
+  append_batch_size:
+    description: Append sinks with client_id, tables per batched append ("1" = per table).
+    default: "1"
+  max_seeds_per_run:
+    description: Seeds per run ("0" = no limit).
+    default: "0"
+  freshness_interval_s:
+    description: Seconds between freshness writes for unchanged tables already at the current version ("0" = every run).
+    default: "0"
+  max_queries_per_source:
+    description: Concurrent queries per source server across all runs, shared between them (at least 1 per run; see README "Concurrency"; "0" = no cap).
+    default: "0"
+  detection_chunk:
+    description: Tables per batched change-detection query.
+    default: "200"
 
 targets:
   dev:

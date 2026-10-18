@@ -139,6 +139,7 @@ class _DF:
     def __init__(self, spark, query): self.spark, self.query, self.tagged = spark, query, None
     def select(self, *cols):
         d = _DF(self.spark, self.query); d.tagged = cols; return d
+    def __getitem__(self, name): return f"col({name})"     # df[name]: a column object, as PySpark's DataFrame
     def createOrReplaceTempView(self, name): self.spark.views[name] = (self.query, self.tagged)
 
 
@@ -203,7 +204,7 @@ def test_consolidated_cursor_read_is_tagged_and_merged_on_client(monkeypatch):
         return real_sql(stmt)
     spark.sql = sql
     _merge(monkeypatch, spark, cfg=dict(CFG, client_id="t1"))
-    assert seen["tagged"] == ("lit(t1) AS __client_id__", "id", "amount", "updated_at")
+    assert seen["tagged"] == ("lit(t1) AS __client_id__", "col(id)", "col(amount)", "col(updated_at)")
     assert "AND tgt.`__client_id__` = 't1' " in spark.statements[0]
 
 

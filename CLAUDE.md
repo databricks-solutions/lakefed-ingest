@@ -46,21 +46,25 @@ databricks bundle run --target prod --profile PROD
 
 ## Default version (repo root)
 
-Warehouse-free: everything runs on cluster compute. No UC connections — source reads use Spark
-JDBC with per-database credentials (JSON `{user,password}`) from a secret scope named by
-`control.secret_key`. See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase_schema.md`.
+Warehouse-free: everything runs on cluster compute. Source reads use Spark JDBC with per-database
+credentials (JSON `{user,password}`) from a secret scope named by `control.secret_key`; or, for a
+row with `use_remote_query`, `remote_query` through the UC connection in `src_connection` (no
+secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase_schema.md`.
 
 ### Lakebase state (`src/lakefed_ingest/lakebase_schema.sql`, schema `lakefed_ingest`)
 - `control` — one row per (source database, table): `task_collection`, `src_type` (source adapter:
-  `sqlserver` | `oracle` | `postgresql` | `mysql`), `src_host`/`src_port`, `src_database`, `src_schema`,
-  `src_table`, `secret_key`, `primary_key`, `select_list` (explicit columns), sink, `load_type` (load
+  `sqlserver` | `oracle` | `postgresql` | `mysql`), `src_host`/`src_port` and `secret_key` (JDBC) or
+  `src_connection` + `use_remote_query` (UC connection), `src_database`, `src_schema`,
+  `src_table`, `primary_key`, `select_list` (explicit columns), sink, `load_type` (load
   strategy: `ct` | `full` | `cursor` (SQL Server; placeholder elsewhere); `cdc` is a placeholder), partitioned-seed settings,
   `cursor_column`, `cdc_capture_instance`, `jdbc_options` (JSON), `client_id` (optional: consolidated
-  sink shared by many source DBs; written to sink column `__client_id__`). CHECK constraints enforce valid combos; a unique index allows one
-  row per (sink, client_id).
+  sink shared by many source DBs; written to sink column `__client_id__`), `client_attrs` (JSON
+  {column: value}: identity columns written as STRING on every row), `write_mode` (`merge` default |
+  `append` for ct/full: change-log sink with `__change_op`/`__change_version`/`__extracted_at`/`__run_id`).
+  CHECK constraints enforce valid combos; a unique index allows one row per (sink, client_id).
 - `checkpoint` — generic: `strategy` + `position` (text; CT version for `ct`, JSON {col,type,value} for
   `cursor`), phase (`seeding → incremental` for ct and cursor, `loaded` for full), status, freshness,
-  `ct_begin_version`. `reseed_queue` (ct, cursor).
+  `ct_begin_version`, `pending_position`/`pending_run_id` (an append in flight). `reseed_queue` (ct, cursor).
 - `ingest_run`, `ingest_event` — telemetry (`run_id`, `position_from/to`). The DB is registered in UC
   (default catalog `lakefed_ingest_lakebase`) for DBSQL monitoring.
 - DDL is applied by `apply_lakebase_schema.ipynb`, which splits on `;` — no `DO $$` blocks. Migrations
@@ -70,7 +74,13 @@ JDBC with per-database credentials (JSON `{user,password}`) from a secret scope 
 ### Jobs (`resources/`)
 - `lakefed_ingest` → task `ingest` → `ingest.ipynb`: one run ingests a `task_collection`. Parameters:
   `task_collection`, `parallelism` (single budget of concurrent query units), `secret_scope`,
-  `detection_chunk`, `trust_server_certificate`, `db_instance`, `db_name`.
+  `detection_chunk`, `trust_server_certificate`, `snapshot_isolation` (change reads under SNAPSHOT),
+  `reseed_on_new_columns` (false: added select_list columns don't reseed), `append_batch_size` (>1:
+  batched appends, see `batch_append.py`), `max_seeds_per_run` (seed budget, 0 = none),
+  `freshness_interval_s` (skip no-op bulk-advance writes newer than this), `max_queries_per_source`
+  (cap per source across runs, 0 = none: each run takes cap / runs reading the source, counted from
+  shared advisory locks; `parallel.SourceLimiter`), `db_instance`, `db_name`.
+  The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
 - `lakefed_ingest_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
   instance, its UC catalog, and the secret scope (`database_instances.lakebase`,
   `database_catalogs.lakebase_catalog`, `secret_scopes.secret_scope`).
@@ -80,26 +90,33 @@ JDBC with per-database credentials (JSON `{user,password}`) from a secret scope 
 2. Plan (`planner.py`, pure): unsupported (`src_type`, `load_type`) pair → fail per table (stage
    `plan`); `full` → reload; `cursor` → `cursor_seed` / schema_reseed / `cursor` (per-table high
    watermark, `cursor_engine`); CT tables → seed / schema_reseed / detection candidate; group by
-   (source database, load_type); capture CT current version once per DB → fast exit if all checkpoints current,
+   (source database, load_type); one query per DB captures the CT current version + per-table CT state
+   (`ct_engine.database_ct_state`) → fast exit if all checkpoints current,
    else batched detection (`detection_chunk` tables per query); failed chunk → per-table fallback;
    checkpoint ahead of current version → reseed; CT disabled on the DB → fail loudly. Per-table CT
-   status (one `sys.change_tracking_tables` query per DB, before the fast exit): CT off on a table,
+   status (`sys.change_tracking_tables`, read with the version, before the fast exit): CT off on a table,
    retention lapsed, or `begin_version` ≠ `checkpoint.ct_begin_version` (CT re-enabled) → reseed.
 3. Unchanged tables: one bulk Lakebase checkpoint advance.
 4. Per-table worker: full reload (`load_strategies.FullStrategy` → `ct_engine.seed`), seed (capture V0
    before seed; partitioned seed via staging + atomic swap),
    reseed enqueue, or CHANGETABLE read + idempotent PK MERGE (schema evolution) then checkpoint
-   advance. The change read carries a sessionInitStatement retention guard.
+   advance. The change read carries a sessionInitStatement retention guard (through a UC
+   connection: the query's TOP count, `ct_read_query_guarded`) and is bounded at the
+   captured version. Append mode (`write_mode` append) appends instead (seed/full: op 'S'). A ct append
+   records the pending append first; a `full` append doesn't (it adds one snapshot per run, so there
+   is no position to protect). A `pending` route (run stopped before the advance) checks the sink
+   for that run's rows (`append_committed`) before anything else.
 
 ### Modules
 | File | Purpose |
 |---|---|
-| `src/lakefed_ingest/ct_engine.py` | Spark JDBC source ops: CT versions, detection, read + MERGE, seed, sink DDL |
+| `src/lakefed_ingest/ct_engine.py` | Source ops (Spark JDBC, or `remote_query` through a UC connection): CT versions, detection, read + MERGE / append, seed, sink DDL, batched appends (`append_batch`) |
+| `src/lakefed_ingest/batch_append.py` | Batched appends (append mode, consolidated sinks): plan batches by (sink, kind), write with bisect on failure, bulk checkpoints + telemetry; per-table fallback |
 | `src/lakefed_ingest/source_adapters.py` | Per-engine dialect (`src_type`): JDBC URL/driver/options, quoting, literals, select/size/bounds SQL |
 | `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix (+ placeholder pairs); cdc placeholder |
 | `src/lakefed_ingest/cursor_engine.py` | Cursor (watermark) strategy, SQL Server: type lookup, high watermark (rowversion capped below MIN_ACTIVE_ROWVERSION), typed literals, (lo, hi] read + upsert MERGE |
 | `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning (no Spark/DB; unit-tested with fakes) |
-| `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget |
+| `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget, `SourceLimiter` (per-source permits) |
 | `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |
 | `src/lakefed_ingest/state_store.py` | Lakebase accessor (psycopg, SDK-minted OAuth token) + pure helpers |
 | `tests/conftest.py` | Puts `src/lakefed_ingest` on `sys.path` |
@@ -110,10 +127,12 @@ JDBC with per-database credentials (JSON `{user,password}`) from a secret scope 
 - No `.cache()` / `.persist()`; read each source once per cycle (Delta MERGE materializes the JDBC
   source itself).
 - No SQL warehouse dependency in the default version.
-- Checkpoints advance only after the Delta commit (at-least-once + idempotent MERGE).
-- Every sink write must be client-scoped when `client_id` is set: tag rows (`ct_engine._tag`), write
-  `write_columns(cfg)`, MERGE on `merge_keys(cfg)`, overwrite via `insert_overwrite_sql(..., cfg)`
-  (REPLACE WHERE client_id), stage via `staging_table_name(sink, cfg)`. Wrap writes in
+- Checkpoints advance only after the Delta commit (at-least-once + idempotent MERGE). An append is
+  not idempotent: record the pending append (`store.record_pending`) before it; the advance clears it.
+- Every sink write must be client-scoped when `client_id` is set: tag rows (`ct_engine._tag`, with
+  `append_meta(cfg, ...)` for append writes), write `write_columns(cfg)`, MERGE on `merge_keys(cfg)`,
+  overwrite via `insert_overwrite_sql(..., cfg)` (REPLACE WHERE client_id) or, in append mode, append
+  (`_write_snapshot` / `_insert_into`), stage via `staging_table_name(sink, cfg)`. Wrap writes in
   `with_write_retry` (Delta conflict retry, exponential backoff).
 
 ## Job orchestration version (`job_orchestration/`)

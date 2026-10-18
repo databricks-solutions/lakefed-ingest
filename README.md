@@ -8,7 +8,7 @@ two versions:
 | Orchestration | One job task ingests a whole `task_collection` in-process (thread pool + Spark FAIR scheduler pools) | Jobs `for_each` tasks: one task run per table / partition |
 | Compute | Job cluster only — no SQL warehouse | SQL warehouse + notebooks |
 | Metadata / state | Lakebase (Postgres): control, checkpoints, reseed queue, telemetry | Delta control table |
-| Source access | Spark JDBC with per-database credentials from a secret scope | Lakehouse Federation / `remote_query` via UC connections |
+| Source access | Spark JDBC with per-database credentials from a secret scope, or `remote_query` through a UC connection per row | Lakehouse Federation / `remote_query` via UC connections |
 | Load types | SQL Server Change Tracking (`ct`) and watermark `cursor`, each with full / partitioned seed; `full` reload (partitioned or not) for every source. `cdc` and non-SQL Server `cursor` are placeholders | Full, watermark incremental, partitioned full |
 | Sources | SQL Server (`ct`, `cursor`, `full`); Oracle, PostgreSQL, MySQL (`full`) | SQL Server, Oracle, PostgreSQL, Redshift, Synapse, IBM Db2 LUW |
 | Bundle | `lakefed_ingest_v2` | `lakefed_ingest` |
@@ -58,6 +58,7 @@ src/lakefed_ingest/
   source_adapters.py               # per-engine dialect: JDBC URL/driver, quoting, size/bounds/select SQL
   load_strategies.py               # per-load_type strategy + the (src_type, load_type) support matrix
   ct_engine.py                     # source ops via Spark JDBC: CT versions, detection, read + MERGE, seed
+  batch_append.py                  # batched appends: many tables -> one sink, one job, one commit
   parallel.py                      # thread pool + FAIR pools + the shared WorkSlots budget
   partitions.py                    # partitioned-seed planning
   state_store.py                   # Lakebase accessor: config, checkpoints, telemetry, locks
@@ -82,7 +83,8 @@ Each run of the `lakefed_ingest` job ingests one `task_collection`:
    Lakebase update — no source reads, no MERGEs, no empty Delta commits.
 3. **Fan out.** Seeds, reseeds, and changed tables run in parallel. Each change set is read once
    from `CHANGETABLE(CHANGES ...)` and applied with an idempotent primary-key MERGE (deletes
-   included); the checkpoint advances only after the MERGE commits.
+   included), or appended to an [append sink](#append-sinks-optional); the checkpoint advances only
+   after the write commits.
 4. **Record.** Per-table events and a run summary are written to Lakebase telemetry.
 
 ### Sources and load strategies
@@ -112,6 +114,17 @@ literals, and the SELECT / size / bounds queries) and `control.load_type` a **lo
   comes from `ALL_TABLES` statistics (no extra privileges). MySQL: `src_schema` is the database.
 - **`jdbc_options`** (JSON object, optional) adds Spark JDBC read options per row, e.g.
   `{"fetchsize": "50000"}`. Connection, credential, driver and query options can't be overridden.
+- **Reading through a Unity Catalog connection** (optional). A row with `use_remote_query = true`
+  reads through the connection named in `src_connection`, with `remote_query` on the same job
+  cluster, instead of Spark JDBC. The connection holds the credentials, so the row needs no
+  `secret_key`, `src_host` or `src_port`. It needs Databricks Runtime 18.3 or later (the job runs
+  `18.x`), and the identity the job runs as needs `USE CONNECTION` on the connection and, because
+  the job cluster is dedicated (single user), `MANAGE` too. The read options (adapter defaults and
+  `jdbc_options`) become `remote_query` options, such as `fetchsize`; one it doesn't support fails
+  the read. A change read's retention guard is part of its query. `snapshot_isolation` can't apply
+  without a session statement, so the planner refuses it for such `ct` rows (with
+  `READ_COMMITTED_SNAPSHOT ON` on the database, each read is consistent on its own). Spark JDBC and
+  `remote_query` map source types separately, so keep each sink's rows on one of the two.
 
 Checkpoints are generic: `checkpoint.strategy` names the strategy that wrote the row and
 `checkpoint.position` (text) is its resume position — for `ct`, the database CT version; for
@@ -126,6 +139,12 @@ Checkpoints are generic: `checkpoint.strategy` names the strategy that wrote the
   during the seed, so there is no gap.
 - **incremental:** read changes since the checkpoint, MERGE, advance. If the checkpoint falls below Change
   Tracking's minimum valid version (retention lapsed), the table is queued for a reseed.
+- **Change reads** stop at the version captured before detection, which the checkpoint then advances
+  to: a change committed later waits for the next run instead of being read twice. Under the default
+  READ COMMITTED, the change table and the base table are read at slightly different times; a change
+  whose row was deleted in between is skipped (its delete arrives next run). Job parameter
+  `snapshot_isolation = "true"` reads both as of one point in time instead (needs
+  `ALLOW_SNAPSHOT_ISOLATION ON` on every source database).
 
 Delivery is at-least-once (checkpoint advances post-commit) and the MERGE is idempotent, so there
 are no gaps and no duplicates.
@@ -162,8 +181,9 @@ once (`materializeSource=auto`).
 Most tables in a large estate don't change between runs. Change Tracking versions are per
 database, so detection is grouped by source database:
 
-- **Per-database fast exit.** Capture the database's current CT version once. If every
-  checkpoint is already at that version, the whole database is unchanged after one small query.
+- **Per-database fast exit.** One small query reads the database's current CT version and every
+  table's CT state. If every checkpoint is already at that version, the whole database is
+  unchanged after that one query.
 - **Batched detection.** Otherwise one `EXISTS`-style query per chunk of tables
   (`detection_chunk`, default 200) classifies each table as changed, unchanged, or needing reseed.
   The version is captured *before* detection, so changes after it are picked up next run.
@@ -221,7 +241,8 @@ source databases at the **same** sink (e.g. every client's `dbo.orders` → `mai
 **Guards.** A unique index allows one row per (sink, `client_id`) — one row per dedicated sink.
 A sink claimed by a dedicated row *and* consolidated rows fails those rows at stage `plan`, and a
 write into an existing sink whose mode doesn't match (a dedicated row into a table with a
-`__client_id__` column, or the reverse) fails that table — so no row can overwrite another's data.
+`__client_id__` column, or the reverse; a merge row into an append sink, or the reverse) fails that
+table, so no row can overwrite another's data.
 
 **Write conflicts.** Clients (or jobs) writing the same sink at once can hit Delta concurrency
 conflicts. A conflict retries the whole unit (re-read + write) with exponential backoff and full
@@ -229,7 +250,54 @@ jitter: 6 attempts, 1 s base, 60 s cap (env `LAKEFED_WRITE_RETRY_ATTEMPTS`, `_BA
 slot is held while waiting. Retries are logged (`[retry]`); if they become frequent, stagger the
 collections writing the same sinks.
 
-### Concurrency — one knob
+### Append sinks (optional)
+
+With `control.write_mode = 'append'` (load types `ct` and `full`), the sink is a change log rather
+than a copy of the source table: nothing in it is updated or deleted, and every write adds rows
+with four extra columns:
+
+| Column | Value |
+|---|---|
+| `__change_op` | `I`, `U` or `D` for a Change Tracking change; `S` for a snapshot row (a seed, a reseed, or a `full` load) |
+| `__change_version` | A change's commit version (`SYS_CHANGE_VERSION`); for a seed, the CT version captured before it; NULL for a `full` load |
+| `__extracted_at` | When the rows were read |
+| `__run_id` | The `ingest_run` that wrote them |
+
+- A change row has the key from the change table and the other columns from the base table; a
+  delete has only the key. Change Tracking returns the net change per key since the checkpoint, so
+  a row updated several times between runs appears once, at its latest version.
+- A seed or reseed appends the whole table as `S` rows: a complete snapshot of that client's table
+  at one version. A reseed follows lapsed retention, CT turned off and on, or a version reset
+  (changes that couldn't be read), so downstream, a key missing from a later snapshot was deleted.
+  A `full` load appends a snapshot every run, so the sink grows by the table's size each run (fine
+  for small tables and views; use merge mode for large ones). Treat each (`__client_id__`,
+  `__run_id`) set of `S` rows as one snapshot.
+- With `client_id`, many source databases append to one sink, created with liquid clustering on
+  `__client_id__`. `client_attrs` adds identity columns: a JSON object such as
+  `{"tenant_name": "Acme", "source_server": "sql01"}`, written as STRING columns on every row
+  (merge sinks accept them too). Names are letters, digits and `_`, and must not collide with
+  `select_list`.
+- **No duplicates.** An append isn't idempotent the way a MERGE is. Before each `ct` append (a
+  change set or a seed) the run records on the checkpoint the position the append reaches and its
+  `run_id`; the checkpoint advance clears them. If a run stops in between, the next run looks in the sink for that client's
+  rows with that `__run_id`: found, the append committed and the checkpoint advances (outcome
+  `recovered`); not found, the table reads again from its checkpoint.
+- Downstream (for example SCD2 or a current-state view), order a key's rows by `__change_version`.
+
+**Batched appends.** With many source databases per sink, most of a run is per-table overhead: a
+Spark job and a Delta commit for a few changed rows. Set the job parameter `append_batch_size`
+(default `1`, off) to batch them: changed tables, seeds and `full` loads of append rows with a
+`client_id` (not partitioned) that write the same sink are read together (one JDBC query per source
+database, unioned by name, as one Spark job with a task per database) and appended in one Delta
+commit. A batch holds one `parallelism` slot per table it reads, so raise `parallelism` with it
+(source queries run on the executors, so their cores bound how many run at once). Change batches
+run first, seed batches last. If a batch fails, the run first checks the sink for rows the batch
+committed anyway, then splits the rest in halves and retries; a table that fails on its own takes
+the per-table path, so it fails exactly as it would without batching. A batched table's
+`ingest_event` row is written when its batch finishes, with `pool` = `batch<size>` and no row count
+(the batch total is in the job output).
+
+### Concurrency
 
 The job's `parallelism` parameter is the maximum number of units of query work running at once in
 a run: a change read + MERGE, a seed, one partition of a partitioned seed, a small source query, or
@@ -237,10 +305,41 @@ the staging swap. Each unit holds one slot of a shared budget and its own FAIR p
 holds a slot while waiting on other work, so nested fan-out can't deadlock. The budget is per run;
 concurrent runs of different collections each have their own.
 
+**Per-source cap.** Concurrent runs whose collections read the same server add up, so a source can
+get many runs' `parallelism` at once. Set `max_queries_per_source` (default `0`, off) to cap the
+queries on one source across every run that shares the Lakebase database. A source is a UC connection
+(rows with `use_remote_query`) or a JDBC host and port. Each run holds a shared Lakebase advisory lock
+per source it reads, on its collection-lock connection (released with it), and takes an equal share
+of the cap: the cap divided by the runs holding that source's lock, at least 1 (so when more runs
+read a source than the cap allows, the total is one query per run). Shares are recounted
+every 15 seconds, so the total can pass the cap for up to 15 seconds after a run starts, until the
+other runs shrink their shares; a share a run doesn't use isn't lent to the others. A unit that
+queries a source takes one of its permits before its slot (a batch takes one per read; a batch
+bigger than the share runs alone on that source). Requests for a source are admitted in arrival
+order. The job output and `ingest_run.detail` list each source's share and the most permits in use
+(`source_caps`). With the cap, `parallelism` can be sized for the compute and the cap for the source.
+
 **Compute.** The ingestion job runs on a job cluster (DBR 18, single user,
 `spark.scheduler.mode=FAIR`) sized by the `node_type_id`, `driver_node_type_id`, and `num_workers`
 bundle variables. It is driver-bound (per-table MERGE planning and Delta commits), so size the
 driver first.
+
+### Large estates
+
+Job parameters for estates of thousands of databases and millions of tables (defaults keep the
+behavior described above). Each defaults to the bundle variable of the same name, so a target can
+set them:
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `max_seeds_per_run` | `0` (no limit) | At most this many seeds per run; the rest seed in later runs. Onboarding then takes several bounded runs, and tables already seeded keep getting their increments in each. Seeds whose last attempt failed go last |
+| `freshness_interval_s` | `0` | Unchanged tables whose checkpoint is already current are written to Lakebase only when `last_success_at` is older than this. Nearly every table is quiet nearly every run, so this removes most of a run's Lakebase writes; `last_success_at` is then up to this stale |
+| `append_batch_size` | `1` (off) | [Batched appends](#append-sinks-optional) for append sinks with `client_id` |
+| `detection_chunk` | `200` | Tables per change-detection query. Set it to at least the tables per database, so a changed database costs one detection query |
+
+Each run loads its collection's control rows into the driver (repeated values such as
+`select_list` are shared, but each row is still a Python dict), so prefer more, smaller collections
+over a few huge ones: for example a few hundred thousand tables each.
 
 ## Metadata (Lakebase)
 
@@ -282,16 +381,22 @@ so control and telemetry tables can be queried from DBSQL. See [docs/monitoring.
 ### Control rows
 
 Key columns: `task_collection`, `src_type`, `src_host` / `src_port` (NULL port = the engine
-default), `src_database`, `src_schema`, `src_table`, `secret_key`, `primary_key` (comma-separated;
+default) and `secret_key`, or `src_connection` with `use_remote_query` (see
+[Sources and load strategies](#sources-and-load-strategies)), `src_database`, `src_schema`,
+`src_table`, `primary_key` (comma-separated;
 required for `ct`, `cursor` and `cdc`), `select_list` (explicit columns — `*` isn't supported),
 `sink_catalog` / `sink_schema` / `sink_table`, `load_type` (`ct` | `full` | `cursor` | `cdc`), the
 optional partitioned-seed settings, `cursor_column` (required for `cursor`), `client_id`
-(consolidated sinks), and `jdbc_options`.
+(consolidated sinks), `write_mode` (`merge` | `append`, see [Append sinks](#append-sinks-optional)),
+`client_attrs` (identity columns, JSON), and `jdbc_options`.
 `cdc_capture_instance` is reserved for the placeholder `cdc` strategy. Check constraints reject invalid combinations (e.g.
 `ct` on a non-SQL Server source). See `notebooks/load_control_example.ipynb`.
 
 **Schema changes.** Writes use schema evolution. Adding a column to `select_list` adds it to the
-sink and reseeds that table so historical rows are backfilled. New sinks get
+sink and reseeds that table so historical rows are backfilled. With the job parameter
+`reseed_on_new_columns = "false"` the table carries on from its checkpoint instead: the column is
+added and is NULL on rows written before (useful for append sinks, where a reseed appends a full
+snapshot of every table that gained the column). New sinks get
 `delta.enableTypeWidening`; for older sinks run
 `ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')`.
 
@@ -303,12 +408,12 @@ sink and reseeds that table so historical rows are backfilled. New sinks get
 | Schema + migrations | `lakefed_ingest_setup` job (idempotent; re-run after upgrades) |
 | Lakebase auth | SDK-minted OAuth token at runtime; the run identity must be a Postgres role on the instance |
 | Cluster → Lakebase network path (port 5432) | Workspace IP access list must allow cluster egress, or use Private Link. Verify first. |
-| Per-database source credentials | One JSON secret `{"user","password"}` per source database, named by `control.secret_key`, in the `secret_scope` (may be Azure Key Vault-backed) |
+| Per-database source credentials | One JSON secret `{"user","password"}` per source database, named by `control.secret_key`, in the `secret_scope` (may be Azure Key Vault-backed); or, for rows with `use_remote_query`, a UC connection on which the job's identity has `USE CONNECTION` and `MANAGE` |
 | Cluster → source network path (SQL Server 1433, Oracle 1521, PostgreSQL 5432, MySQL 3306) | Customer networking |
 | `ct` source tables: CT enabled + primary key, `CHANGE_RETENTION` longer than the seed time (snapshot isolation is not required) | Source-side configuration |
 | Oracle / MySQL sources: JDBC driver library on the job cluster | Uncomment it in `resources/lakefed_ingest.yml` |
 
-No UC connections, `remote_query`, or SQL warehouse are needed.
+No SQL warehouse is needed, and UC connections only for rows that read through one.
 
 > Deploying `lakefed_ingest_setup.yml` **creates a billable Lakebase instance** unless you bind an
 > existing one.
@@ -324,7 +429,8 @@ databricks bundle deploy -t <target> -p <profile>
 # One-time and after upgrades: apply / migrate the Lakebase schema.
 databricks bundle run lakefed_ingest_setup -t <target> -p <profile>
 
-# Load one secret per source database (or use an Azure Key Vault-backed scope).
+# Load one secret per source database (or use an Azure Key Vault-backed scope). Rows that read
+# through a UC connection (use_remote_query) need none.
 databricks secrets put-secret <scope> <secret_key> --string-value '{"user":"..","password":".."}'
 
 # Register tables: edit and run notebooks/load_control_example.ipynb.

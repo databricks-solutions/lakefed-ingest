@@ -71,8 +71,8 @@ def test_cursor_position_round_trip():
 def test_full_load_ensures_sink_then_seeds(monkeypatch):
     calls = []
     monkeypatch.setattr(ce, "ensure_sink_table", lambda sp, cfg, sink, slots=None: calls.append(("ensure", sink)))
-    monkeypatch.setattr(ce, "seed", lambda sp, cfg, sink, slots=None, executor=None, guard=None:
-                        calls.append(("seed", sink, guard)) or 42)
+    monkeypatch.setattr(ce, "seed", lambda sp, cfg, sink, slots=None, executor=None, guard=None, run_id=None:
+                        calls.append(("seed", sink, guard, run_id)) or 42)
     g = object()
-    assert ls.get_strategy("full").load("spark", {"id": 1}, "c.s.t", guard=g) == 42
-    assert calls == [("ensure", "c.s.t"), ("seed", "c.s.t", g)]
+    assert ls.get_strategy("full").load("spark", {"id": 1}, "c.s.t", guard=g, run_id=7) == 42
+    assert calls == [("ensure", "c.s.t"), ("seed", "c.s.t", g, 7)]

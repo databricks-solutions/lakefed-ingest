@@ -24,7 +24,15 @@ seed/merge/load/checkpoint — pinpoints *where* a failure happened; `plan` = th
 `position_from`/`position_to` (checkpoint positions as text — the CT version for `ct`; NULL for
 `full`), `pool`, and `error`. One row is INSERTed at start
 (status `running`) and UPDATEd at finish — concurrent workers touch distinct rows, so there is no
-write contention.
+write contention. Tables in a batched append (`append_batch_size` > 1) are the exception: their rows
+are inserted, finished, when the batch ends, with `pool` = `batch<size>` and no row counts, so they
+don't appear among the in-flight tables. A `verify` stage is a run checking the sink for an append
+an earlier run left pending.
+
+A run that ends without finishing (cancelled, or its cluster went away) can't close its own rows. The
+next run of the same collection holds the collection's lock, so it closes them at launch: the dead
+run's `ingest_run` row and its `running` events become `failed`, with the run's `detail` naming the
+run that closed it (`closed_by_run`). Until then the dead run still reads `running`.
 
 Table and column reference: [lakebase_schema.md](lakebase_schema.md).
 

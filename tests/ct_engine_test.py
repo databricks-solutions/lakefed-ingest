@@ -28,6 +28,48 @@ def test_ct_projection_composite_pk():
     assert "t.[ord] AS [ord]" not in parts and "t.[line_no] AS [line_no]" not in parts
 
 
+def test_ct_projection_matches_keys_case_insensitively():
+    # SQL Server metadata often disagrees on case (OrderLineID in the PK, orderLineID in the
+    # column list); projecting both would give Spark two columns with the same name.
+    parts = [p.strip() for p in ce.ct_projection("orderLineID, note", "OrderLineID").split(",")]
+    assert parts == ["ct.[OrderLineID] AS [OrderLineID]", "t.[note] AS [note]",
+                     "ct.SYS_CHANGE_OPERATION AS op"]
+
+
+def test_columns_that_differ_only_by_case_are_refused_not_dropped():
+    # On a case-sensitive collation, id and ID can be two columns. Matching them to the key ignoring
+    # case would silently drop one; Delta can't hold both either, so the row fails with a clear error.
+    for build in (ce.ct_projection, ce.merge_set):
+        with pytest.raises(ValueError, match="differ only by case"):
+            build("id, ID, qty", "id")
+        with pytest.raises(ValueError, match="differ only by case"):
+            build("Qty, qty", "id")
+
+
+def test_merge_set_matches_keys_case_insensitively():
+    assert ce.merge_set("orderLineID, note", "OrderLineID") == "`note` = s.`note`"
+
+
+def test_sink_fqn_quotes_each_part():
+    cfg = {"sink_catalog": "01-sales-dev", "sink_schema": "team-a-bronze",
+           "sink_table": "we`ird"}
+    assert ce.sink_fqn(cfg) == "`01-sales-dev`.`team-a-bronze`.`we``ird`"
+
+
+def test_sink_fqn_keeps_names_that_are_already_quoted():
+    # Earlier versions didn't quote, so control rows may hold quoted names already.
+    cfg = {"sink_catalog": "`01-sales-dev`", "sink_schema": "bronze", "sink_table": "`we``ird`"}
+    assert ce.sink_fqn(cfg) == "`01-sales-dev`.`bronze`.`we``ird`"
+    assert ce.quote_delta_ident("`a`b`") == "```a``b```"   # not a quoted identifier: quote it
+    assert ce.quote_delta_ident("`") == "````"
+
+
+def test_staging_table_name_stays_valid_for_quoted_sinks():
+    assert ce.staging_table_name("`c-1`.`s`.`t`") == "`c-1`.`s`.`t__seed_staging`"
+    assert ce.staging_table_name("`c-1`.`s`.`t`", _CONS).startswith("`c-1`.`s`.`t__seed_staging__tenant_001_")
+    assert ce.staging_table_name("`c-1`.`s`.`t`", _CONS).endswith("`")
+
+
 def test_ct_join_and_merge_on():
     assert ce.ct_join("ord, line_no") == "t.[ord] = ct.[ord] AND t.[line_no] = ct.[line_no]"
     assert ce.merge_on("order_id") == "tgt.`order_id` = s.`order_id`"
@@ -39,6 +81,33 @@ def test_ct_read_query_shape():
     q = ce.ct_read_query(cfg, 8)
     assert "CHANGETABLE(CHANGES [dbo].[orders], 8) ct" in q
     assert "LEFT JOIN [dbo].[orders] t ON t.[order_id] = ct.[order_id]" in q
+
+
+def test_ct_read_query_is_unbounded_unless_given_a_version():
+    cfg = {"src_schema": "dbo", "src_table": "orders",
+           "select_list": "order_id, amount", "primary_key": "order_id"}
+    assert "SYS_CHANGE_VERSION <=" not in ce.ct_read_query(cfg, 8)
+    assert ce.ct_read_query(cfg, 8, 12).endswith(
+        "LEFT JOIN [dbo].[orders] t ON t.[order_id] = ct.[order_id] "
+        "WHERE (ct.SYS_CHANGE_OPERATION = 'D' OR t.[order_id] IS NOT NULL) AND ct.SYS_CHANGE_VERSION <= 12")
+
+
+def test_ct_read_query_skips_changes_whose_base_row_is_gone():
+    # An update read from the change table whose base row was deleted before the join read it would
+    # otherwise land with NULL columns; its delete has a later version and comes next cycle.
+    cfg = {"src_schema": "dbo", "src_table": "lines",
+           "select_list": "ord, line_no, qty", "primary_key": "ord, line_no"}
+    assert ce.ct_read_query(cfg, 8).endswith(
+        "WHERE (ct.SYS_CHANGE_OPERATION = 'D' OR t.[ord] IS NOT NULL)")
+
+
+def test_change_read_session_init_adds_snapshot_isolation_when_enabled(monkeypatch):
+    cfg = {"src_schema": "dbo", "src_table": "t"}
+    monkeypatch.delenv("LAKEFED_SQL_SNAPSHOT_ISOLATION", raising=False)
+    assert ce.ct_read_session_init(cfg, 5) == ce.ct_retention_guard_sql(cfg, 5)
+    monkeypatch.setenv("LAKEFED_SQL_SNAPSHOT_ISOLATION", "true")
+    assert ce.ct_read_session_init(cfg, 5) == (
+        "SET TRANSACTION ISOLATION LEVEL SNAPSHOT; " + ce.ct_retention_guard_sql(cfg, 5))
 
 
 def test_merge_set_excludes_pk():
@@ -166,7 +235,8 @@ def test_target_writes_are_data_only_insert_overwrite():
     # (saveAsTable overwrite commits as CREATE OR REPLACE TABLE AS SELECT, which can reset liquid
     # clustering keys / properties / row filters that consolidated bronze relies on).
     import inspect, ct_engine
-    src = inspect.getsource(ct_engine.seed) + inspect.getsource(ct_engine._partitioned_seed)
+    src = (inspect.getsource(ct_engine.seed) + inspect.getsource(ct_engine._partitioned_seed)
+           + inspect.getsource(ct_engine._write_snapshot))
     assert "_insert_overwrite(" in src
     assert 'saveAsTable(sink_fqn)' not in src.replace('mode("ignore")', "")
     assert "INSERT OVERWRITE" in inspect.getsource(ct_engine._insert_overwrite)
@@ -225,10 +295,15 @@ def test_jdbc_config_no_host_raises(monkeypatch):
 # ---- partitioned seed: failure leaves the target untouched; success swaps once -----------
 
 class _FakeLit:
-    """Stands in for pyspark F.lit in ct_engine._tag."""
-    def __init__(self, value): self.value, self.name = value, None
+    """Stands in for pyspark F.lit (and the cast) in ct_engine._lit."""
+    def __init__(self, value, dtype=None): self.value, self.dtype, self.name = value, dtype, None
     def alias(self, name): self.name = name; return self
     def __repr__(self): return f"lit({self.value!r}) AS {self.name}"
+
+class _Col:
+    """Stands in for a pyspark Column taken from a DataFrame (``df[name]``)."""
+    def __init__(self, name): self.name = name
+    def __repr__(self): return f"col({self.name})"
 
 class _Row(dict):
     def asDict(self):
@@ -262,6 +337,13 @@ class _DF:
     def select(self, *cols):                       # ct_engine._tag: records the projection
         self.spark.tagged.append(cols)
         return _DF(self.spark, self.query)
+
+    def __getitem__(self, name):                   # df[name]: a column object, as PySpark's DataFrame
+        return _Col(name)
+
+    def unionByName(self, other, allowMissingColumns=False):   # ct_engine.union_by_name
+        assert allowMissingColumns
+        return _DF(self.spark, f"{self.query} UNION {other.query}")
 
     def first(self):
         if "table_size_mb" in self.query:
@@ -538,6 +620,18 @@ def test_ct_read_carries_the_retention_guard(monkeypatch):
     assert ce.RETENTION_LAPSED_MARKER in seen.get("session_init", "") and "> 5" in seen["session_init"]
 
 
+def test_ct_read_is_bounded_by_to_version(monkeypatch):
+    queries = []
+
+    def fake_read(sp, cfg, q, **kw):
+        queries.append(q)
+        return _DF(sp, q)
+    monkeypatch.setattr(ce, "_read", fake_read)
+    spark = _MergeSpark(result=_Row(num_affected_rows=0))
+    ce.read_and_merge_ct(spark, _MERGE_CFG, "c.s.t", 5, to_version=9)
+    assert queries[-1].endswith("AND ct.SYS_CHANGE_VERSION <= 9")
+
+
 # ---- source adapters: the JDBC read and the seed / full-load SQL follow control.src_type ----------
 
 class _Reader:
@@ -767,7 +861,21 @@ def test_tag_prepends_client_id_literal_first(monkeypatch):
     ce._tag(df, _CONS)
     (cols,) = spark.tagged
     assert isinstance(cols[0], _FakeLit) and cols[0].value == "tenant-001" and cols[0].name == "__client_id__"
-    assert list(cols[1:]) == ["id", "v"]                  # original columns follow, in order
+    assert [c.name for c in cols[1:]] == ["id", "v"]      # original columns follow, in order
+
+
+def test_tag_selects_columns_as_objects_never_by_name(monkeypatch):
+    # A bare name makes PySpark resolve a JVM class by short name, which misses the driver's classpath
+    # under the notebook class loader's lock: one miss per column per table, and every table worker
+    # queues on that lock. So every column, the moved change-read ones too, goes in as df[name].
+    monkeypatch.setattr(ce, "_lit", _FakeLit)
+    spark = _FakeSpark()
+    df = _DF(spark, "q")
+    df.columns = ["id", "v", "__change_op", "__change_version"]
+    ce._tag(df, _APP, ce.append_meta(_APP, run_id=42, changes=True))
+    ce._tag(_DF(spark, "q"), _CONS)
+    for cols in spark.tagged:
+        assert not [c for c in cols if isinstance(c, str)]
 
 
 def test_dedicated_sink_may_have_a_native_client_id_column():
@@ -838,3 +946,335 @@ def test_read_and_merge_ct_retries_whole_unit_on_conflict(monkeypatch):
     merges = [x for x in spark.statements if x.startswith("MERGE")]
     views = {x.split(" USING ")[1].split()[0] for x in merges}
     assert len(reads) == 2 and len(merges) == 2 and len(views) == 2 and spark.views == {}
+
+
+# ---- append write mode: identity columns, change-log rows, nothing replaced -------------------------
+
+_APP = dict(_CONS, write_mode="append",
+            client_attrs='{"tenant_name": "Acme", "source_server": "sql1", "app_version": 3}')
+
+
+def test_client_attrs_parse_in_order_as_text():
+    assert ce.client_attrs(_APP) == [("tenant_name", "Acme"), ("source_server", "sql1"),
+                                     ("app_version", "3")]
+    assert ce.client_attrs({"client_attrs": None}) == [] and ce.client_attrs({"client_attrs": " "}) == []
+    assert ce.client_attrs({"client_attrs": {"a": None}}) == [("a", None)]
+
+
+def test_client_attrs_validation():
+    for bad, match in (('["a"]', "JSON object"), ('{"__x": 1}', "invalid client_attrs column"),
+                       ('{"a b": 1}', "invalid client_attrs column"), ('{"A": 1, "a": 2}', "given twice"),
+                       ('{"a": {"b": 1}}', "must be a string")):
+        with pytest.raises(ValueError, match=match):
+            ce.client_attrs({"client_attrs": bad})
+
+
+def test_write_mode_defaults_to_merge_and_validates():
+    assert ce.write_mode({}) == "merge" and ce.write_mode({"write_mode": " Append "}) == "append"
+    assert ce.is_append(_APP) and not ce.is_append(_CONS)
+    with pytest.raises(ValueError, match="invalid write_mode"):
+        ce.write_mode({"write_mode": "upsert"})
+
+
+def test_append_write_columns_and_identity_columns_in_merge_mode():
+    assert ce.write_columns(_APP) == ["id", "v", "__client_id__", "tenant_name", "source_server",
+                                      "app_version", "__change_op", "__change_version",
+                                      "__extracted_at", "__run_id"]
+    assert ce.write_columns(dict(_CONS, client_attrs='{"tenant_name": "Acme"}')) == \
+        ["id", "v", "__client_id__", "tenant_name"]
+
+
+def test_tag_leads_with_identity_then_append_metadata(monkeypatch):
+    monkeypatch.setattr(ce, "_lit", _FakeLit)
+    spark = _FakeSpark()
+    df = _DF(spark, "q")
+    df.columns = ["id", "v", "__change_op", "__change_version"]       # what a change read returns
+    ce._tag(df, _APP, ce.append_meta(_APP, run_id=42, changes=True))
+    (cols,) = spark.tagged
+    assert [c.name for c in cols] == [
+        "__client_id__", "tenant_name", "source_server", "app_version",
+        "__change_op", "__change_version", "__extracted_at", "__run_id", "id", "v"]
+    lits = {c.name: c for c in cols if isinstance(c, _FakeLit)}
+    assert (lits["__run_id"].value, lits["__run_id"].dtype) == (42, "bigint")
+    assert (lits["app_version"].value, lits["app_version"].dtype) == ("3", "string")
+    assert lits["__extracted_at"].dtype == "timestamp"
+
+
+def test_snapshot_metadata_is_typed_even_when_null(monkeypatch):
+    monkeypatch.setattr(ce, "_lit", _FakeLit)
+    meta = ce.append_meta(_APP, run_id=7)
+    assert [(m.name, m.value, m.dtype) for m in meta[:2]] == [("__change_op", "S", "string"),
+                                                             ("__change_version", None, "bigint")]
+    assert ce.append_meta(_CONS) == []
+
+
+def test_append_change_read_projects_operation_and_version():
+    q = ce.ct_read_query(dict(_MERGE_CFG, write_mode="append"), 5, 9)
+    assert ("ct.SYS_CHANGE_OPERATION AS [__change_op], CAST(ct.SYS_CHANGE_VERSION AS BIGINT) AS "
+            "[__change_version] FROM CHANGETABLE(CHANGES [dbo].[t], 5) ct") in q
+    assert " AS op " not in q and " AS op " in ce.ct_read_query(_MERGE_CFG, 5, 9)
+
+
+def test_append_and_merge_sinks_are_never_mixed():
+    log = ["__client_id__", "tenant_name", "__change_op", "id", "v"]
+    ce.check_sink_mode(_APP, "c.s.t", log)
+    with pytest.raises(ValueError, match="has no '__change_op' column but this control row's write_mode is 'append'"):
+        ce.check_sink_mode(_APP, "c.s.t", ["__client_id__", "id", "v"])
+    with pytest.raises(ValueError, match="has an '__change_op' column but this control row's write_mode is 'merge'"):
+        ce.check_sink_mode(_CONS, "c.s.t", log)
+    ce.check_sink_mode(dict(_CONS, select_list="id, __change_op"), "c.s.t", log)   # the source's own column
+
+
+def test_ensure_sink_table_creates_an_append_sink_with_its_columns(monkeypatch):
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
+    monkeypatch.setattr(ce, "_lit", _FakeLit)
+    monkeypatch.setattr(_Table, "columns", ["__client_id__", "tenant_name", *ce.APPEND_COLUMNS, "id", "v"])
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: False
+    ce.ensure_sink_table(spark, _APP, "c.s.t")
+    (cols,) = spark.tagged
+    assert [c.name for c in cols if isinstance(c, _FakeLit)][-4:] == list(ce.APPEND_COLUMNS)
+    assert any(x.startswith("CREATE TABLE IF NOT EXISTS c.s.t CLUSTER BY (`__client_id__`)") for x in spark.statements)
+
+
+def test_append_seed_appends_a_snapshot_and_replaces_nothing(monkeypatch):
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
+    monkeypatch.setattr(ce, "_lit", _FakeLit)
+    spark = _FakeSpark()
+    assert ce.seed(spark, dict(_APP, src_table="big"), "c.s.big", run_id=42, version=500) == 1
+    (write,) = [x for x in spark.statements if x.startswith("INSERT")]
+    assert write.startswith("INSERT WITH SCHEMA EVOLUTION INTO c.s.big BY NAME SELECT `id`, `v`, `__client_id__`, "
+                            "`tenant_name`, `source_server`, `app_version`, `__change_op`, "
+                            "`__change_version`, `__extracted_at`, `__run_id` FROM seed_full_")
+    assert "REPLACE WHERE" not in write and spark.views == {}
+    lits = {c.name: c.value for c in spark.tagged[0] if isinstance(c, _FakeLit)}
+    assert (lits["__change_op"], lits["__change_version"], lits["__run_id"]) == ("S", 500, 42)
+
+
+def test_append_partitioned_seed_appends_the_staged_snapshot(monkeypatch):
+    spark = _FakeSpark()
+    _seed(monkeypatch, spark, client_id="tenant-001", write_mode="append")
+    staging = ce.staging_table_name("c.s.big", {"client_id": "tenant-001"})
+    finals = [x for x in spark.statements if x.startswith("INSERT WITH SCHEMA EVOLUTION INTO c.s.big ")]
+    assert finals == ["INSERT WITH SCHEMA EVOLUTION INTO c.s.big BY NAME SELECT `id`, `v`, `__client_id__`, "
+                      f"`__change_op`, `__change_version`, `__extracted_at`, `__run_id` FROM {staging}"]
+    assert not any("REPLACE WHERE" in x or "OVERWRITE c.s.big" in x for x in spark.statements)
+    assert spark.statements[-1] == f"DROP TABLE IF EXISTS {staging}"
+    stamps = {id(c) for cols in spark.tagged for c in cols
+              if isinstance(c, _FakeLit) and c.name == "__extracted_at"}
+    assert len(spark.tagged) > 2 and len(stamps) == 1     # staging and every partition: the same literals
+
+
+def test_read_and_append_ct_appends_change_rows(monkeypatch):
+    reads = []
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: reads.append((q, kw)) or _DF(sp, q))
+    monkeypatch.setattr(ce, "_lit", _FakeLit)
+    spark = _FakeSpark()
+    assert ce.read_and_append_ct(spark, dict(_MERGE_CFG, write_mode="append"), "c.s.t", 5, 9, run_id=42) == 1
+    [(q, kw)] = reads
+    assert q.endswith("AND ct.SYS_CHANGE_VERSION <= 9") and ce.RETENTION_LAPSED_MARKER in kw["session_init"]
+    (write,) = [x for x in spark.statements if x.startswith("INSERT")]
+    assert write.startswith("INSERT WITH SCHEMA EVOLUTION INTO c.s.t BY NAME SELECT `id`, `v`, `__change_op`, "
+                            "`__change_version`, `__extracted_at`, `__run_id` FROM ct_staged_")
+    assert not any(x.startswith("MERGE") for x in spark.statements) and spark.views == {}
+    (cols,) = spark.tagged
+    assert [c.name for c in cols[:2]] == ["__change_op", "__change_version"]   # moved to the front from the read
+
+
+def test_append_committed_looks_for_this_clients_rows_from_that_run():
+    assert ce.append_committed_sql("c.s.t", _APP, 42) == (
+        "SELECT 1 AS found FROM c.s.t WHERE `__client_id__` = 'tenant-001' AND `__run_id` = 42 LIMIT 1")
+    assert ce.append_committed_sql("c.s.t", dict(_APP, client_id=None), 42) == (
+        "SELECT 1 AS found FROM c.s.t WHERE `__run_id` = 42 LIMIT 1")
+
+
+def test_append_committed_needs_the_sink_and_a_row():
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: False
+    assert ce.append_committed(spark, _APP, "c.s.t", 42) is False and spark.statements == []
+    spark.catalog.tableExists = lambda name: True
+    for rows, expected in (([{"found": 1}], True), ([], False)):
+        spark.sql = lambda stmt, rows=rows: type("R", (), {"collect": lambda s: rows})()
+        assert ce.append_committed(spark, _APP, "c.s.t", 42) is expected
+
+
+# ---- batched appends: one union of reads, one INSERT --------------------------------------------------
+
+def test_append_batch_reads_every_member_and_inserts_once(monkeypatch):
+    import parallel
+    reads = []
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: reads.append((cfg["id"], kw.get("session_init")))
+                        or _DF(sp, q))
+    monkeypatch.setattr(ce, "_lit", _FakeLit)
+    spark, slots = _FakeSpark(), parallel.WorkSlots(4)
+    a = dict(_APP, id=1, client_id="eng-1")
+    b = dict(_APP, id=2, client_id="eng-2", select_list="id, v, extra")
+    rows = ce.append_batch(spark, "c.s.t", [ce.change_read(a, 5, 9, run_id=42), ce.change_read(b, 7, 9, run_id=42)],
+                           slots=slots)
+    assert rows == 1 and [r[0] for r in reads] == [1, 2]
+    assert all(ce.RETENTION_LAPSED_MARKER in init for _, init in reads)     # each read keeps its guard
+    (write,) = [x for x in spark.statements if x.startswith("INSERT")]
+    assert write.startswith("INSERT WITH SCHEMA EVOLUTION INTO c.s.t BY NAME SELECT `id`, `v`, `__client_id__`, ")
+    assert write.count("`extra`") == 1 and " FROM batch_staged_" in write
+    assert len(spark.tagged) == 2 and spark.views == {} and slots.peak == 2   # one slot per database read
+
+
+def test_batch_columns_are_every_members_columns_once():
+    a = dict(_CONS, select_list="id, v")
+    b = dict(_CONS, select_list="ID, v, w")
+    assert ce.batch_columns([a, b]) == ["id", "v", "__client_id__", "w"]
+
+
+def test_committed_clients_finds_the_members_whose_rows_landed():
+    assert ce.committed_clients_sql("c.s.t", ["eng-1", "eng-2"], 42) == (
+        "SELECT DISTINCT `__client_id__` AS client FROM c.s.t WHERE `__run_id` = 42 "
+        "AND `__client_id__` IN ('eng-1', 'eng-2')")
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: True
+    spark.sql = lambda stmt: type("R", (), {"collect": lambda s: [{"client": "eng-2"}]})()
+    cfgs = [dict(_APP, client_id="eng-1"), dict(_APP, client_id="eng-2")]
+    assert ce.committed_clients(spark, "c.s.t", cfgs, 42) == {"eng-2"}
+    spark.catalog.tableExists = lambda name: False
+    assert ce.committed_clients(spark, "c.s.t", cfgs, 42) == set()
+
+
+def test_seed_prep_asks_every_database_in_one_job_then_one_by_one_on_failure(monkeypatch):
+    calls = []
+
+    class _PrepDF:
+        def __init__(self, ids): self.ids = ids
+        def unionByName(self, other, allowMissingColumns=False): return _PrepDF(self.ids + other.ids)
+        def collect(self):
+            calls.append(list(self.ids))
+            if 2 in self.ids:
+                raise RuntimeError("Login failed for user")          # database 2 is unreachable
+            return [{"control_id": i, "v": 100 + i, "mv": 5, "bv": None} for i in self.ids]
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _PrepDF([cfg["id"]]))
+    cfgs = [dict(_APP, id=i, client_id=f"eng-{i}") for i in (1, 2, 3)]
+    got = ce.seed_prep(None, cfgs)
+    assert calls == [[1, 2, 3], [1], [2], [3]]
+    assert got[1] == (101, 5, None) and got[3] == (103, 5, None) and isinstance(got[2], RuntimeError)
+    sql = ce.seed_prep_sql(cfgs[0])
+    assert sql.startswith("SELECT CAST(1 AS BIGINT) AS control_id, CAST(CHANGE_TRACKING_CURRENT_VERSION() AS BIGINT)")
+    assert "CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(N'[dbo].[t]'))" in sql and "begin_version" in sql
+
+
+def test_prepare_seed_asks_the_version_ct_state_and_begin_version_in_one_query(monkeypatch):
+    # A per-table seed used to ask three questions (current_version, require_table_ct and, after the
+    # seed, ct_begin_version), each a statement the driver plans. One query answers all three, and
+    # the begin_version is then the one CT had BEFORE the read, as a batched seed records it.
+    import pytest
+    seen = _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": 7, "bv": 3}])
+    assert ce.prepare_seed(None, _APP) == (500, 3)
+    assert seen == [ce.seed_prep_sql(_APP)]
+    _fake_read(monkeypatch, [{"control_id": 1, "v": None, "mv": None, "bv": None}])
+    with pytest.raises(RuntimeError, match="not enabled on this source database"):
+        ce.prepare_seed(None, _APP)
+    _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": None, "bv": None}])
+    with pytest.raises(RuntimeError, match="not enabled on this source table"):
+        ce.prepare_seed(None, _APP)
+
+
+def test_database_ct_state_reads_the_version_and_every_tables_state_in_one_query(monkeypatch):
+    seen = _fake_read(monkeypatch, [{"v": 500, "sch": "DBO", "tbl": "Orders", "mv": 5, "bv": 3},
+                                    {"v": 500, "sch": "dbo", "tbl": "lines", "mv": None, "bv": None}])
+    assert ce.database_ct_state({"src_database": "d"}) == (500, {("dbo", "orders"): (5, 3),
+                                                                ("dbo", "lines"): (None, None)})
+    assert seen == [ce.CT_DATABASE_STATE_SQL] and ce.CT_TABLE_STATUS_SQL in ce.CT_DATABASE_STATE_SQL
+    _fake_read(monkeypatch, [{"v": None, "sch": None, "tbl": None, "mv": None, "bv": None}])   # CT off
+    assert ce.database_ct_state({"src_database": "d"}) == (None, {})
+
+
+# ---- reads through a Unity Catalog connection (use_remote_query) ---------------------------------------
+
+_REMOTE = dict(_MERGE_CFG, id=7, src_type="sqlserver", src_connection="sales_conn", use_remote_query=True,
+               src_database="sales")
+
+
+def test_uses_remote_query_reads_the_flag_as_stored():
+    assert ce.uses_remote_query(_REMOTE) and ce.uses_remote_query(dict(_REMOTE, use_remote_query="true"))
+    assert not ce.uses_remote_query(dict(_REMOTE, use_remote_query=False))
+    assert not ce.uses_remote_query({"src_connection": "legacy"})     # the legacy host lookup stays JDBC
+
+
+def test_remote_query_sql_passes_connection_database_query_and_options_as_parameters():
+    sql, args = ce.remote_query_sql(dict(_REMOTE, jdbc_options='{"fetchsize": "50000"}'), "SELECT N'it''s' AS x")
+    assert sql == "SELECT * FROM remote_query(:conn, database => :db, query => :q, `fetchsize` => :o0)"
+    assert args == {"conn": "sales_conn", "db": "sales", "q": "SELECT N'it''s' AS x", "o0": "50000"}
+
+
+def test_remote_query_sql_names_the_oracle_service():
+    sql, args = ce.remote_query_sql(dict(_REMOTE, src_type="oracle", src_database="ORCLPDB1"), "SELECT 1 FROM dual")
+    assert sql == "SELECT * FROM remote_query(:conn, service_name => :db, query => :q, `fetchsize` => :o0)"
+    assert args["db"] == "ORCLPDB1" and args["o0"] == "10000"          # the adapter's default fetch size
+
+
+def test_read_through_a_connection_runs_remote_query_without_a_secret():
+    class _Spark:
+        def __init__(self):
+            self.calls = []
+
+        def sql(self, stmt, args=None):
+            self.calls.append((stmt, args))
+            return "df"
+    spark = _Spark()
+    assert ce._read(spark, _REMOTE, "SELECT 1 AS one") == "df"         # no secret lookup, no JDBC options
+    [(stmt, args)] = spark.calls
+    assert stmt == "SELECT * FROM remote_query(:conn, database => :db, query => :q)"
+    assert args == {"conn": "sales_conn", "db": "sales", "q": "SELECT 1 AS one"}
+    with pytest.raises(ValueError, match="runs no session statement"):
+        ce._read(spark, _REMOTE, "SELECT 1", session_init=ce.SNAPSHOT_ISOLATION_SQL)
+
+
+def test_change_read_through_a_connection_carries_the_retention_guard_in_its_query():
+    query, init = ce.ct_read(_REMOTE, 5, 9)
+    mv = "CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(N'[dbo].[t]'))"
+    assert init is None and query == (
+        f"SELECT TOP (CASE WHEN {mv} IS NULL OR {mv} > 5 THEN CAST(N'{ce.RETENTION_LAPSED_ERROR}' AS INT) "
+        f"ELSE CAST(9223372036854775807 AS BIGINT) END) * FROM ({ce.ct_read_query(_REMOTE, 5, 9)}) AS c")
+    # SQL Server quotes the value it failed to convert, so the sweep sees the marker and reseeds.
+    assert ce.is_retention_lapsed_error(RuntimeError(
+        f"Conversion failed when converting the nvarchar value '{ce.RETENTION_LAPSED_ERROR}' to data type int."))
+
+
+def test_change_read_over_jdbc_keeps_the_session_guard(monkeypatch):
+    monkeypatch.delenv("LAKEFED_SQL_SNAPSHOT_ISOLATION", raising=False)
+    jdbc = dict(_REMOTE, use_remote_query=False)
+    assert ce.ct_read(jdbc, 5, 9) == (ce.ct_read_query(jdbc, 5, 9), ce.ct_retention_guard_sql(jdbc, 5))
+    assert f"THROW 51000, N'{ce.RETENTION_LAPSED_ERROR}', 1;" in ce.ct_retention_guard_sql(jdbc, 5)
+
+
+def test_changes_through_a_connection_are_read_with_the_guarded_query(monkeypatch):
+    reads = []
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: reads.append((q, kw.get("session_init"))) or _DF(sp, q))
+    monkeypatch.setattr(ce, "_lit", _FakeLit)
+    app = dict(_REMOTE, write_mode="append")
+    assert ce.read_and_append_ct(_FakeSpark(), app, "c.s.t", 5, 9, run_id=42) == 1
+    assert ce.read_and_merge_ct(_FakeSpark(), _REMOTE, "c.s.t", 5, to_version=9) is None
+    guarded = [ce.ct_read_query_guarded(app, 5, 9), ce.ct_read_query_guarded(_REMOTE, 5, 9)]
+    assert reads == [(guarded[0], None), (guarded[1], None)]
+    assert ce.change_read(app, 5, 9, run_id=42)[1:3] == (guarded[0], None)    # a batch member, the same
+
+
+# ---- per-source query caps: which server a unit queries ---------------------------------------------
+
+def test_source_key_names_the_server_a_row_queries():
+    assert ce.source_key(_REMOTE) == "connection:sales_conn"
+    jdbc = dict(_MERGE_CFG, src_type="sqlserver", src_host="SQL01.example", src_port=1500)
+    assert ce.source_key(jdbc) == "host:sql01.example:1500"
+    assert ce.source_key(dict(jdbc, src_port=None)) == "host:sql01.example:1433"           # the adapter's port
+    assert ce.source_key(dict(jdbc, src_connection="lookup")) == "host:sql01.example:1500"  # src_host wins
+    assert ce.source_key({"src_type": "sqlserver", "src_connection": "Legacy"}) == "connection:legacy"
+
+
+def test_units_take_a_permit_of_each_rows_source():
+    import parallel
+    limiter = parallel.SourceLimiter({"connection:sales_conn": 2})
+    slots = parallel.WorkSlots(4, sources=limiter)
+    with ce._unit(slots, _REMOTE):
+        assert limiter.peak == {"connection:sales_conn": 1}
+    with ce._units(slots, [_REMOTE, _REMOTE, dict(_REMOTE, src_connection="other")]):
+        assert limiter.peak == {"connection:sales_conn": 2, "connection:other": 1}
+    with ce._unit(slots):                                    # Delta-only units take no permit
+        assert slots.in_flight == 1
+    assert ce._unit(None, _REMOTE) is not None and ce._units(None, [_REMOTE]) is not None

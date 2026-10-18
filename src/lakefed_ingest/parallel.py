@@ -22,8 +22,85 @@ from __future__ import annotations
 import contextlib
 import queue
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
+
+
+class SourceLimiter:
+    """Per-source caps for one run: at most ``limit(source)`` units query a source at once. A limit
+    can change while the run goes (``set_limit``), e.g. this run's share of a cap that the runs
+    reading the source divide between them (``state_store.SourceShares``); a source with no limit
+    set is not capped.
+
+    A request names one source per query it runs at once (a batch of reads names each member's
+    source). It is admitted when, for each of its sources, the permits in use plus min(its count,
+    the limit) fit the limit (so a request bigger than the limit runs alone on that source rather
+    than never), and no earlier waiting request needs one of its sources: admission is in arrival
+    order per source, so a batch is never starved by a stream of single queries. ``peak`` records
+    the most permits in use per source. Pure Python."""
+
+    def __init__(self, limits: Optional[Dict[str, int]] = None):
+        self._cv = threading.Condition()
+        self._limits = {s: max(1, int(n)) for s, n in (limits or {}).items()}
+        self._in_use: Dict[str, int] = {}
+        self._waiting: List[dict] = []    # requests not yet admitted, in arrival order
+        self.peak: Dict[str, int] = {}
+
+    def limit(self, source: str) -> int:
+        """The source's current limit; 0 when it isn't capped."""
+        with self._cv:
+            return self._limits.get(source, 0)
+
+    def set_limit(self, source: str, limit: int) -> None:
+        with self._cv:
+            self._limits[source] = max(1, int(limit))
+            self._admit()
+            self._cv.notify_all()
+
+    @contextlib.contextmanager
+    def hold(self, sources: Iterable[Optional[str]]):
+        """Block until admitted (see the class docstring); release on exit, even on exception."""
+        need = Counter(s for s in sources if s)
+        if not need:
+            yield
+            return
+        request = {"need": need, "admitted": False}
+        with self._cv:
+            self._waiting.append(request)
+            self._admit()
+            while not request["admitted"]:
+                self._cv.wait()
+        try:
+            yield
+        finally:
+            with self._cv:
+                for source, n in need.items():
+                    self._in_use[source] -= n
+                self._admit()
+                self._cv.notify_all()
+
+    def _fits(self, need: Counter) -> bool:
+        for source, n in need.items():
+            cap = self._limits.get(source, 0)
+            if cap and self._in_use.get(source, 0) + min(n, cap) > cap:
+                return False
+        return True
+
+    def _admit(self) -> None:
+        """Admit waiting requests in arrival order; one that doesn't fit keeps later requests off its
+        sources. Called with the condition held."""
+        blocked, waiting = set(), []
+        for request in self._waiting:
+            if blocked.isdisjoint(request["need"]) and self._fits(request["need"]):
+                for source, n in request["need"].items():
+                    self._in_use[source] = self._in_use.get(source, 0) + n
+                    self.peak[source] = max(self.peak.get(source, 0), self._in_use[source])
+                request["admitted"] = True
+            else:
+                blocked.update(request["need"])
+                waiting.append(request)
+        self._waiting = waiting
 
 
 class WorkSlots:
@@ -39,16 +116,23 @@ class WorkSlots:
     Each slot has a stable id; ``acquire()`` calls ``set_pool(f"pool{id}")`` on the current
     thread so the unit's Spark jobs land in that slot's FAIR scheduler pool (``capacity`` pools,
     one per concurrent unit). ``peak`` records the most units ever in flight (for telemetry).
+
+    With ``sources`` (a ``SourceLimiter``), a unit that names the source it queries also holds one of
+    that source's permits, taken BEFORE its slot: a slot then never waits on a source, and a permit
+    only waits for slots, which units that are running give back.
     Pure Python — no Spark/dbutils imports.
     """
 
-    def __init__(self, capacity: int, set_pool: Optional[Callable[[str], None]] = None):
+    def __init__(self, capacity: int, set_pool: Optional[Callable[[str], None]] = None,
+                 sources: Optional[SourceLimiter] = None):
+        self.sources = sources
         self.capacity = max(1, int(capacity))
         self._free: "queue.Queue[int]" = queue.Queue()
         for i in range(self.capacity):
             self._free.put(i)
         self._set_pool = set_pool
         self._mu = threading.Lock()
+        self._many_mu = threading.Lock()  # one multi-slot acquisition at a time (see acquire_many)
         self._local = threading.local()   # per-thread list of pools used (see start_tracking)
         self.in_flight = 0
         self.peak = 0
@@ -66,24 +150,54 @@ class WorkSlots:
         return pools
 
     @contextlib.contextmanager
-    def acquire(self):
-        """Block until a slot is free; yield its id; always return it (even on exception)."""
-        slot = self._free.get()
+    def acquire(self, source: Optional[str] = None):
+        """Block until a slot is free (and, with ``sources``, a permit of ``source``); yield the slot's
+        id; always return both (even on exception)."""
+        with self._permits([source]):
+            slot = self._free.get()
+            with self._held([slot]):
+                yield slot
+
+    @contextlib.contextmanager
+    def acquire_many(self, n: int, sources: Optional[List[Optional[str]]] = None):
+        """Hold ``n`` slots (capped at ``capacity``) for ONE unit that runs ``n`` units of query work
+        at once (e.g. a batch of source reads executed as one Spark job) and, with ``sources``, a
+        permit of each read's source (``sources``: one entry per read). Yields the first slot's id;
+        its FAIR pool is set on the current thread.
+
+        Deadlock-free under the same rule as ``acquire`` (never hold a slot while waiting): multi-slot
+        acquisitions are serialized, so two of them can never each hold part of what the other waits
+        for, and single-slot holders never wait while holding, so the slots being waited for free up."""
+        n = max(1, min(int(n), self.capacity))
+        with self._permits(sources or []):
+            with self._many_mu:
+                taken = [self._free.get() for _ in range(n)]
+            with self._held(taken):
+                yield taken[0]
+
+    def _permits(self, sources: List[Optional[str]]):
+        if self.sources is None or not any(sources):
+            return contextlib.nullcontext()
+        return self.sources.hold(sources)
+
+    @contextlib.contextmanager
+    def _held(self, taken: List[int]):
         with self._mu:
-            self.in_flight += 1
+            self.in_flight += len(taken)
             self.peak = max(self.peak, self.in_flight)
         try:
-            pool = f"pool{slot}"
+            pool = f"pool{taken[0]}"
             tracked = getattr(self._local, "pools", None)
             if tracked is not None and pool not in tracked:
                 tracked.append(pool)
             if self._set_pool is not None:
                 self._set_pool(pool)
-            yield slot
+            yield
         finally:
             with self._mu:
-                self.in_flight -= 1
-            self._free.put(slot)
+                self.in_flight -= len(taken)
+            for slot in taken:
+                self._free.put(slot)
 
 
 def run_parallel(
