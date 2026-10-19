@@ -317,6 +317,27 @@ def merge_group_results(group_outputs: List[dict]) -> dict:
     return agg
 
 
+# ---- table retries ------------------------------------------------------------------------------------
+def retry_plan(plan: dict, cp: Optional[dict], run_id) -> dict:
+    """The next attempt of a table whose attempt failed in run ``run_id`` (``table_retry``), from its
+    checkpoint ``cp`` as it is now.
+
+    * Merge mode: the same route on the fresh checkpoint. Every write is idempotent (MERGE by key,
+      replace) and the checkpoint advances only after the commit, so doing it again is harmless.
+    * Append mode, CT with a pending append: route ``pending``, which checks whether that append
+      committed before anything else, as after a stopped run.
+    * Any other append: the same route with ``verify_run_id``, so the worker first looks for this
+      run's rows of the table in the sink and appends again only when there are none. This covers a
+      full load (it records no pending append) and a CT table whose checkpoint advance already ran
+      before the attempt failed (the advance clears the pending append)."""
+    cfg = plan["cfg"]
+    if not ct_engine.is_append(cfg):
+        return dict(plan, cp=cp)
+    if ss.strategy_name(cfg) == ls.CT and cp is not None and cp.get("pending_run_id") is not None:
+        return {"cfg": cfg, "route": "pending", "cp": cp}
+    return dict(plan, cp=cp, verify_run_id=run_id)
+
+
 # ---- scale controls -----------------------------------------------------------------------------------
 SEED_ROUTES = ("seed", "cursor_seed")
 
