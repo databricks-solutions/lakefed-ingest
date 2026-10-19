@@ -37,7 +37,8 @@ failure query below lists tables that are still failing.
 A run that ends without finishing (cancelled, or its cluster went away) can't close its own rows. The
 next run of the same collection holds the collection's lock, so it closes them at launch: the dead
 run's `ingest_run` row and its `running` events become `failed`, with the run's `detail` naming the
-run that closed it (`closed_by_run`). Until then the dead run still reads `running`.
+run that closed it (`closed_by_run`). So does the last `retried` event of a table that was waiting for
+its retry, keeping its error with the reason added. Until then the dead run still reads `running`.
 
 Table and column reference: [lakebase_schema.md](lakebase_schema.md).
 
