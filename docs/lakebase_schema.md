@@ -214,13 +214,13 @@ when the watermark hasn't moved.
 | `action` | `seed`, `increment`, `reseed` or `full` |
 | `phase` | Checkpoint phase when the table started |
 | `stage` | How far it got: `plan`, `detect`, `verify` (checking a pending append), `ensure_sink`, `read`, `seed`, `merge`, `load`, `checkpoint`. On a failure, this is where it failed |
-| `status` | `running` → `ok` \| `failed`; `skipped` for a reseed that was only queued (no data copied) |
+| `status` | `running` → `ok` \| `failed`; `skipped` for a reseed that was only queued (no data copied); `retried` for an attempt that failed and was tried again in the same run (`table_retries`), so the table has a later row for its next attempt |
 | `started_at`, `finished_at`, `duration_ms` | Timing |
 | `rows_read`, `rows_merged` | Row counts from the Delta commit metrics (NULL when the runtime doesn't report them) |
 | `position_from`, `position_to` | Checkpoint position before and after (CT version, or cursor value) |
 | `pool` | Spark FAIR pools the table's work ran in |
-| `error` | Error message for a failed table |
-| `retry_count` | Reserved; not currently populated (write-conflict retries are logged in the job output) |
+| `error` | Error message for a failed or retried attempt, with its deepest Java cause when Spark's message leaves it out |
+| `retry_count` | Earlier attempts of this table in the run: 0 for the first, 1 for the first retry. Write-conflict retries inside an attempt are logged in the job output only |
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.

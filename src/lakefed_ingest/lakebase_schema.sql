@@ -295,7 +295,7 @@ create table if not exists lakefed_ingest.ingest_event (
     action          text,                                     -- seed | increment | reseed | full
     phase           text,
     stage           text,                                     -- plan | detect | ensure_sink | read | seed | merge | load | checkpoint
-    status          text        not null default 'running',   -- running | ok | failed | skipped
+    status          text        not null default 'running',   -- running | ok | failed | skipped | retried (an attempt tried again)
     started_at      timestamptz not null default now(),
     finished_at     timestamptz,
     duration_ms     bigint,
@@ -305,7 +305,7 @@ create table if not exists lakefed_ingest.ingest_event (
     position_to     text,
     pool            text,
     error           text,
-    retry_count     int         not null default 0
+    retry_count     int         not null default 0          -- earlier attempts of this table in the run (table_retries)
 );
 
 -- CT versions were bigint before the generic checkpoint; positions are text.

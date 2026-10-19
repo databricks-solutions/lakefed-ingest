@@ -354,14 +354,15 @@ def record_event_start_sql() -> str:
 
 
 def record_event_finish_sql() -> str:
-    """Finalize an ingest_event row: finished_at/duration + outcome + metrics."""
+    """Finalize an ingest_event row: finished_at/duration + outcome + metrics. ``retry_count`` is the
+    number of earlier attempts of the table in this run (``table_retry``)."""
     return (
         f"update {EVENT_TABLE} set "
         "finished_at = now(), "
         "duration_ms = (extract(epoch from (now() - started_at)) * 1000)::bigint, "
         "status = %s, stage = %s, rows_read = %s, rows_merged = %s, "
         "position_from = %s, position_to = %s, error = %s, "
-        "action = coalesce(%s, action), pool = coalesce(%s, pool) "
+        "action = coalesce(%s, action), pool = coalesce(%s, pool), retry_count = coalesce(%s, retry_count) "
         "where id = %s"
     )
 
@@ -741,15 +742,17 @@ class StateStore:
 
     def record_event_finish(self, event_id, status, stage=None, rows_read=None, rows_merged=None,
                             position_from=None, position_to=None, error=None,
-                            action=None, pool=None) -> None:
+                            action=None, pool=None, retry_count=None) -> None:
         """Finalize an ingest_event row; on 'ok' also stamp checkpoint.last_success_at.
         Positions are stored as text. ``action`` (optional) corrects the provisional action set at
-        start (e.g. 'reseed'); ``pool`` (optional) records the FAIR pool(s) the table's units ran in."""
+        start (e.g. 'reseed'); ``pool`` (optional) records the FAIR pool(s) the table's units ran in;
+        ``retry_count`` (optional) the table's earlier attempts in this run. Status 'retried' is an
+        attempt that failed and is tried again."""
         with self._cursor() as cur:
             cur.execute(record_event_finish_sql(), (
                 status, stage, rows_read, rows_merged, position_text(position_from),
                 position_text(position_to),
-                (error[:2000] if isinstance(error, str) else error), action, pool, int(event_id),
+                (error[:2000] if isinstance(error, str) else error), action, pool, retry_count, int(event_id),
             ))
             if status == "ok":
                 cur.execute(touch_last_success_sql(), (int(event_id),))
