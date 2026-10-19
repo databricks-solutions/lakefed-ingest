@@ -426,13 +426,20 @@ def close_abandoned_runs_sql() -> str:
     """Close a collection's other runs still 'running', and their events still 'running', as failed.
     Only a run holding the collection's lock may call it: no other sweep of the collection is then
     alive, so an open run is one that was cancelled or lost its cluster and will never finish its rows.
+    A table that was waiting for its retry (table_retries) when the run died has a last attempt
+    'retried' and no later one: it is closed as failed too, keeping its own error and timing.
+    Params: detail, task_collection, run_id, error (appended to a retried attempt's), error.
     Returns (runs closed, events closed)."""
     return (
         f"with dead as (update {RUN_TABLE} set status = 'failed', finished_at = now(), detail = %s "
         "where task_collection = %s and status = 'running' and run_id <> %s returning run_id), "
-        f"events as (update {EVENT_TABLE} e set status = 'failed', finished_at = now(), "
-        "duration_ms = (extract(epoch from (now() - e.started_at)) * 1000)::bigint, error = %s "
-        "from dead where e.run_id = dead.run_id and e.status = 'running' returning e.id) "
+        f"events as (update {EVENT_TABLE} e set status = 'failed', finished_at = coalesce(e.finished_at, now()), "
+        "duration_ms = coalesce(e.duration_ms, (extract(epoch from (now() - e.started_at)) * 1000)::bigint), "
+        "error = case when e.status = 'retried' then concat(e.error, ' | ', %s) else %s end "
+        "from dead where e.run_id = dead.run_id and (e.status = 'running' or ("
+        f"e.status = 'retried' and not exists (select 1 from {EVENT_TABLE} later "
+        "where later.run_id = e.run_id and later.control_id = e.control_id and later.id > e.id))) "
+        "returning e.id) "
         "select (select count(*) from dead), (select count(*) from events)"
     )
 
@@ -791,10 +798,9 @@ class StateStore:
         """Close the collection's runs that ended without finishing (see ``close_abandoned_runs_sql``);
         ``run_id`` is the caller's own run, which must hold the collection's lock. Returns (runs, events)."""
         detail = json.dumps({"closed_by_run": int(run_id), "reason": ABANDONED_RUN_REASON})
+        error = f"{ABANDONED_RUN_REASON}; closed by run {int(run_id)}"
         with self._cursor() as cur:
-            cur.execute(close_abandoned_runs_sql(), (
-                detail, task_collection, int(run_id), f"{ABANDONED_RUN_REASON}; closed by run {int(run_id)}",
-            ))
+            cur.execute(close_abandoned_runs_sql(), (detail, task_collection, int(run_id), error, error))
             runs, events = cur.fetchone()
         return int(runs), int(events)
 

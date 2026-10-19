@@ -28,7 +28,7 @@ import re
 import threading
 import time
 from collections import Counter
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import ct_engine
 
@@ -53,17 +53,26 @@ _PERMANENT = (
     ct_engine.CT_NOT_ENABLED_MSG, ct_engine.CT_TABLE_NOT_ENABLED_MSG,
     "TABLE_OR_VIEW_NOT_FOUND", "UNRESOLVED_COLUMN", "DELTA_FAILED_TO_MERGE_FIELDS", "CAST_INVALID_INPUT",
     "DATATYPE_MISMATCH", "PKIX path building failed", "UnknownHostException",
+    # Oracle, PostgreSQL, MySQL: a refused login, a missing object, a missing privilege.
+    "ORA-01017", "ORA-00942", "ORA-01031", "ORA-28000", "ORA-01045", "password authentication failed",
+    "does not exist", "doesn't exist", "Access denied for user", "Unknown database", "Unknown column",
 )
 _PERMANENT_CODES = {18456, 4060, 208, 207, 229, 230}
 _PERMANENT_TYPES = (ValueError, KeyError, TypeError)
 _TRANSIENT = (
     "FAILED_JDBC.CONNECTION", "Connection reset", "Broken pipe", "SocketTimeoutException", "Read timed out",
     "connect timed out", "The TCP/IP connection to the host", "The connection is closed", "forcibly closed",
+    "ORA-03113", "ORA-03114", "ORA-03135", "ORA-12170", "ORA-12541", "Communications link failure",
+    "too many clients", "Too many connections",
 )
 # Azure SQL throttling and availability, deadlock victim, and transport errors.
 _TRANSIENT_CODES = {40501, 40613, 40197, 49918, 49919, 49920, 10928, 10929, 1205, 233, 10053, 10054, 10060}
 _CODE = re.compile(r"\bcode=(\d+)")
-_SQLSTATE_08 = re.compile(r"(?:SQLSTATE:?\s*|state=)08[0-9A-Z]{3}\b")
+# SQLSTATE classes: 08 connection exception, 53300 too many connections, 57P01/57P03 server shutting
+# down or starting (transient); 28 invalid authorization, 42 syntax or access rule, 3D unknown
+# database (permanent).
+_SQLSTATE_TRANSIENT = re.compile(r"(?:SQLSTATE:?\s*|state=)(?:08[0-9A-Z]{3}|53300|57P01|57P03)\b")
+_SQLSTATE_PERMANENT = re.compile(r"(?:SQLSTATE:?\s*|state=)(?:28|42|3D)[0-9A-Z]{3}\b")
 _ERROR_CLASS = re.compile(r"\[([A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*)\]")
 
 
@@ -138,11 +147,12 @@ def classify(exc: BaseException) -> str:
     recognised). Rules that rule a retry out win over the transient ones."""
     text = error_text(exc)
     codes = {int(c) for c in _CODE.findall(text)}
-    if any(m in text for m in _NEVER) or any(m in text for m in _PERMANENT) or codes & _PERMANENT_CODES:
+    if (any(m in text for m in _NEVER) or any(m in text for m in _PERMANENT) or codes & _PERMANENT_CODES
+            or _SQLSTATE_PERMANENT.search(text)):
         return PERMANENT
     if any(isinstance(e, _PERMANENT_TYPES) for e in _chain(exc)):
         return PERMANENT
-    if any(m in text for m in _TRANSIENT) or codes & _TRANSIENT_CODES or _SQLSTATE_08.search(text):
+    if any(m in text for m in _TRANSIENT) or codes & _TRANSIENT_CODES or _SQLSTATE_TRANSIENT.search(text):
         return TRANSIENT
     return PERMANENT
 
@@ -178,8 +188,10 @@ class RetryPolicy:
 
     * ``retries``: extra attempts per table.
     * ``budget``: retries in the whole run; once spent, failures fail at once.
-    * ``per_source``: failed retries on one source server (``ct_engine.source_key``) before that
-      source stops retrying for the rest of the run."""
+    * ``per_source``: retries on one source server (``ct_engine.source_key``) that have not succeeded,
+      waiting, running or failed: a source never has more than this many at once, even when an outage
+      fails all its tables at the same moment, and once this many have failed it stops retrying for
+      the rest of the run. A retry that succeeds frees its place."""
 
     def __init__(self, retries: int = 0, budget: int = DEFAULT_BUDGET, per_source: int = None,
                  base_s: float = None, max_s: float = None, rand=random.random,
@@ -189,15 +201,28 @@ class RetryPolicy:
         self.base_s, self.max_s, self.rand, self.source_of = base_s, max_s, rand, source_of
         self._lock = threading.Lock()
         self._left = self.budget
-        self._failed_retries: Counter = Counter()
+        self._held: Dict[object, str] = {}          # control id -> source, for a granted retry not yet over
+        self._open: Counter = Counter()             # per source: granted retries not yet over
+        self._failed_retries: Counter = Counter()   # per source: retries that failed
         self._stopped: List[str] = []
         self._by_class: Counter = Counter()
         self._granted = self._recovered = self._failed_after_retry = 0
         self._exhausted = False
 
+    def _retry_over(self, key, ok: bool) -> None:
+        """The granted retry of control row ``key`` ended (caller holds the lock)."""
+        source = self._held.pop(key, None)
+        if source is None:
+            return
+        self._open[source] -= 1
+        if not ok:
+            self._failed_retries[source] += 1
+            if self._failed_retries[source] >= self.per_source and source not in self._stopped:
+                self._stopped.append(source)
+
     def claim(self, cfg: dict, exc: BaseException, attempt: int) -> Optional[float]:
         """Seconds to wait before retrying ``cfg`` after ``exc`` failed attempt ``attempt`` (0-based), or
-        None: fail now (permanent, out of attempts, budget spent, or the source stopped)."""
+        None: fail now (permanent, out of attempts, budget spent, or the source has no place left)."""
         if self.retries == 0:
             return None
         try:
@@ -205,12 +230,11 @@ class RetryPolicy:
             source = self.source_of(cfg)
         except Exception:                 # can't judge it: fail it, as without retries
             return None
+        key = cfg.get("id")
         with self._lock:
-            if attempt > 0:
-                self._failed_retries[source] += 1
-                if self._failed_retries[source] >= self.per_source and source not in self._stopped:
-                    self._stopped.append(source)
-            if not transient or attempt >= self.retries or source in self._stopped:
+            self._retry_over(key, ok=False)          # attempt > 0: the retry granted for it failed
+            if (not transient or attempt >= self.retries or source in self._stopped
+                    or self._open[source] + self._failed_retries[source] >= self.per_source):
                 return None
             if self._left <= 0:
                 self._exhausted = True
@@ -218,13 +242,17 @@ class RetryPolicy:
             self._left -= 1
             self._granted += 1
             self._by_class[error_class(exc)] += 1
+            self._held[key] = source
+            self._open[source] += 1
         return backoff_delay(attempt, self.base_s, self.max_s, rand=self.rand)
 
-    def finished(self, ok: bool, attempt: int) -> None:
-        """Count a table's final outcome after ``attempt`` (0-based) attempts' retries."""
+    def finished(self, cfg: dict, ok: bool, attempt: int) -> None:
+        """A table's final outcome after ``attempt`` (0-based) attempts. Frees a retry still held for it
+        (it succeeded, or the run stopped before its next attempt could fail through ``claim``)."""
         if attempt == 0:
             return
         with self._lock:
+            self._retry_over(cfg.get("id"), ok)
             if ok:
                 self._recovered += 1
             else:
@@ -244,22 +272,22 @@ def with_retries(worker: Callable, policy: RetryPolicy, replan: Callable, sleep=
     wait the granted delay, then run it again on ``replan(plan)`` (the plan rebuilt from the table's
     checkpoint as it is now). Returns ``run(plan)``."""
     def run(plan):
-        attempt = 0
+        cfg, attempt = plan["cfg"], 0
         while True:
             try:
                 out = worker(plan, attempt=attempt)
             except Retry as granted:
-                sleep(granted.delay)
                 attempt += 1
                 try:
+                    sleep(granted.delay)
                     plan = replan(plan)
-                except Exception:
-                    policy.finished(False, attempt)
+                except BaseException:     # cancelled while waiting, or the retry couldn't be planned
+                    policy.finished(cfg, False, attempt)
                     raise
                 continue
-            except Exception:
-                policy.finished(False, attempt)
+            except BaseException:
+                policy.finished(cfg, False, attempt)
                 raise
-            policy.finished(True, attempt)
+            policy.finished(cfg, True, attempt)
             return out
     return run

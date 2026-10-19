@@ -7,6 +7,8 @@ pending append before a CT append, checks the sink first on a ``pending`` route 
 ``verify_run_id``, and advances the checkpoint after the commit. ``_Sink`` holds rows tagged
 (client, run) and can be told to fail before writing, or to commit and then fail.
 """
+import threading
+
 import pytest
 
 import batch_append as ba
@@ -184,6 +186,22 @@ def _policy(retries=2, budget=20, per_source=5):
     (ValueError("control row 3: Connection reset"), tr.PERMANENT),            # a configuration error
     (RuntimeError("[DELTA_FAILED_TO_MERGE_FIELDS] Failed to merge fields 'v'"), tr.PERMANENT),
     (RuntimeError("something nobody has seen before"), tr.PERMANENT),         # unknown: as today
+    # the other source adapters: Spark wraps their refused logins in FAILED_JDBC.CONNECTION too
+    (_spark_error(cause=_JavaError("java.sql.SQLException", "ORA-01017: invalid username/password; logon denied",
+                                   1017, "72000")), tr.PERMANENT),
+    (RuntimeError("java.sql.SQLSyntaxErrorException: ORA-00942: table or view does not exist"), tr.PERMANENT),
+    (_spark_error(cause=_JavaError("org.postgresql.util.PSQLException",
+                                   'FATAL: password authentication failed for user "x"', 0, "28P01")), tr.PERMANENT),
+    (RuntimeError('org.postgresql.util.PSQLException: ERROR: relation "orders" does not exist'), tr.PERMANENT),
+    (_spark_error(cause=_JavaError("java.sql.SQLException", "Access denied for user 'x'@'h'", 1045, "28000")),
+     tr.PERMANENT),
+    (RuntimeError("java.sql.SQLSyntaxErrorException: Table 'db.orders' doesn't exist"), tr.PERMANENT),
+    (RuntimeError("java.sql.SQLRecoverableException: ORA-03113: end-of-file on communication channel"),
+     tr.TRANSIENT),
+    (_spark_error(cause=_JavaError("org.postgresql.util.PSQLException", "FATAL: sorry, too many clients already",
+                                   0, "53300")), tr.TRANSIENT),
+    (RuntimeError("com.mysql.cj.jdbc.exceptions.CommunicationsException: Communications link failure"),
+     tr.TRANSIENT),
 ])
 def test_classify_retries_transient_source_errors_only(error, expected):
     assert tr.classify(error) == expected
@@ -244,6 +262,45 @@ def test_a_source_stops_retrying_after_its_failed_retries_and_others_carry_on():
     assert policy.summary()["sources_stopped"] == ["host:h1:1433"]
     retried_on_h1 = sum(1 for e in worker.events if e[0] <= 10 and e[3] > 0)
     assert retried_on_h1 == 3                                            # 3 failed retries, then no more
+
+
+def test_failures_at_once_on_one_source_get_at_most_its_limit_of_retries():
+    # A source outage fails many tables at the same moment, before any retry has run: the limit
+    # counts retries granted and not yet succeeded, so it holds then too.
+    policy, start = _policy(retries=2, budget=100, per_source=5), threading.Barrier(32)
+    granted = []
+
+    def fail_first_attempt():
+        start.wait()
+        granted.append(policy.claim(_cfg(1), _spark_error(), 0))
+    threads = [threading.Thread(target=fail_first_attempt) for _ in range(32)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(d is not None for d in granted) == 5 and policy.summary()["retries"] == 5
+
+
+def test_a_retry_that_succeeds_frees_its_place_for_the_next_failure_on_its_source():
+    policy = _policy(retries=2, budget=100, per_source=1)
+    assert policy.claim(_cfg(1), _spark_error(), 0) is not None
+    assert policy.claim(_cfg(2), _spark_error(), 0) is None              # the source's one place is taken
+    policy.finished(_cfg(1), True, 1)
+    assert policy.claim(_cfg(3), _spark_error(), 0) is not None
+
+
+def test_a_run_stopped_during_a_pause_fails_the_table_and_frees_its_place():
+    sink, policy = _Sink(faults={1: ["before"]}), _policy(per_source=1)
+    worker = _Worker(sink, policy)
+
+    def cancelled(seconds):
+        raise KeyboardInterrupt("the run was cancelled")
+    run = tr.with_retries(worker, policy, worker.replan, sleep=cancelled)
+    with pytest.raises(KeyboardInterrupt):
+        run(_plan(1))
+    assert worker.events == [(1, "retried", "seed", 0)] and sink.rows == []
+    summary = policy.summary()
+    assert (summary["retries"], summary["recovered"], summary["failed_after_retry"]) == (1, 0, 1)
 
 
 # ---- 6. a commit whose outcome is uncertain is never appended twice ------------------------------------------

@@ -246,10 +246,16 @@ def test_close_abandoned_runs_sql_closes_the_collections_other_open_runs_and_the
     assert f"update {ss.RUN_TABLE} set status = 'failed'" in run_update
     assert "where task_collection = %s and status = 'running' and run_id <> %s" in run_update
     assert f"update {ss.EVENT_TABLE} e set status = 'failed'" in event_update
-    assert "e.run_id = dead.run_id and e.status = 'running'" in event_update
+    assert "e.run_id = dead.run_id and (e.status = 'running'" in event_update
+    # A table waiting for its retry when the run died: its last attempt is 'retried' and no later one
+    # exists, so it is closed as failed too, keeping its error and timing.
+    assert ("e.status = 'retried' and not exists (select 1 from " + ss.EVENT_TABLE + " later "
+            "where later.run_id = e.run_id and later.control_id = e.control_id and later.id > e.id)") in event_update
+    assert "finished_at = coalesce(e.finished_at, now())" in event_update
+    assert "when e.status = 'retried' then concat(e.error, ' | ', %s)" in event_update
     assert sql.rstrip().endswith("select (select count(*) from dead), (select count(*) from events)")
-    # detail, task_collection, run_id, error
-    assert sql.count("%s") == 4
+    # detail, task_collection, run_id, error (twice: a running event's, appended to a retried one's)
+    assert sql.count("%s") == 5
 
 
 # ---- per-collection run lock --------------------------------------------------------------
@@ -392,10 +398,10 @@ def test_close_abandoned_runs_binds_detail_collection_run_then_error_and_returns
     assert ss.StateStore(conn).close_abandoned_runs("c", 9) == (1, 48)
     (sql, params), = conn.calls
     assert sql == ss.close_abandoned_runs_sql()
-    detail, collection, run_id, error = params
+    detail, collection, run_id, retried_error, error = params
     assert json.loads(detail) == {"closed_by_run": 9, "reason": ss.ABANDONED_RUN_REASON}
     assert (collection, run_id) == ("c", 9)
-    assert error == f"{ss.ABANDONED_RUN_REASON}; closed by run 9"
+    assert error == retried_error == f"{ss.ABANDONED_RUN_REASON}; closed by run 9"
 
 
 def test_is_alive_false_when_closed_or_erroring_true_otherwise():

@@ -335,9 +335,10 @@ and errors it doesn't recognise fail at once, as without retries.
 - **Pauses** double with each attempt, with jitter: 5 to 10 s, then 10 to 20 s, up to 2 minutes
   (environment variables `LAKEFED_TABLE_RETRY_BASE_S`, default `10`, and `LAKEFED_TABLE_RETRY_MAX_S`,
   default `120`). A waiting table holds no `parallelism` slot.
-- **Limits:** `table_retry_budget` (default `20`) retries in the whole run, and a source server stops
-  retrying for the rest of the run after 5 failed retries (`LAKEFED_TABLE_RETRY_PER_SOURCE`). A
-  source outage then costs a few extra queries, not one per table. Retries take slots and per-source
+- **Limits:** `table_retry_budget` (default `20`) retries in the whole run, and at most 5 retries per
+  source server that haven't succeeded yet, waiting, running or failed (`LAKEFED_TABLE_RETRY_PER_SOURCE`).
+  Once 5 have failed, the source stops retrying for the rest of the run. A source outage then costs a
+  few extra queries, even when it fails all its tables at once, not one per table. Retries take slots and per-source
   permits like any other work, so `parallelism` and `max_queries_per_source` still hold.
 - **No duplicates:** in merge mode every write is idempotent. In append mode the next attempt first
   checks the sink for this run's rows of the table and appends again only when there are none, so an
