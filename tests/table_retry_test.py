@@ -264,32 +264,35 @@ def test_a_source_stops_retrying_after_its_failed_retries_and_others_carry_on():
     assert retried_on_h1 == 3                                            # 3 failed retries, then no more
 
 
-def test_failures_at_once_on_one_source_get_at_most_its_limit_of_retries():
-    # A source outage fails many tables at the same moment, before any retry has run: the limit
-    # counts retries granted and not yet succeeded, so it holds then too.
-    policy, start = _policy(retries=2, budget=100, per_source=5), threading.Barrier(32)
+def test_failures_at_once_on_one_source_are_bounded_by_the_runs_budget():
+    # A source outage fails many tables at the same moment, before any retry has failed: the source
+    # stop can't act yet, so the run's budget is what bounds the extra queries.
+    policy, start = _policy(retries=2, budget=20, per_source=5), threading.Barrier(32)
     granted = []
 
-    def fail_first_attempt():
+    def fail_first_attempt(cid):
         start.wait()
-        granted.append(policy.claim(_cfg(1), _spark_error(), 0))
-    threads = [threading.Thread(target=fail_first_attempt) for _ in range(32)]
+        granted.append(policy.claim(_cfg(cid), _spark_error(), 0))
+    threads = [threading.Thread(target=fail_first_attempt, args=(cid,)) for cid in range(1, 33)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    assert sum(d is not None for d in granted) == 5 and policy.summary()["retries"] == 5
+    assert sum(d is not None for d in granted) == 20 and policy.summary()["budget_left"] == 0
 
 
-def test_a_retry_that_succeeds_frees_its_place_for_the_next_failure_on_its_source():
+def test_a_source_keeps_retrying_while_its_retries_succeed():
+    # A blip that fails many tables of one server at once is what retries are for: only failed
+    # retries count towards the source's stop.
     policy = _policy(retries=2, budget=100, per_source=1)
-    assert policy.claim(_cfg(1), _spark_error(), 0) is not None
-    assert policy.claim(_cfg(2), _spark_error(), 0) is None              # the source's one place is taken
-    policy.finished(_cfg(1), True, 1)
-    assert policy.claim(_cfg(3), _spark_error(), 0) is not None
+    for cid in range(1, 11):
+        assert policy.claim(_cfg(cid), _spark_error(), 0) is not None
+    for cid in range(1, 11):
+        policy.finished(_cfg(cid), True, 1)
+    assert policy.claim(_cfg(11), _spark_error(), 0) is not None and policy.summary()["sources_stopped"] == []
 
 
-def test_a_run_stopped_during_a_pause_fails_the_table_and_frees_its_place():
+def test_a_run_stopped_during_a_pause_counts_the_table_as_failed():
     sink, policy = _Sink(faults={1: ["before"]}), _policy(per_source=1)
     worker = _Worker(sink, policy)
 

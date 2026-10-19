@@ -188,10 +188,10 @@ class RetryPolicy:
 
     * ``retries``: extra attempts per table.
     * ``budget``: retries in the whole run; once spent, failures fail at once.
-    * ``per_source``: retries on one source server (``ct_engine.source_key``) that have not succeeded,
-      waiting, running or failed: a source never has more than this many at once, even when an outage
-      fails all its tables at the same moment, and once this many have failed it stops retrying for
-      the rest of the run. A retry that succeeds frees its place."""
+    * ``per_source``: failed retries on one source server (``ct_engine.source_key``) before that
+      source stops retrying for the rest of the run. Retries that succeed don't count, so a blip that
+      fails many of a server's tables at once is retried in full. An outage that fails them all at
+      the same moment gets retries before any has failed: the run's ``budget`` bounds those."""
 
     def __init__(self, retries: int = 0, budget: int = DEFAULT_BUDGET, per_source: int = None,
                  base_s: float = None, max_s: float = None, rand=random.random,
@@ -202,7 +202,6 @@ class RetryPolicy:
         self._lock = threading.Lock()
         self._left = self.budget
         self._held: Dict[object, str] = {}          # control id -> source, for a granted retry not yet over
-        self._open: Counter = Counter()             # per source: granted retries not yet over
         self._failed_retries: Counter = Counter()   # per source: retries that failed
         self._stopped: List[str] = []
         self._by_class: Counter = Counter()
@@ -214,7 +213,6 @@ class RetryPolicy:
         source = self._held.pop(key, None)
         if source is None:
             return
-        self._open[source] -= 1
         if not ok:
             self._failed_retries[source] += 1
             if self._failed_retries[source] >= self.per_source and source not in self._stopped:
@@ -222,7 +220,7 @@ class RetryPolicy:
 
     def claim(self, cfg: dict, exc: BaseException, attempt: int) -> Optional[float]:
         """Seconds to wait before retrying ``cfg`` after ``exc`` failed attempt ``attempt`` (0-based), or
-        None: fail now (permanent, out of attempts, budget spent, or the source has no place left)."""
+        None: fail now (permanent, out of attempts, budget spent, or the source stopped)."""
         if self.retries == 0:
             return None
         try:
@@ -232,9 +230,9 @@ class RetryPolicy:
             return None
         key = cfg.get("id")
         with self._lock:
-            self._retry_over(key, ok=False)          # attempt > 0: the retry granted for it failed
-            if (not transient or attempt >= self.retries or source in self._stopped
-                    or self._open[source] + self._failed_retries[source] >= self.per_source):
+            if attempt > 0:
+                self._retry_over(key, ok=False)      # the retry granted for it failed
+            if not transient or attempt >= self.retries or source in self._stopped:
                 return None
             if self._left <= 0:
                 self._exhausted = True
@@ -243,12 +241,11 @@ class RetryPolicy:
             self._granted += 1
             self._by_class[error_class(exc)] += 1
             self._held[key] = source
-            self._open[source] += 1
         return backoff_delay(attempt, self.base_s, self.max_s, rand=self.rand)
 
     def finished(self, cfg: dict, ok: bool, attempt: int) -> None:
-        """A table's final outcome after ``attempt`` (0-based) attempts. Frees a retry still held for it
-        (it succeeded, or the run stopped before its next attempt could fail through ``claim``)."""
+        """A table's final outcome after ``attempt`` (0-based) attempts. A retry still held for it ends
+        here: it succeeded, or the run stopped before its next attempt could fail through ``claim``."""
         if attempt == 0:
             return
         with self._lock:
