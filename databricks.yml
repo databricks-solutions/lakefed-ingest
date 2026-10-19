@@ -70,6 +70,12 @@ variables:
   detection_chunk:
     description: Tables per batched change-detection query.
     default: "200"
+  table_retries:
+    description: Extra attempts per table after a transient source error, in the same run ("0" = off).
+    default: "0"
+  table_retry_budget:
+    description: Table retries in the whole run; once spent, failures fail at once.
+    default: "20"
 
 targets:
   dev:

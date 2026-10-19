@@ -27,7 +27,12 @@ seed/merge/load/checkpoint — pinpoints *where* a failure happened; `plan` = th
 write contention. Tables in a batched append (`append_batch_size` > 1) are the exception: their rows
 are inserted, finished, when the batch ends, with `pool` = `batch<size>` and no row counts, so they
 don't appear among the in-flight tables. A `verify` stage is a run checking the sink for an append
-an earlier run left pending.
+an earlier run left pending, or a retry checking for the rows of the attempt that failed.
+
+With `table_retries` set (README "Table retries"), an attempt that fails with a transient source error
+and is tried again finishes as `retried`, with its stage and error, and the table gets another row for
+its next attempt; `retry_count` numbers them (0, 1, ...). Only a final failure is `failed`, so the
+failure query below lists tables that are still failing.
 
 A run that ends without finishing (cancelled, or its cluster went away) can't close its own rows. The
 next run of the same collection holds the collection's lock, so it closes them at launch: the dead
@@ -89,6 +94,16 @@ Batched appends (`append_batch_size` > 1) record no `rows_merged` on their table
 `detail` carries their rows instead: `batch_rows` (rows the batches committed, from each commit's
 metrics) and `batch_rows_unknown` (tables whose rows landed in a commit that reported an error; not
 counted in `batch_rows`).
+
+Table retries: the run's `detail.table_retries` holds `retries` (granted), `recovered` (tables that
+succeeded on a retry), `failed_after_retry`, `budget` and `budget_left`, `budget_exhausted`,
+`sources_stopped` and `by_class` (retries per error class). The retried attempts of a run:
+```sql
+SELECT src_database, src_schema, src_table, retry_count, stage, left(error, 200) AS error, finished_at
+FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_event
+WHERE run_id = :run_id AND status = 'retried'
+ORDER BY finished_at;
+```
 
 ## Optional: durable history beyond the OLTP store
 

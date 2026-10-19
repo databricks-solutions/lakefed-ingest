@@ -68,6 +68,8 @@ resources:
               freshness_interval_s: "{{job.parameters.freshness_interval_s}}"
               detection_chunk: "{{job.parameters.detection_chunk}}"
               max_queries_per_source: "{{job.parameters.max_queries_per_source}}"
+              table_retries: "{{job.parameters.table_retries}}"
+              table_retry_budget: "{{job.parameters.table_retry_budget}}"
           libraries:
             - pypi:
                 package: "psycopg[binary]"
@@ -138,3 +140,11 @@ resources:
         # "Concurrency" has the limits). "0" = no cap.
         - name: max_queries_per_source
           default: ${var.max_queries_per_source}
+        # Table retries: a table that fails with a transient source error (a refused or dropped
+        # connection, a timeout, throttling) is tried again in the same run, after a pause that doubles
+        # each time. Extra attempts per table; "0" = off.
+        - name: table_retries
+          default: ${var.table_retries}
+        # Retries in the whole run; once spent, failures fail at once (as with retries off).
+        - name: table_retry_budget
+          default: ${var.table_retry_budget}

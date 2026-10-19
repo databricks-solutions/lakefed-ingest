@@ -324,6 +324,28 @@ order. The job output and `ingest_run.detail` list each source's share and the m
 bundle variables. It is driver-bound (per-table MERGE planning and Delta commits), so size the
 driver first.
 
+### Table retries
+
+By default a table that fails waits for the next run. Set the job parameter `table_retries` (default
+`0`, off) to try it again in the same run when the failure is a transient source error: a refused or
+dropped connection, a timeout, or Azure SQL throttling (`table_retry.py`). Errors that would fail again
+(a missing table, a denied permission, a schema error, a failed login when Spark passes on its cause)
+and errors it doesn't recognise fail at once, as without retries.
+
+- **Pauses** double with each attempt, with jitter: 5 to 10 s, then 10 to 20 s, up to 2 minutes
+  (environment variables `LAKEFED_TABLE_RETRY_BASE_S`, default `10`, and `LAKEFED_TABLE_RETRY_MAX_S`,
+  default `120`). A waiting table holds no `parallelism` slot.
+- **Limits:** `table_retry_budget` (default `20`) retries in the whole run, and a source server stops
+  retrying for the rest of the run after 5 failed retries (`LAKEFED_TABLE_RETRY_PER_SOURCE`). A
+  source outage then costs a few extra queries, not one per table. Retries take slots and per-source
+  permits like any other work, so `parallelism` and `max_queries_per_source` still hold.
+- **No duplicates:** in merge mode every write is idempotent. In append mode the next attempt first
+  checks the sink for this run's rows of the table and appends again only when there are none, so an
+  append whose commit landed before its statement failed is never written twice.
+- **Records:** each attempt is its own `ingest_event` row: `retried` (with the error and the stage),
+  then `ok` or `failed`, with `retry_count`. The run's `detail` has the totals (`table_retries`). See
+  [monitoring.md](docs/monitoring.md).
+
 ### Large estates
 
 Job parameters for estates of thousands of databases and millions of tables (defaults keep the

@@ -79,7 +79,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   batched appends, see `batch_append.py`), `max_seeds_per_run` (seed budget, 0 = none),
   `freshness_interval_s` (skip no-op bulk-advance writes newer than this), `max_queries_per_source`
   (cap per source across runs, 0 = none: each run takes cap / runs reading the source, counted from
-  shared advisory locks; `parallel.SourceLimiter`), `db_instance`, `db_name`.
+  shared advisory locks; `parallel.SourceLimiter`), `table_retries` (extra attempts per table after a
+  transient source error, 0 = off; `table_retry.py`), `table_retry_budget` (retries per run),
+  `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
 - `lakefed_ingest_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
   instance, its UC catalog, and the secret scope (`database_instances.lakebase`,
@@ -106,11 +108,16 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
    records the pending append first; a `full` append doesn't (it adds one snapshot per run, so there
    is no position to protect). A `pending` route (run stopped before the advance) checks the sink
    for that run's rows (`append_committed`) before anything else.
+   With `table_retries` > 0, a transient source failure is retried in the run (`table_retry.with_retries`;
+   the next attempt from `planner.retry_plan` on the fresh checkpoint). An append-mode retry goes to
+   `pending`, or carries `verify_run_id` (stage `verify`): rows of this run in the sink → finish the
+   checkpoint (`recovered`), never append again.
 
 ### Modules
 | File | Purpose |
 |---|---|
 | `src/lakefed_ingest/ct_engine.py` | Source ops (Spark JDBC, or `remote_query` through a UC connection): CT versions, detection, read + MERGE / append, seed, sink DDL, batched appends (`append_batch`) |
+| `src/lakefed_ingest/table_retry.py` | Table retries: classify transient vs permanent errors (deny rules win, unknown = permanent), equal-jitter backoff, per-run budget and per-source stop (`RetryPolicy`), the worker wrapper (`with_retries`); the next attempt comes from `planner.retry_plan` |
 | `src/lakefed_ingest/batch_append.py` | Batched appends (append mode, consolidated sinks): plan batches by (sink, kind), write with bisect on failure, bulk checkpoints + telemetry; per-table fallback |
 | `src/lakefed_ingest/source_adapters.py` | Per-engine dialect (`src_type`): JDBC URL/driver/options, quoting, literals, select/size/bounds SQL |
 | `src/lakefed_ingest/load_strategies.py` | Per-`load_type` strategy, position encoding, `supported()` matrix (+ placeholder pairs); cdc placeholder |
