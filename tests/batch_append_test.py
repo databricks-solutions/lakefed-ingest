@@ -238,3 +238,37 @@ def test_written_members_whose_checkpoint_advance_failed_are_reported_failed():
     assert [a[1] for a in engine.appends] == [[1, 2]]
     assert all(r["status"] == "failed" and "checkpoint advance failed" in r["detail"] for r in out["members"])
     assert store.call("record_failed_tables")[2] == {"stage": "checkpoint", "action": "increment"}
+
+
+# ---- row totals (ingest_run.detail) ------------------------------------------------------------------
+
+def test_a_new_runner_has_written_no_rows():
+    assert _runner(_Engine(), _Store(), []).row_totals() == {"batch_rows": 0, "batch_rows_unknown": 0}
+
+
+def test_the_runner_adds_up_the_rows_of_every_batch_it_commits():
+    engine, store, alone = _Engine(bad={2}), _Store(), []
+    runner = _runner(engine, store, alone)
+    runner.run({"kind": "changes", "members": [_plan(1), _plan(2), _plan(3)]})
+    runner.run({"kind": "changes", "members": [_plan(4, sink="lines"), _plan(5, sink="lines")]})
+    committed = sum(len(ids) for _, ids, _ in engine.appends)  # the fake commits one row per table
+    assert committed == 4 and alone == [2]
+    assert runner.row_totals() == {"batch_rows": 4, "batch_rows_unknown": 0}
+
+
+def test_tables_whose_rows_landed_despite_the_error_are_counted_as_unknown():
+    engine, store, alone = _Engine(bad={1, 2}, landed={1, 2}), _Store(), []
+    runner = _runner(engine, store, alone)
+    runner.run({"kind": "changes", "members": [_plan(1), _plan(2)]})
+    assert runner.row_totals() == {"batch_rows": 0, "batch_rows_unknown": 2}
+
+
+def test_row_totals_add_up_across_batches_running_at_once():
+    from concurrent.futures import ThreadPoolExecutor
+    engine, store, alone = _Engine(), _Store(), []
+    runner = _runner(engine, store, alone)
+    batches = [{"kind": "changes", "members": [_plan(i, sink=f"s{i}"), _plan(i + 1000, sink=f"s{i}")]}
+               for i in range(200)]
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(runner.run, batches))
+    assert runner.row_totals() == {"batch_rows": 400, "batch_rows_unknown": 0}

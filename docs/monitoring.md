@@ -85,6 +85,11 @@ ORDER BY started_at DESC
 LIMIT 20;
 ```
 
+Batched appends (`append_batch_size` > 1) record no `rows_merged` on their tables' events; the run's
+`detail` carries their rows instead: `batch_rows` (rows the batches committed, from each commit's
+metrics) and `batch_rows_unknown` (tables whose rows landed in a commit that reported an error; not
+counted in `batch_rows`).
+
 ## Optional: durable history beyond the OLTP store
 
 Lakebase is the live store; if you want run history retained in Delta (e.g. for long-term

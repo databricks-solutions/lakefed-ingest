@@ -196,7 +196,7 @@ Inserted when a run starts (`status = 'running'`) and finalized when it ends.
 | `total`, `ok`, `failed` | Table counts |
 | `skipped` | Tables that were unchanged (nothing to read) |
 | `reseeded` | Tables queued for a reseed |
-| `detail` | JSON with run details: change-detection counts per route, timings, peak concurrency, and with `max_queries_per_source` set, each source's share and peak permits (`source_caps`) |
+| `detail` | JSON with run details: change-detection counts per route, timings, peak concurrency, and with `max_queries_per_source` set, each source's share and peak permits (`source_caps`), and the rows batched appends committed (`batch_rows`, with `batch_rows_unknown` tables not counted) |
 
 ## `ingest_event` — one row per table per run
 

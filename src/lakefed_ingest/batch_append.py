@@ -18,7 +18,8 @@ Job parameter ``append_batch_size`` caps the members per batch; 1 (the default) 
   members' checkpoints and records their telemetry in bulk (one Lakebase round trip each).
 
 Telemetry: a batch member gets one finished ``ingest_event`` (no 'running' row while the batch is in
-flight). ``rows_merged`` is NULL: a batch's commit reports one total, printed with the batch.
+flight). ``rows_merged`` is NULL: a batch's commit reports one total, printed with the batch and added
+to the run's ``BatchRunner.row_totals()``, which the run writes into ``ingest_run.detail``.
 ``pool`` reads ``batch<size>``.
 
 Pure Python apart from what ``BatchRunner`` calls in ``ct_engine``, unit-tested with fakes in
@@ -28,6 +29,7 @@ tests/batch_append_test.py.
 from __future__ import annotations
 
 import math
+import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -196,6 +198,16 @@ class BatchRunner:
                  engine=ct_engine):
         self.spark, self.store, self.slots, self.run_id = spark, store, slots, run_id
         self.per_table, self.guard, self.engine = per_table, guard, engine
+        self._totals_lock = threading.Lock()   # batches run on many threads at once
+        self._batch_rows = 0
+        self._batch_rows_unknown = 0
+
+    def row_totals(self) -> dict:
+        """Rows this run's batches committed, from each commit's own metrics, and the number of tables
+        whose rows landed in a commit that reported an error (their rows aren't counted). The run
+        writes both into ``ingest_run.detail``."""
+        with self._totals_lock:
+            return {"batch_rows": self._batch_rows, "batch_rows_unknown": self._batch_rows_unknown}
 
     def run(self, batch: dict) -> dict:
         """Run one batch. Returns {"batch": True, "members": [one run_parallel-style result each]}."""
@@ -265,13 +277,18 @@ class BatchRunner:
             reads = [e.snapshot_read(m["cfg"], self.run_id, m.get("v0")) for m in group]
         rows = e.append_batch(self.spark, sink, reads, slots=self.slots)
         print(f"[batch:{kind}] {sink}: {len(group)} tables, {rows} rows")
+        with self._totals_lock:
+            self._batch_rows += int(rows or 0)
         return rows
 
     def _committed(self, kind: str, sink: str, group: List[dict]) -> List[dict]:
         print(f"[batch:{kind}] {sink}: append of {len(group)} tables failed -> checking the sink, then splitting")
         landed = self.engine.committed_clients(self.spark, sink, [m["cfg"] for m in group], self.run_id,
                                                slots=self.slots)
-        return [m for m in group if self.engine.client_id(m["cfg"]) in landed]
+        written = [m for m in group if self.engine.client_id(m["cfg"]) in landed]
+        with self._totals_lock:
+            self._batch_rows_unknown += len(written)
+        return written
 
     def _finish(self, kind, written, unknown, results, duration_ms, size):
         """Advance the written members' checkpoints and record their telemetry (bulk); record the
