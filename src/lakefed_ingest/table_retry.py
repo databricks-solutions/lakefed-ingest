@@ -114,15 +114,23 @@ def error_text(exc: BaseException) -> str:
     parts = []
     for e in _chain(exc):
         parts.append(f"{type(e).__name__}: {e}")
-        for getter in ("getErrorClass", "getCondition", "getSqlState"):
-            try:
-                value = getattr(e, getter)()
-            except Exception:
-                value = None
-            if value:
-                parts.append(f"{getter}={value}" if getter != "getSqlState" else f"SQLSTATE: {value}")
+        condition = _call(e, "getCondition") if hasattr(e, "getCondition") else _call(e, "getErrorClass")
+        if condition:
+            parts.append(f"[{condition}]")
+        state = _call(e, "getSqlState")
+        if state:
+            parts.append(f"SQLSTATE: {state}")
         parts.extend(_java_causes(e))
     return "\n".join(parts)
+
+
+def _call(obj, method: str):
+    """``obj.method()``, or None when it has no such method or it fails (PySpark errors only have
+    them when the JVM reported a condition; ``getErrorClass`` is the older name of ``getCondition``)."""
+    try:
+        return getattr(obj, method)()
+    except Exception:
+        return None
 
 
 def classify(exc: BaseException) -> str:
@@ -192,8 +200,11 @@ class RetryPolicy:
         None: fail now (permanent, out of attempts, budget spent, or the source stopped)."""
         if self.retries == 0:
             return None
-        transient = classify(exc) == TRANSIENT
-        source = self.source_of(cfg)
+        try:
+            transient = classify(exc) == TRANSIENT
+            source = self.source_of(cfg)
+        except Exception:                 # can't judge it: fail it, as without retries
+            return None
         with self._lock:
             if attempt > 0:
                 self._failed_retries[source] += 1

@@ -368,3 +368,28 @@ def test_retry_plan_verifies_every_append_and_keeps_merges_as_they_were():
     assert planner.retry_plan(seed, None, 42) == dict(seed, cp=None, verify_run_id=42)
     full = _plan(4, route="full", load_type="full")
     assert planner.retry_plan(full, dict(fresh, pending_run_id=7), 42)["verify_run_id"] == 42   # full: never pending
+
+
+def test_a_policy_that_cannot_judge_a_failure_fails_it_as_today():
+    def no_source(cfg):
+        raise ValueError("unknown src_type")
+    policy = tr.RetryPolicy(retries=2, source_of=no_source)
+    assert policy.claim(_cfg(1), _spark_error(), 0) is None and policy.summary()["retries"] == 0
+
+
+def test_the_spark_condition_is_read_once_preferring_the_current_name():
+    class _Captured(RuntimeError):
+        calls = []
+
+        def getCondition(self):
+            self.calls.append("getCondition")
+            return "FAILED_JDBC.CONNECTION"
+
+        def getErrorClass(self):
+            self.calls.append("getErrorClass")
+            return "FAILED_JDBC.CONNECTION"
+
+        def getSqlState(self):
+            return "08001"
+    error = _Captured("Failed to connect to the database.")
+    assert tr.classify(error) == tr.TRANSIENT and _Captured.calls == ["getCondition"]
