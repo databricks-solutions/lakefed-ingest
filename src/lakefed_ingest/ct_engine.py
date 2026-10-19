@@ -1066,7 +1066,7 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
             cancelled = sum(1 for g in futures if g.cancelled())
             raise RuntimeError(
                 f"partitioned seed of {schema}.{table}: {failed}/{len(plist)} partitions failed, "
-                f"{cancelled} cancelled; target untouched; first error: {str(first_err)[:300]}")
+                f"{cancelled} cancelled; target untouched; first error: {str(first_err)[:300]}") from first_err
     finally:
         if own_executor:
             ex.shutdown(wait=True)

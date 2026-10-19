@@ -401,8 +401,9 @@ def _seed(monkeypatch, spark, **overrides):
 def test_partitioned_seed_failure_leaves_target_untouched(monkeypatch):
     import pytest
     spark = _FakeSpark(fail_where="[id] >= 37 ")      # one middle partition fails (stride 9)
-    with pytest.raises(RuntimeError, match="target untouched"):
+    with pytest.raises(RuntimeError, match="target untouched") as raised:
         _seed(monkeypatch, spark)
+    assert raised.value.__cause__ is not None     # the partition's own error, for table_retry.classify
     assert not any(s.startswith("INSERT WITH SCHEMA EVOLUTION OVERWRITE c.s.big ") for s in spark.statements)
     assert not any(s.startswith("DROP TABLE") for s in spark.statements)   # staging kept
 
