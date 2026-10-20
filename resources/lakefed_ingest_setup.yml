@@ -12,7 +12,7 @@ resources:
   database_instances:
     lakebase:
       name: ${var.lakebase_instance}
-      capacity: CU_1
+      capacity: ${var.lakebase_capacity}
       # Enable Postgres role/password login for broad client compatibility; the cluster itself
       # connects with a short-lived SDK-minted OAuth token (no stored password).
       enable_pg_native_login: true

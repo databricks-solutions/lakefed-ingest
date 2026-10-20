@@ -27,7 +27,7 @@ create table if not exists lakefed_ingest.control (
     job_name              text,                               -- optional label (unused by this version)
     task_collection       text        not null,
     src_type              text        not null default 'sqlserver',  -- source adapter
-    src_connection        text,                               -- legacy: UC connection (host lookup only)
+    src_connection        text,                               -- UC connection: read through it (use_remote_query), else legacy host lookup
     src_host              text,                               -- source host (JDBC; no UC connection)
     src_port              int,                                -- NULL -> the adapter's default port
     secret_key            text,                               -- per-DB creds secret key (JSON {user,password})
@@ -47,7 +47,7 @@ create table if not exists lakefed_ingest.control (
     partition_col         text,                               -- partitioned seed: numeric/date/datetime col
     partition_size_mb     int,                                -- partitioned seed: target MB per partition
     select_list           text        not null,
-    use_remote_query      boolean     not null default false,  -- unused by the JDBC sweep
+    use_remote_query      boolean     not null default false,  -- read through src_connection (remote_query), not JDBC
     ct_enabled            boolean     not null default true,
     cursor_column         text,                               -- load_type cursor: high-watermark column
     cdc_capture_instance  text,                               -- load_type cdc: capture instance / slot
@@ -79,6 +79,14 @@ alter table lakefed_ingest.control alter column job_name drop not null;
 -- Consolidated sinks (optional): rows with client_id set share one sink table, each writing only its
 -- own client's rows (MERGE on client_id + PK, REPLACE WHERE client_id for seeds / full reloads).
 alter table lakefed_ingest.control add column if not exists client_id text;
+-- Write mode. 'merge' (default) keeps the sink in step with the source: PK MERGE for changes,
+-- client-scoped replace for seeds and full reloads. 'append' lands every change, and every seed or
+-- full snapshot, as new rows tagged __change_op / __change_version / __extracted_at / __run_id: a
+-- change log that many source databases can fan in to (with client_id) for downstream processing.
+alter table lakefed_ingest.control add column if not exists write_mode text not null default 'merge';
+-- Identity columns written on every row next to __client_id__, as a JSON object {column: value}
+-- (for example the tenant name or the source server).
+alter table lakefed_ingest.control add column if not exists client_attrs text;
 
 -- Constraints are (re-)declared here so re-applying the file updates existing tables. Older
 -- deploys had an inline load_type check (auto-named) and `mt_`-prefixed names; drop those too.
@@ -91,7 +99,7 @@ alter table lakefed_ingest.control drop constraint if exists valid_src_type;
 alter table lakefed_ingest.control add constraint valid_src_type check (
     src_type in ('sqlserver', 'oracle', 'postgresql', 'mysql')
 );
--- CT tasks need a PK, a SQL Server source, and a resolvable host (src_host, or a legacy UC connection).
+-- CT tasks need a PK, a SQL Server source, and a source to read: src_host, or a UC connection.
 alter table lakefed_ingest.control drop constraint if exists mt_valid_ct_metadata;
 alter table lakefed_ingest.control drop constraint if exists valid_ct_metadata;
 alter table lakefed_ingest.control add constraint valid_ct_metadata check (
@@ -116,10 +124,26 @@ alter table lakefed_ingest.control drop constraint if exists valid_partitioning;
 alter table lakefed_ingest.control add constraint valid_partitioning check (
     not load_partitioned or (partition_col is not null and coalesce(partition_size_mb, 0) > 0)
 );
+-- A read through a Unity Catalog connection (remote_query) needs the connection; no host or secret.
+alter table lakefed_ingest.control drop constraint if exists valid_remote_query;
+alter table lakefed_ingest.control add constraint valid_remote_query check (
+    not use_remote_query or src_connection is not null
+);
 -- jdbc_options, when set, must be a JSON object.
 alter table lakefed_ingest.control drop constraint if exists valid_jdbc_options;
 alter table lakefed_ingest.control add constraint valid_jdbc_options check (
     jdbc_options is null or jsonb_typeof(jdbc_options::jsonb) = 'object'
+);
+
+-- Append is implemented for change tracking and full reloads.
+alter table lakefed_ingest.control drop constraint if exists valid_write_mode;
+alter table lakefed_ingest.control add constraint valid_write_mode check (
+    write_mode in ('merge', 'append') and (write_mode = 'merge' or load_type in ('ct', 'full'))
+);
+-- client_attrs, when set, must be a JSON object.
+alter table lakefed_ingest.control drop constraint if exists valid_client_attrs;
+alter table lakefed_ingest.control add constraint valid_client_attrs check (
+    client_attrs is null or jsonb_typeof(client_attrs::jsonb) = 'object'
 );
 
 -- client_id becomes a Delta predicate literal: a restricted character set (same rule as ct_engine).
@@ -137,6 +161,10 @@ create unique index if not exists control_sink_client_uq
 create index if not exists control_collection_idx
     on lakefed_ingest.control (task_collection)
     where task_enabled = true;
+-- The dedicated rows, by sink: each sweep's mixed-sink check starts here (state_store.mixed_sinks_sql).
+create index if not exists control_dedicated_sink_idx
+    on lakefed_ingest.control (lower(sink_catalog), lower(sink_schema), lower(sink_table))
+    where client_id is null;
 
 -- Generic checkpoint, one row per control task (keyed by control.id). Keying by the control id
 -- (not db/schema/table) keeps same-named databases on different servers from colliding; the src_*
@@ -197,6 +225,13 @@ alter table lakefed_ingest.checkpoint add column if not exists ct_begin_version 
 -- a column ADDED to the control row means the table is reseeded (CT returns changed rows only, so
 -- history needs a backfill). NULL = not recorded yet (legacy rows: the sweep checks the sink once).
 alter table lakefed_ingest.checkpoint add column if not exists select_list text;
+
+-- Append writes (control.write_mode 'append') are not idempotent the way a MERGE is, so before
+-- appending, the run records the position the append brings the sink to and its own run_id. The
+-- checkpoint advance clears both. If a run stops in between, the next run looks in the sink for rows
+-- with that __run_id: found, the append committed and the checkpoint advances; not found, it reads again.
+alter table lakefed_ingest.checkpoint add column if not exists pending_position text;
+alter table lakefed_ingest.checkpoint add column if not exists pending_run_id bigint;
 
 -- Tables awaiting a full reseed (CT retention lapsed, schema change, or CT versions reset).
 -- Processed by the sweep's reseed handling (phase flips back to seeding).
@@ -260,7 +295,7 @@ create table if not exists lakefed_ingest.ingest_event (
     action          text,                                     -- seed | increment | reseed | full
     phase           text,
     stage           text,                                     -- plan | detect | ensure_sink | read | seed | merge | load | checkpoint
-    status          text        not null default 'running',   -- running | ok | failed | skipped
+    status          text        not null default 'running',   -- running | ok | failed | skipped | retried (an attempt tried again)
     started_at      timestamptz not null default now(),
     finished_at     timestamptz,
     duration_ms     bigint,
@@ -270,7 +305,7 @@ create table if not exists lakefed_ingest.ingest_event (
     position_to     text,
     pool            text,
     error           text,
-    retry_count     int         not null default 0
+    retry_count     int         not null default 0          -- earlier attempts of this table in the run (table_retries)
 );
 
 -- CT versions were bigint before the generic checkpoint; positions are text.

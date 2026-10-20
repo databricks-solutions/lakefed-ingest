@@ -166,7 +166,7 @@ def column_type(cfg: dict, slots=None) -> str:
     A nullable cursor column is refused: incremental reads select ``col > lo AND col <= hi``, so a
     row whose cursor value is NULL would never be read (the seed copies it, later changes to it
     would be silently missed)."""
-    with ct_engine._unit(slots):
+    with ct_engine._unit(slots, cfg):
         row = ct_engine._read(ct_engine._spark(), cfg, column_type_sql(cfg)).first()
     if row is None or row["typ"] is None:
         raise ValueError(f"cursor_column '{cfg['cursor_column']}' not found on "
@@ -185,7 +185,7 @@ def _refuse_nullable(cfg: dict, nullable) -> None:
 
 
 def high_watermark(cfg: dict, typ: str, slots=None) -> Optional[str]:
-    with ct_engine._unit(slots):
+    with ct_engine._unit(slots, cfg):
         row = ct_engine._read(ct_engine._spark(), cfg, high_watermark_sql(cfg, typ)).first()
     if row is not None:
         _refuse_nullable(cfg, row["nullable"])
@@ -198,7 +198,7 @@ def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str],
     ``.cache()``/``count()``). Returns rows affected from the MERGE metrics (None if unavailable)."""
     query = source_adapters.for_cfg(cfg).select_sql(cfg, where=read_where(cfg, typ, lo, hi))
     def once():
-        with ct_engine._unit(slots):
+        with ct_engine._unit(slots, cfg):
             df = ct_engine._tag(ct_engine._read(spark, cfg, query), cfg)
             view = f"cursor_staged_{uuid.uuid4().hex}"
             df.createOrReplaceTempView(view)

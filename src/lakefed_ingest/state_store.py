@@ -23,8 +23,10 @@ the CT strategy.
 
 from __future__ import annotations
 
+import json
 import re
 import threading
+import zlib
 from typing import Callable, List, Optional
 
 SCHEMA = "lakefed_ingest"
@@ -48,7 +50,7 @@ CONTROL_COLUMNS = [
     "partition_col", "partition_size_mb",
     "select_list", "use_remote_query", "ct_enabled", "cursor_column", "cdc_capture_instance",
     "jdbc_options", "source_instance_group", "tier", "priority", "warehouse_id", "task_enabled",
-    "client_id",
+    "client_id", "write_mode", "client_attrs",
 ]
 
 
@@ -186,14 +188,24 @@ def task_identity(cfg: dict) -> tuple:
     return (int(cfg["id"]), cfg["src_database"], cfg["src_schema"], cfg["src_table"])
 
 
+def _sink_label(cfg: dict) -> str:
+    """catalog.schema.table of the row's sink, as telemetry records it (``ingest_event.sink_fqn``)."""
+    return f"{cfg.get('sink_catalog')}.{cfg.get('sink_schema')}.{cfg.get('sink_table')}"
+
+
 # --------------------------------------------------------------------------------------
 # SQL builders (parameterized, %s placeholders) — unit-tested for shape, no DB needed.
 # --------------------------------------------------------------------------------------
 def mixed_sinks_sql() -> str:
     """Sinks (lower-cased catalog, schema, table) claimed by a dedicated row (client_id NULL) AND
-    other rows — across ALL collections, enabled or not (a disabled row still owns its data)."""
-    return (f"select lower(sink_catalog), lower(sink_schema), lower(sink_table) from {CONTROL_TABLE} "
-            "group by 1, 2, 3 having count(*) filter (where client_id is null) > 0 and count(*) > 1")
+    other rows, across ALL collections, enabled or not (a disabled row still owns its data). Starts
+    from the dedicated rows (partial index control_dedicated_sink_idx) and probes each one's sink in
+    control_sink_client_uq, so every sweep doesn't scan a control table that holds millions of
+    consolidated rows."""
+    return (f"select lower(d.sink_catalog), lower(d.sink_schema), lower(d.sink_table) from {CONTROL_TABLE} d "
+            f"where d.client_id is null and exists (select 1 from {CONTROL_TABLE} o "
+            "where lower(o.sink_catalog) = lower(d.sink_catalog) and lower(o.sink_schema) = lower(d.sink_schema) "
+            "and lower(o.sink_table) = lower(d.sink_table) and o.id <> d.id)")
 
 
 def list_task_configs_sql() -> str:
@@ -225,13 +237,15 @@ def get_checkpoint_sql() -> str:
 def get_checkpoints_sql() -> str:
     """Checkpoints for MANY control tasks in one round trip (the sweep's planning phase).
     Param: list of control ids (bound as a Postgres array)."""
-    return (f"select control_id, position, phase, status, select_list, strategy, ct_begin_version "
-            f"from {CHECKPOINT_TABLE} where control_id = any(%s)")
+    return (f"select control_id, position, phase, status, select_list, strategy, ct_begin_version, "
+            f"pending_position, pending_run_id, last_success_at from {CHECKPOINT_TABLE} "
+            "where control_id = any(%s)")
 
 
 def upsert_checkpoint_sql() -> str:
     """Insert-or-update a checkpoint (keyed by control_id): set strategy + position, phase/status,
-    and record the select_list the sink was written with (kept when NULL is passed).
+    and record the select_list the sink was written with (kept when NULL is passed). Clears a
+    pending append (see ``record_pending_sql``): the checkpoint now says where the sink is.
 
     Params: control_id, src_database, src_schema, src_table, strategy, position, phase, status,
     detail, select_list.
@@ -244,6 +258,23 @@ def upsert_checkpoint_sql() -> str:
         "strategy = excluded.strategy, position = excluded.position, phase = excluded.phase, "
         "status = excluded.status, detail = excluded.detail, "
         f"select_list = coalesce(excluded.select_list, checkpoint.select_list), "
+        "pending_position = null, pending_run_id = null, "
+        "updated_at = now()"
+    )
+
+
+def record_pending_sql() -> str:
+    """Before an append write: the position it brings the sink to and the run writing it. A new row
+    (first seed) starts in phase seeding; an existing one keeps its position, phase and status.
+
+    Params: control_id, src_database, src_schema, src_table, strategy, pending_position, pending_run_id.
+    """
+    return (
+        f"insert into {CHECKPOINT_TABLE} "
+        "(control_id, src_database, src_schema, src_table, strategy, pending_position, pending_run_id, "
+        "updated_at) values (%s, %s, %s, %s, %s, %s, %s, now()) "
+        "on conflict (control_id) do update set "
+        "pending_position = excluded.pending_position, pending_run_id = excluded.pending_run_id, "
         "updated_at = now()"
     )
 
@@ -255,7 +286,8 @@ def bulk_advance_unchanged_sql() -> str:
     backwards (greatest, compared as numbers — positions are text), only for CT rows in the cdc
     phase, and stamps freshness. Advancing quiet tables matters: CT cleanup keeps raising each
     table's min valid version even when the table never changes, so a checkpoint left behind would
-    trigger a false reseed once retention passes.
+    trigger a false reseed once retention passes. A table with a pending append is never advanced
+    here: the planner sends it to the worker, which checks whether that append committed.
     Params: CT version (captured), select_list (or NULL to keep), CT begin_version (recorded only
     when not yet known — legacy rows), control_id.
     """
@@ -265,7 +297,7 @@ def bulk_advance_unchanged_sql() -> str:
         "status = 'ok', detail = null, "
         "select_list = coalesce(%s, select_list), ct_begin_version = coalesce(ct_begin_version, %s), "
         "last_success_at = now(), updated_at = now() "
-        "where control_id = %s and phase = 'incremental' and strategy = 'ct'"
+        "where control_id = %s and phase = 'incremental' and strategy = 'ct' and pending_run_id is null"
     )
 
 
@@ -322,14 +354,15 @@ def record_event_start_sql() -> str:
 
 
 def record_event_finish_sql() -> str:
-    """Finalize an ingest_event row: finished_at/duration + outcome + metrics."""
+    """Finalize an ingest_event row: finished_at/duration + outcome + metrics. ``retry_count`` is the
+    number of earlier attempts of the table in this run (``table_retry``)."""
     return (
         f"update {EVENT_TABLE} set "
         "finished_at = now(), "
         "duration_ms = (extract(epoch from (now() - started_at)) * 1000)::bigint, "
         "status = %s, stage = %s, rows_read = %s, rows_merged = %s, "
         "position_from = %s, position_to = %s, error = %s, "
-        "action = coalesce(%s, action), pool = coalesce(%s, pool) "
+        "action = coalesce(%s, action), pool = coalesce(%s, pool), retry_count = coalesce(%s, retry_count) "
         "where id = %s"
     )
 
@@ -345,6 +378,26 @@ def record_event_failed_sql() -> str:
         "action, phase, stage, error, status, finished_at, duration_ms) "
         "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'failed', now(), 0)"
     )
+
+
+def record_event_finished_sql() -> str:
+    """Insert an already-FINISHED ingest_event row (bulk, via executemany) for the members of a batched
+    append, which ran as one unit. Params: run_id, task_collection, control_id, src_database,
+    src_schema, src_table, sink_fqn, action, phase, stage, status, position_from, position_to, pool,
+    error, duration_ms (for started_at), duration_ms."""
+    return (
+        f"insert into {EVENT_TABLE} "
+        "(run_id, task_collection, control_id, src_database, src_schema, src_table, sink_fqn, "
+        "action, phase, stage, status, position_from, position_to, pool, error, "
+        "started_at, finished_at, duration_ms) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+        "now() - %s * interval '1 millisecond', now(), %s)"
+    )
+
+
+def touch_last_success_many_sql() -> str:
+    """Stamp checkpoint.last_success_at for many control ids. Param: array of control ids."""
+    return f"update {CHECKPOINT_TABLE} set last_success_at = now() where control_id = any(%s)"
 
 
 def touch_last_success_sql() -> str:
@@ -363,6 +416,31 @@ def finish_run_sql() -> str:
         "finished_at = now(), status = %s, total = %s, ok = %s, failed = %s, "
         "skipped = %s, reseeded = %s, detail = %s "
         "where run_id = %s"
+    )
+
+
+ABANDONED_RUN_REASON = "the run ended without finishing (cancelled, or its cluster went away)"
+
+
+def close_abandoned_runs_sql() -> str:
+    """Close a collection's other runs still 'running', and their events still 'running', as failed.
+    Only a run holding the collection's lock may call it: no other sweep of the collection is then
+    alive, so an open run is one that was cancelled or lost its cluster and will never finish its rows.
+    A table that was waiting for its retry (table_retries) when the run died has a last attempt
+    'retried' and no later one: it is closed as failed too, keeping its own error and timing.
+    Params: detail, task_collection, run_id, error (appended to a retried attempt's), error.
+    Returns (runs closed, events closed)."""
+    return (
+        f"with dead as (update {RUN_TABLE} set status = 'failed', finished_at = now(), detail = %s "
+        "where task_collection = %s and status = 'running' and run_id <> %s returning run_id), "
+        f"events as (update {EVENT_TABLE} e set status = 'failed', finished_at = coalesce(e.finished_at, now()), "
+        "duration_ms = coalesce(e.duration_ms, (extract(epoch from (now() - e.started_at)) * 1000)::bigint), "
+        "error = case when e.status = 'retried' then concat(e.error, ' | ', %s) else %s end "
+        "from dead where e.run_id = dead.run_id and (e.status = 'running' or ("
+        f"e.status = 'retried' and not exists (select 1 from {EVENT_TABLE} later "
+        "where later.run_id = e.run_id and later.control_id = e.control_id and later.id > e.id))) "
+        "returning e.id) "
+        "select (select count(*) from dead), (select count(*) from events)"
     )
 
 
@@ -396,6 +474,37 @@ def try_lock_collection_sql() -> str:
 def unlock_collection_sql() -> str:
     """Release the collection's session-level advisory lock."""
     return "select pg_advisory_unlock(hashtextextended(%s, 0))"
+
+
+# Per-source query caps (job parameter max_queries_per_source): every run holds a session-level SHARED
+# advisory lock per source it reads, on its collection-lock connection, so the holders of a source's
+# lock are the runs reading it now, and a run that stops leaves the count with its session. The lock
+# has two int keys, a fixed class and a hash of the source (the two-key space is separate from the
+# one-key collection locks).
+SOURCE_LOCK_CLASS = 0x6C666973
+
+
+def source_lock_key(source: str) -> int:
+    """A source's lock key: a stable non-negative 31-bit hash of its name (``ct_engine.source_key``)."""
+    return zlib.crc32(source.encode("utf-8")) & 0x7FFFFFFF
+
+
+def join_source_sql() -> str:
+    return "select pg_advisory_lock_shared(%s::int, %s::int)"
+
+
+def source_runs_sql() -> str:
+    """How many sessions hold each of the given sources' shared locks: rows (lock key, runs)."""
+    return ("select objid::bigint, count(*) from pg_locks where locktype = 'advisory' and granted "
+            "and mode = 'ShareLock' and objsubid = 2 and classid::bigint = %s "
+            "and database = (select oid from pg_database where datname = current_database()) "
+            "and objid::bigint = any(%s) group by objid")
+
+
+def source_shares(cap: int, keys: dict, runs: dict) -> dict:
+    """{source: this run's share of ``cap``}: the cap divided by the runs reading the source now (this
+    run among them), at least 1. ``keys``: {source: lock key}; ``runs``: {lock key: runs}."""
+    return {source: max(1, int(cap) // max(1, runs.get(key, 1))) for source, key in keys.items()}
 
 
 # --------------------------------------------------------------------------------------
@@ -493,7 +602,14 @@ class StateStore:
         instead of one job run per table."""
         with self._cursor() as cur:
             cur.execute(list_task_configs_sql(), (task_collection,))
-            return [dict(zip(CONTROL_COLUMNS, row)) for row in cur.fetchall()]
+            rows = cur.fetchall()
+        # Most values repeat across a collection's rows (one select_list per source table for
+        # thousands of databases, the sink names, the server): share one string object per value so
+        # a collection of hundreds of thousands of rows doesn't hold a copy per row.
+        shared: dict = {}
+        def share(v):
+            return shared.setdefault(v, v) if isinstance(v, str) else v
+        return [dict(zip(CONTROL_COLUMNS, map(share, row))) for row in rows]
 
     def mixed_sinks(self) -> set:
         """{(catalog, schema, table)} lower-cased — see ``mixed_sinks_sql``."""
@@ -521,7 +637,8 @@ class StateStore:
             cur.execute(get_checkpoints_sql(), (ids,))
             rows = cur.fetchall()
         return {int(r[0]): {"position": r[1], "phase": r[2], "status": r[3], "select_list": r[4],
-                            "strategy": r[5], "ct_begin_version": r[6]} for r in rows}
+                            "strategy": r[5], "ct_begin_version": r[6], "pending_position": r[7],
+                            "pending_run_id": r[8], "last_success_at": r[9]} for r in rows}
 
     def advance_checkpoint(self, cfg: dict, position, phase=INCREMENTAL, status="ok", detail=None,
                            select_list=None, strategy=None):
@@ -533,6 +650,54 @@ class StateStore:
             cur.execute(upsert_checkpoint_sql(),
                         (*task_identity(cfg), strategy or strategy_name(cfg), position_text(position),
                          phase, status, detail, select_list))
+
+    def record_pending(self, cfg: dict, position, run_id) -> None:
+        """Record an append write about to start (see ``record_pending_sql``). Call BEFORE the write."""
+        with self._cursor() as cur:
+            cur.execute(record_pending_sql(), (*task_identity(cfg), strategy_name(cfg),
+                                               position_text(position), int(run_id)))
+
+    # ---- bulk forms, for the members of a batched append (one executemany each) --------------
+    def record_pending_many(self, items, run_id) -> None:
+        """``record_pending`` for many rows: items = [(cfg, position)]."""
+        params = [(*task_identity(cfg), strategy_name(cfg), position_text(pos), int(run_id)) for cfg, pos in items]
+        if params:
+            with self._cursor() as cur:
+                cur.executemany(record_pending_sql(), params)
+
+    def advance_many(self, items) -> None:
+        """``advance_checkpoint`` (status ok, recording each row's select_list) for many rows:
+        items = [(cfg, position, phase, detail)]. Call ONLY after their write committed."""
+        params = [(*task_identity(cfg), strategy_name(cfg), position_text(pos), phase, "ok", detail,
+                   cfg.get("select_list")) for cfg, pos, phase, detail in items]
+        if params:
+            with self._cursor() as cur:
+                cur.executemany(upsert_checkpoint_sql(), params)
+
+    def record_ct_begin_versions(self, items) -> None:
+        """``record_ct_begin_version`` for many rows: items = [(cfg, begin_version)] (None skipped)."""
+        params = [(int(bv), int(cfg["id"])) for cfg, bv in items if bv is not None]
+        if params:
+            with self._cursor() as cur:
+                cur.executemany(record_ct_begin_version_sql(), params)
+
+    def record_finished_events(self, run_id, items, duration_ms=0) -> None:
+        """One finished ingest_event per item; 'ok' ones also stamp checkpoint.last_success_at.
+        items = [(cfg, action, phase, stage, status, position_from, position_to, pool, error)]."""
+        rows, ok = [], []
+        for cfg, action, phase, stage, status, p_from, p_to, pool, error in items:
+            rows.append((int(run_id), cfg.get("task_collection"), cfg.get("id"), cfg.get("src_database"),
+                         cfg.get("src_schema"), cfg.get("src_table"), _sink_label(cfg), action, phase, stage,
+                         status, position_text(p_from), position_text(p_to), pool,
+                         None if error is None else str(error)[:2000], int(duration_ms), int(duration_ms)))
+            if status == "ok":
+                ok.append(int(cfg["id"]))
+        if not rows:
+            return
+        with self._cursor() as cur:
+            cur.executemany(record_event_finished_sql(), rows)
+            if ok:
+                cur.execute(touch_last_success_many_sql(), (ok,))
 
     def bulk_advance_unchanged(self, rows) -> int:
         """Advance many unchanged CT tables in one executemany: rows = [(control_id, ct_version,
@@ -584,34 +749,37 @@ class StateStore:
 
     def record_event_finish(self, event_id, status, stage=None, rows_read=None, rows_merged=None,
                             position_from=None, position_to=None, error=None,
-                            action=None, pool=None) -> None:
+                            action=None, pool=None, retry_count=None) -> None:
         """Finalize an ingest_event row; on 'ok' also stamp checkpoint.last_success_at.
         Positions are stored as text. ``action`` (optional) corrects the provisional action set at
-        start (e.g. 'reseed'); ``pool`` (optional) records the FAIR pool(s) the table's units ran in."""
+        start (e.g. 'reseed'); ``pool`` (optional) records the FAIR pool(s) the table's units ran in;
+        ``retry_count`` (optional) the table's earlier attempts in this run. Status 'retried' is an
+        attempt that failed and is tried again."""
         with self._cursor() as cur:
             cur.execute(record_event_finish_sql(), (
                 status, stage, rows_read, rows_merged, position_text(position_from),
                 position_text(position_to),
-                (error[:2000] if isinstance(error, str) else error), action, pool, int(event_id),
+                (error[:2000] if isinstance(error, str) else error), action, pool, retry_count, int(event_id),
             ))
             if status == "ok":
                 cur.execute(touch_last_success_sql(), (int(event_id),))
 
-    def record_failed_tables(self, run_id, items, stage="detect") -> int:
+    def record_failed_tables(self, run_id, items, stage="detect", action=None) -> int:
         """Bulk-record tables that failed before per-table work (their source database was
-        unreachable during change detection, or the planner rejected the row — stage 'plan'): one
-        finished 'failed' ingest_event row each and the checkpoint status set to 'failed'
-        (phase/position untouched). items = [(cfg, cp, error)]."""
+        unreachable during change detection, or the planner rejected the row: stage 'plan'), or in
+        a batched append: one finished 'failed' ingest_event row each and the checkpoint status set to
+        'failed' (phase/position untouched). items = [(cfg, cp, error)]; ``action`` defaults to
+        'full' / 'increment' by the row's strategy."""
         if not items:
             return 0
         events, statuses = [], []
         for cfg, cp, err in items:
-            sink = f"{cfg.get('sink_catalog')}.{cfg.get('sink_schema')}.{cfg.get('sink_table')}"
+            sink = _sink_label(cfg)
             e = (err or "")[:2000]
-            action = "full" if strategy_name(cfg) == "full" else "increment"
+            action_ = action or ("full" if strategy_name(cfg) == "full" else "increment")
             events.append((int(run_id), cfg.get("task_collection"), cfg.get("id"),
                            cfg.get("src_database"), cfg.get("src_schema"), cfg.get("src_table"),
-                           sink, action, (cp or {}).get("phase"), stage, e))
+                           sink, action_, (cp or {}).get("phase"), stage, e))
             statuses.append((*task_identity(cfg), strategy_name(cfg), "failed", e[:500]))
         with self._cursor() as cur:
             cur.executemany(record_event_failed_sql(), events)
@@ -626,6 +794,16 @@ class StateStore:
                 status, total, ok, failed, skipped, reseeded, detail, int(run_id),
             ))
 
+    def close_abandoned_runs(self, task_collection, run_id) -> tuple:
+        """Close the collection's runs that ended without finishing (see ``close_abandoned_runs_sql``);
+        ``run_id`` is the caller's own run, which must hold the collection's lock. Returns (runs, events)."""
+        detail = json.dumps({"closed_by_run": int(run_id), "reason": ABANDONED_RUN_REASON})
+        error = f"{ABANDONED_RUN_REASON}; closed by run {int(run_id)}"
+        with self._cursor() as cur:
+            cur.execute(close_abandoned_runs_sql(), (detail, task_collection, int(run_id), error, error))
+            runs, events = cur.fetchone()
+        return int(runs), int(events)
+
     # ---- per-collection run lock (hold on a DEDICATED connection for the whole sweep) -------
     def try_lock_collection(self, task_collection: str) -> bool:
         """True iff this connection now holds the collection's lock (non-blocking)."""
@@ -636,6 +814,21 @@ class StateStore:
     def unlock_collection(self, task_collection: str) -> None:
         with self._cursor() as cur:
             cur.execute(unlock_collection_sql(), (collection_lock_key(task_collection),))
+
+    def join_sources(self, sources) -> dict:
+        """Hold a shared lock per source until this connection closes (see ``SOURCE_LOCK_CLASS``);
+        returns {source: lock key}."""
+        keys = {source: source_lock_key(source) for source in sorted(set(sources))}
+        with self._cursor() as cur:
+            for key in keys.values():
+                cur.execute(join_source_sql(), (SOURCE_LOCK_CLASS, key))
+        return keys
+
+    def source_runs(self, keys) -> dict:
+        """{lock key: runs holding it now}, for the given source lock keys."""
+        with self._cursor() as cur:
+            cur.execute(source_runs_sql(), (SOURCE_LOCK_CLASS, [int(k) for k in keys]))
+            return {int(key): int(runs) for key, runs in cur.fetchall()}
 
     def is_alive(self) -> bool:
         """True iff the connection is still usable. A dropped lock connection means the

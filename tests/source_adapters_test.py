@@ -115,3 +115,8 @@ def test_jdbc_options_cannot_override_framework_options():
     with pytest.raises(ValueError, match="JSON object"):
         sa.parse_jdbc_options("[1]")
     assert sa.parse_jdbc_options(None) == {} and sa.parse_jdbc_options("") == {}
+
+
+def test_remote_query_names_the_database_per_engine():
+    assert [sa.get_adapter(t).remote_database_option for t in sa.SRC_TYPES] == [
+        "database", "service_name", "database", "database"]      # sqlserver, oracle, postgresql, mysql

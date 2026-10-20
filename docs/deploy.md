@@ -23,9 +23,15 @@ targets:
       num_workers: 2
       # Optional overrides (defaults shown):
       # lakebase_instance: lakefed-ingest
+      # lakebase_capacity: CU_1
       # lakebase_database: lakefed_ingest
       # lakebase_catalog: lakefed_ingest_lakebase
       # secret_scope: lakefed_ingest
+      # Ingestion job parameter defaults, e.g. for a large estate (see README "Large estates"):
+      # append_batch_size: "16"
+      # max_seeds_per_run: "10000"
+      # max_queries_per_source: "64"         # see README "Concurrency"
+      # table_retries: "2"                    # see README "Table retries"
 ```
 
 The default compute needs ~32 cores; a subscription with a small vCPU quota must use smaller nodes
@@ -98,7 +104,12 @@ databricks bundle run lakefed_ingest_setup -t dev   # idempotent; re-run after u
    (the deployer is one; add a role for a service principal if jobs run as one).
 3. **Source credentials.** One secret per source database: JSON `{"user": "...", "password": "..."}`.
    The scope may be Azure Key Vault-backed — AKV secret names allow only letters, digits, and dashes.
-   Each control row names its secret in `secret_key`.
+   Each control row names its secret in `secret_key`. A row can instead read through an existing
+   Unity Catalog connection, which holds the credentials: set `src_connection` to its name and
+   `use_remote_query` to `true`. Then grant the identity the job runs as `USE CONNECTION` and
+   `MANAGE` on the connection (`MANAGE` because the job cluster is dedicated), for example
+   `GRANT USE CONNECTION, MANAGE ON CONNECTION <name> TO <principal>`. `remote_query` needs
+   Databricks Runtime 18.3 or later (the job runs `18.x`).
 4. **Control rows.** Register tables in the Lakebase `control` table (see `../README.md`, "Control
    rows", and `notebooks/load_control_example.ipynb`): `src_type`, `load_type`, source
    host/port/database/table, `secret_key`, `primary_key` (not needed for `full`), explicit

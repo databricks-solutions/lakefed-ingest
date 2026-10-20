@@ -336,3 +336,106 @@ def test_missing_primary_key_fails_at_plan_for_merge_strategies_only():
     assert planner.config_error(full) is None
     plans, _, _ = planner.route_tables([ct, full], {})
     assert {p["cfg"]["id"]: p["route"] for p in plans} == {1: "unsupported", 3: "full"}
+
+
+# ---- append write mode -----------------------------------------------------------------------------
+
+def test_pending_append_is_verified_before_anything_else():
+    cfg = dict(_cfg(1, "d1", "a"), write_mode="append")
+    for cp in (dict(_cp(100), pending_position="150", pending_run_id=9),                  # change append
+               dict(_cp(None, phase=ss.SEEDING), pending_position="80", pending_run_id=9)):  # seed append
+        plans, candidates, _ = planner.route_tables([cfg], {1: cp})
+        assert [p["route"] for p in plans] == ["pending"] and candidates == []
+    # merge mode never records one; a stray value is ignored (the next checkpoint advance clears it)
+    plans, candidates, _ = planner.route_tables([_cfg(1, "d1", "a")], {1: dict(_cp(100), pending_run_id=9)})
+    assert plans == [] and [c["id"] for c, _ in candidates] == [1]
+
+
+def test_new_columns_carry_on_when_reseed_on_new_columns_is_off():
+    cfgs = [_cfg(1, "d1", "a", sl="id, v, w"), _cur_cfg(cid=2, sl="id, v, w")]
+    cps = {1: _cp(5), 2: _cur_cp()}
+    plans, candidates, _ = planner.route_tables(cfgs, cps, reseed_on_new_columns=False)
+    assert [p["route"] for p in plans] == ["cursor"] and [c["id"] for c, _ in candidates] == [1]
+    plans, _, _ = planner.route_tables(cfgs, cps)
+    assert [p["route"] for p in plans] == ["schema_reseed", "schema_reseed"]
+
+
+def test_unchanged_rows_record_a_select_list_that_differs_from_the_recorded_one():
+    g = [(_cfg(1, "d1", "a", sl="id, v, w"), _cp(100)), (_cfg(2, "d1", "b"), _cp(100))]
+    out = planner.detect_group(g, lambda c: 100, lambda c, i: ({}, [], 0))
+    assert out["unchanged"] == [(1, 100, "id, v, w", None), (2, 100, None, None)]
+
+
+def test_append_config_errors():
+    ok = dict(_cfg(1, "d1", "a"), write_mode="append", client_attrs='{"tenant_name": "x"}')
+    assert planner.config_error(ok) is None and planner.config_error(dict(ok, load_type="full")) is None
+    cursor = dict(ok, load_type="cursor", cursor_column="v")
+    assert "supports load_type ct and full" in planner.config_error(cursor)
+    assert "invalid write_mode" in planner.config_error(dict(ok, write_mode="upsert"))
+    assert "invalid client_attrs column" in planner.config_error(dict(ok, client_attrs='{"__x": 1}'))
+    clash = planner.config_error(dict(ok, select_list="id, Tenant_Name"))
+    assert "tenant_name" in clash and "rename" in clash
+    assert "__change_op" in planner.config_error(dict(ok, select_list="id, __change_op"))
+    assert planner.config_error(dict(ok, write_mode="merge", select_list="id, __change_op")) is None
+
+
+# ---- scale controls ------------------------------------------------------------------------------------
+
+def test_database_state_answers_version_and_table_status_in_one_query():
+    g = [(_cfg(1, "d1", "a"), _cp(100)), (_cfg(2, "d1", "b"), _cp(100))]
+    calls = []
+
+    def state(c):
+        calls.append(c["src_database"])
+        return 100, {("dbo", "b"): (0, 0)}                # table "a" lost CT
+    out = planner.detect_group(g, None, lambda c, i: ({}, [], 0), database_state=state)
+    assert calls == ["d1"] and out["queries"] == 1 and out["fast_exit"] is True
+    assert [(p["cfg"]["id"], p["reason"]) for p in out["plans"]] == [(1, "ct_disabled")]
+    assert [u[0] for u in out["unchanged"]] == [2]
+
+
+def test_database_state_failure_or_ct_disabled_fails_the_group():
+    g = [(_cfg(1, "d1", "a"), _cp(100))]
+
+    def down(c):
+        raise RuntimeError("Login failed for user")
+    out = planner.detect_group(g, None, lambda c, i: ({}, [], 0), database_state=down)
+    assert "Login failed" in out["failed"][0][2] and out["unchanged"] == []
+    out = planner.detect_group(g, None, lambda c, i: ({}, [], 0), database_state=lambda c: (None, {}))
+    assert "not enabled" in out["failed"][0][2]
+
+
+def test_seed_budget_defers_the_rest_and_puts_failed_seeds_last():
+    plans = [{"cfg": _cfg(i, "d1", "t"), "route": r, "cp": cp} for i, r, cp in (
+        (1, "seed", {"status": "failed"}), (2, "merge", {}), (3, "seed", None), (4, "cursor_seed", None),
+        (5, "seed", None))]
+    kept, deferred = planner.apply_seed_budget(plans, 2)
+    assert [p["cfg"]["id"] for p in kept] == [2, 3, 4] and [p["cfg"]["id"] for p in deferred] == [1, 5]
+    assert planner.apply_seed_budget(plans, 0) == (plans, []) and planner.apply_seed_budget(plans, 4) == (plans, [])
+
+
+def test_freshness_interval_skips_quiet_rows_whose_stamp_is_recent():
+    from datetime import datetime, timedelta, timezone
+    now = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+    recent, old = now - timedelta(minutes=10), now - timedelta(hours=3)
+    cps = {1: dict(_cp(100, begin=7), last_success_at=recent),                    # quiet, stamped recently: skip
+           2: dict(_cp(100, begin=7), last_success_at=old),                       # stamp too old
+           3: dict(_cp(90, begin=7), last_success_at=recent),                     # checkpoint moves
+           4: dict(_cp(100, begin=7), last_success_at=recent, status="failed"),   # status to clear
+           5: dict(_cp(100, begin=7), last_success_at=recent),                    # records a select_list
+           6: dict(_cp(100), last_success_at=recent)}                             # records its begin version
+    rows = [(1, 100, None, 7), (2, 100, None, 7), (3, 100, None, 7), (4, 100, None, 7), (5, 100, "id, v", 7),
+            (6, 100, None, 7)]
+    assert [r[0] for r in planner.bulk_rows_to_write(rows, cps, 3600, now=now)] == [2, 3, 4, 5, 6]
+    assert planner.bulk_rows_to_write(rows, cps, 0) == rows
+
+
+def test_a_read_through_a_connection_needs_the_connection_and_no_snapshot_isolation():
+    remote = dict(_cfg(1, "d1", "a"), use_remote_query=True, src_connection="c1", secret_key=None)
+    assert planner.config_error(remote) is None
+    assert "src_connection" in planner.config_error(dict(remote, src_connection=None))
+    assert "snapshot_isolation is on" in planner.config_error(remote, snapshot_isolation=True)
+    assert planner.config_error(dict(remote, load_type="full"), snapshot_isolation=True) is None   # no change reads
+    assert planner.config_error(dict(remote, use_remote_query=False), snapshot_isolation=True) is None
+    plans, candidates, _ = planner.route_tables([remote], {1: _cp(5)}, snapshot_isolation=True)
+    assert [p["route"] for p in plans] == ["unsupported"] and candidates == []

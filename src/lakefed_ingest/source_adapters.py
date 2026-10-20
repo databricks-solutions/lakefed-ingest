@@ -3,7 +3,8 @@
 The engine (``ct_engine.py``) and the partitioned seed (``partitions.py``) are written once against
 this interface; an adapter supplies the dialect-specific pieces:
 
-* the JDBC URL, driver class, and default Spark JDBC read options (e.g. fetch size);
+* the JDBC URL, driver class, and default Spark JDBC read options (e.g. fetch size), and the
+  ``remote_query`` option naming the database (a read through a Unity Catalog connection);
 * identifier quoting and string / bound literals;
 * the queries a load strategy needs: plain ``SELECT`` of the select_list, table size in MB and
   MIN/MAX bounds (partitioned seed).
@@ -66,6 +67,8 @@ class SourceAdapter:
     driver: str = ""
     # Default Spark JDBC read options (control.jdbc_options overrides per row).
     default_options: Dict[str, str] = {}
+    # The remote_query option naming src_database (a read through a Unity Catalog connection).
+    remote_database_option: str = "database"
 
     # ---- connection ---------------------------------------------------------------------
     def jdbc_url(self, host: str, port: int, database: str, trust_cert: bool) -> str:
@@ -171,6 +174,7 @@ class OracleAdapter(SourceAdapter):
     default_port = 1521
     driver = "oracle.jdbc.OracleDriver"
     default_options = {"fetchsize": "10000"}   # the driver default (10 rows/round trip) is far too small
+    remote_database_option = "service_name"
 
     def jdbc_url(self, host, port, database, trust_cert):
         # TLS (TCPS) needs a wallet / truststore and is configured per deployment; see docs/deploy.md.
