@@ -3,6 +3,7 @@
 No database or psycopg needed — psycopg is imported lazily inside StateStore.connect.
 """
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -596,6 +597,104 @@ def test_ddl_creates_the_schema_version_table_and_runs_in_a_transaction():
     stmts = ss.split_sql_statements(_DDL)
     assert any(s.startswith("create table if not exists lakefed_ingest.schema_version") for s in stmts)
     assert not any("concurrently" in s.lower() for s in stmts)       # not allowed in a transaction
+
+
+# Every upgrade re-applies the WHOLE lakebase_schema.sql (plus RENAMES) in one transaction, from
+# whatever version the database is at, so every statement must be idempotent, additive and valid on
+# any earlier version's schema (docs/lakebase_schema.md, "Changing the schema"). These tests check
+# the statement forms with no database: a statement that would fail or do harm when re-applied fails here
+# instead of failing the next upgrade on every deployment.
+
+# Statements that change existing columns or rows, each reviewed as a no-op once applied and valid from
+# any earlier version (a re-applied type change to the same type doesn't rewrite the table: checked on
+# Lakebase, Postgres 16). Matched by the start of the normalized statement. A new statement of these
+# kinds fails test_ddl_statements_are_safe_to_re_apply until it's reviewed and listed here.
+REVIEWED_NON_ADDITIVE = (
+    "alter table lakefed_ingest.control alter column src_port drop default",
+    "alter table lakefed_ingest.control alter column primary_key drop not null",
+    "alter table lakefed_ingest.control alter column job_name drop not null",
+    "alter table lakefed_ingest.control alter column use_remote_query set default false",
+    "update lakefed_ingest.checkpoint cc set control_id = m.id from",            # where cc.control_id is null
+    "alter table lakefed_ingest.checkpoint alter column position drop default",
+    "alter table lakefed_ingest.checkpoint alter column position drop not null",
+    "alter table lakefed_ingest.checkpoint alter column position type text using position::text",
+    "update lakefed_ingest.checkpoint set phase = 'incremental' where phase = 'cdc'",
+    "alter table lakefed_ingest.ingest_event alter column position_from type text using position_from::text",
+    "alter table lakefed_ingest.ingest_event alter column position_to type text using position_to::text",
+    "update lakefed_ingest.ingest_event set phase = 'incremental' where phase = 'cdc'",
+)
+_NON_ADDITIVE = re.compile(r"^(update|insert|delete)\b|\balter column\b|\bdrop (default|not null)\b|\bset not null\b")
+
+
+def ddl_problems(statements, reviewed=REVIEWED_NON_ADDITIVE):
+    """Why each statement isn't safe to re-apply on any earlier version's schema ([] = all safe)."""
+    out, dropped = [], set()
+    for raw in statements:
+        s = " ".join(raw.split()).lower()
+        short = s[:100]
+        if re.search(r"\brename\b", s):
+            out.append(f"rename (put it in state_store.RENAMES, which runs only pending renames): {short}")
+        elif re.match(r"(drop|truncate)\b", s) or re.search(r"\bdrop (column|table|schema|index|view)\b", s):
+            out.append(f"destructive (needs a per-version migration step, not the cumulative re-apply): {short}")
+        elif s.startswith("create"):
+            if not re.match(r"create (schema|table|(unique )?index) if not exists\b|create or replace (view|function)\b", s):
+                out.append(f"create without if not exists / or replace: {short}")
+        elif s.startswith("alter table"):
+            table = s.split()[2]
+            for name in re.findall(r"\bdrop constraint if exists (\w+)", s):
+                dropped.add((table, name))
+            for name in re.findall(r"\badd constraint (\w+)", s):
+                if (table, name) not in dropped:
+                    out.append(f"add constraint {name} without an earlier drop constraint if exists {name}: {short}")
+            if re.search(r"\badd (?!column if not exists\b|constraint\b)", s):
+                out.append(f"add without column if not exists: {short}")
+            if _NON_ADDITIVE.search(s) and not s.startswith(reviewed):
+                out.append(f"changes an existing column; review it and add it to REVIEWED_NON_ADDITIVE: {short}")
+        elif _NON_ADDITIVE.search(s):
+            if not s.startswith(reviewed):
+                out.append(f"changes existing rows; make it a no-op once applied, then add it to REVIEWED_NON_ADDITIVE: {short}")
+        elif not s.startswith("comment on"):
+            out.append(f"unrecognized statement kind: {short}")
+    return out
+
+
+def test_ddl_statements_are_safe_to_re_apply():
+    assert ddl_problems(ss.split_sql_statements(_DDL)) == []
+    # Every reviewed statement still exists (remove entries for statements taken out of the file).
+    stmts = [" ".join(s.split()).lower() for s in ss.split_sql_statements(_DDL)]
+    assert [r for r in REVIEWED_NON_ADDITIVE if not any(s.startswith(r) for s in stmts)] == []
+
+
+@pytest.mark.parametrize("stmt, why", [
+    ("create table lakefed_ingest.t (a int)", "create without if not exists"),
+    ("create index t_idx on lakefed_ingest.t (a)", "create without if not exists"),
+    ("alter table lakefed_ingest.t add column b int", "add without column if not exists"),
+    ("alter table lakefed_ingest.t add b int", "add without column if not exists"),
+    ("alter table lakefed_ingest.t add constraint c check (a > 0)", "without an earlier drop constraint if exists c"),
+    ("alter table lakefed_ingest.t drop column a", "destructive"),
+    ("drop table if exists lakefed_ingest.t", "destructive"),
+    ("truncate lakefed_ingest.t", "destructive"),
+    ("alter table lakefed_ingest.t rename column a to b", "rename"),
+    ("alter table lakefed_ingest.t alter column a type bigint", "REVIEWED_NON_ADDITIVE"),
+    ("alter table lakefed_ingest.t alter column a set not null", "REVIEWED_NON_ADDITIVE"),
+    ("update lakefed_ingest.t set a = 1", "REVIEWED_NON_ADDITIVE"),
+    ("delete from lakefed_ingest.t where a = 1", "REVIEWED_NON_ADDITIVE"),
+    ("grant select on lakefed_ingest.t to app", "unrecognized"),
+])
+def test_ddl_check_flags_statements_that_are_unsafe_to_re_apply(stmt, why):
+    problems = ddl_problems([stmt])
+    assert len(problems) == 1 and why in problems[0], problems
+
+
+def test_ddl_check_accepts_the_idempotent_forms():
+    assert ddl_problems([
+        "create table if not exists lakefed_ingest.t (a int)",
+        "create unique index if not exists t_uq on lakefed_ingest.t (a)",
+        "alter table lakefed_ingest.t add column if not exists b int, add column if not exists c text",
+        "alter table lakefed_ingest.t drop constraint if exists c",
+        "alter table lakefed_ingest.t add constraint c check (a > 0)",
+        "comment on table lakefed_ingest.t is 'x'",
+    ]) == []
 
 
 class MigrationDb:

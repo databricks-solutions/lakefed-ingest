@@ -234,3 +234,29 @@ An ingestion run whose code needs a newer version than the newest row applies th
 renames first, in one transaction, under an advisory lock (so runs of other collections wait for it
 rather than migrating twice); a failure changes nothing. A database without the table (deployed
 before versions were recorded) counts as version 0.
+
+## Changing the schema
+
+An upgrade doesn't run only the new statements: it re-applies the whole of `lakebase_schema.sql`, plus
+the pending `state_store.RENAMES`, to a database at any earlier version. So every statement must be:
+
+- **Idempotent:** safe to run again. Use `create ... if not exists`, `add column if not exists`, and
+  `drop constraint if exists` right before `add constraint`. A backfill (`update`) must be a no-op
+  once applied, for example `where control_id is null`.
+- **Additive:** no `drop table`, `drop column` or `truncate`. A change that can't be written this way
+  (a destructive change, a one-time step for one version) needs a per-version migration step, which
+  the framework doesn't have yet.
+- **Valid from any earlier version:** the statement may run on a database several versions behind.
+- **Valid in a transaction:** no `CREATE INDEX CONCURRENTLY`, no `DO $$` blocks.
+
+Renames go in `state_store.RENAMES`, which runs only the ones still pending. Prefer adding a column over
+renaming one: add the new column, write both, move the readers, and drop the old one in a later version.
+
+`tests/state_store_test.py` enforces this with no database. `test_ddl_statements_are_safe_to_re_apply`
+checks each statement's form. A statement that changes an existing column or rows (`alter column`,
+`update`) must be reviewed as a no-op once applied and listed in `REVIEWED_NON_ADDITIVE`. Then bump
+`state_store.SCHEMA_VERSION` and add the new fingerprint to `SCHEMA_FINGERPRINTS`; the test says what to add.
+
+Upgrades that only add columns, tables or indexes are safe while runs are going. A version that renames,
+or adds a constraint to a table the ingestion job writes, can fail tables of a run still on the old code
+(they're redone by the next run): for those, pause schedules or deploy between runs.

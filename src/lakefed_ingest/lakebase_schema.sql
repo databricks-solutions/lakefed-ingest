@@ -19,7 +19,9 @@
 -- Table / column / index RENAMES (ct_checkpoint -> checkpoint, sweep_run -> ingest_run, ...) have no
 -- IF EXISTS form in Postgres, so the migration runs them first, guarded, from state_store.RENAMES.
 -- Statements are split on ';', so no DO $$ blocks here, and every statement must be valid in a
--- transaction (no CREATE INDEX CONCURRENTLY).
+-- transaction (no CREATE INDEX CONCURRENTLY). Every upgrade re-applies this whole file from any earlier
+-- version: keep each statement idempotent and additive (docs/lakebase_schema.md, "Changing the schema";
+-- checked by tests/state_store_test.py).
 
 create schema if not exists lakefed_ingest;
 
