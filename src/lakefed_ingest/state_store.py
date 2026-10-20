@@ -124,7 +124,8 @@ def split_sql_statements(ddl: str) -> List[str]:
 # deploy. Bump SCHEMA_VERSION with every change to lakebase_schema.sql or RENAMES; a unit test pins the
 # DDL's fingerprint to it, so a schema change can't ship without a bump.
 #   0 = no version recorded (deployed before versions existed)   1 = first recorded version
-SCHEMA_VERSION = 1
+#   2 = discovery, control_change, checkpoint identities, freshness SLA, schedules (operations app)
+SCHEMA_VERSION = 2
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).

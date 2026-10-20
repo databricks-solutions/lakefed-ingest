@@ -582,6 +582,7 @@ def test_split_sql_statements_on_the_real_schema_file():
 # next ingestion run.
 SCHEMA_FINGERPRINTS = {
     1: "c035b85032e0df245775f4858dcc2e450ae737e885f326071c7b8546527a96e1",
+    2: "8e514a425a7684f353c288677bff216cfe32421980263c197ba453bc10ac989f",
 }
 
 
