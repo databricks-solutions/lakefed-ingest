@@ -67,6 +67,10 @@ _TRANSIENT = (
 )
 # Azure SQL throttling and availability, deadlock victim, and transport errors.
 _TRANSIENT_CODES = {40501, 40613, 40197, 49918, 49919, 49920, 10928, 10929, 1205, 233, 10053, 10054, 10060}
+# SQL Server's driver when its session is killed in the middle of a fetch (a failover, a KILL): matched
+# with the driver's exception name so a generic "error occurred" message elsewhere doesn't qualify.
+_SQLSERVER_FETCH_ABORTED = re.compile(
+    r"SQLServerException(?:\[[^\]]*\])?: An error occurred during the current command \(Done status 0\)")
 _CODE = re.compile(r"\bcode=(\d+)")
 # SQLSTATE classes: 08 connection exception, 53300 too many connections, 57P01/57P03 server shutting
 # down or starting (transient); 28 invalid authorization, 42 syntax or access rule, 3D unknown
@@ -152,7 +156,8 @@ def classify(exc: BaseException) -> str:
         return PERMANENT
     if any(isinstance(e, _PERMANENT_TYPES) for e in _chain(exc)):
         return PERMANENT
-    if any(m in text for m in _TRANSIENT) or codes & _TRANSIENT_CODES or _SQLSTATE_TRANSIENT.search(text):
+    if (any(m in text for m in _TRANSIENT) or codes & _TRANSIENT_CODES or _SQLSTATE_TRANSIENT.search(text)
+            or _SQLSERVER_FETCH_ABORTED.search(text)):
         return TRANSIENT
     return PERMANENT
 

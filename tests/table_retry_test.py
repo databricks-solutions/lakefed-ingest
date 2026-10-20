@@ -202,6 +202,18 @@ def _policy(retries=2, budget=20, per_source=5):
                                    0, "53300")), tr.TRANSIENT),
     (RuntimeError("com.mysql.cj.jdbc.exceptions.CommunicationsException: Communications link failure"),
      tr.TRANSIENT),
+    # SQL Server: a session killed in the middle of a fetch (live run r3b, Spark task retries off)
+    (_spark_error("An error occurred while calling o543.sql.\n: org.apache.spark.SparkException: Job aborted",
+                  cause=_JavaError("com.microsoft.sqlserver.jdbc.SQLServerException",
+                                   "An error occurred during the current command (Done status 0).", 0, "S0001")),
+     tr.TRANSIENT),
+    (RuntimeError("com.microsoft.sqlserver.jdbc.SQLServerException: An error occurred during the current command "
+                  "(Done status 0)."), tr.TRANSIENT),
+    (RuntimeError("An error occurred during the current command (Done status 0)."), tr.PERMANENT),   # no driver
+    (RuntimeError("com.microsoft.sqlserver.jdbc.SQLServerException: An error occurred during the current command "
+                  "(Done status 16)."), tr.PERMANENT),
+    (RuntimeError("com.microsoft.sqlserver.jdbc.SQLServerException: Invalid object name 'gen.h0800'. "
+                  "An error occurred during the current command (Done status 0)."), tr.PERMANENT),  # deny wins
 ])
 def test_classify_retries_transient_source_errors_only(error, expected):
     assert tr.classify(error) == expected
