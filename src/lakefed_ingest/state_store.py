@@ -119,6 +119,26 @@ def split_sql_statements(ddl: str) -> List[str]:
     return [s.strip() for s in no_comments.split(";") if s.strip()]
 
 
+# Schema version. The version applied is recorded in `schema_version`, so an ingestion run whose code
+# is newer than its database applies the pending migration itself (StateStore.migrate): upgrading is a
+# deploy. Bump SCHEMA_VERSION with every change to lakebase_schema.sql or RENAMES; a unit test pins the
+# DDL's fingerprint to it, so a schema change can't ship without a bump.
+#   0 = no version recorded (deployed before versions existed)   1 = first recorded version
+SCHEMA_VERSION = 1
+# Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
+# int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
+# and a class of its own (not SOURCE_LOCK_CLASS).
+SCHEMA_LOCK = (0x6C667363, 0)
+
+
+def schema_fingerprint(ddl: str) -> str:
+    """sha256 of the DDL's statements (comments and whitespace ignored) and RENAMES: what the
+    SCHEMA_VERSION pin test compares."""
+    import hashlib
+    body = "\n".join(" ".join(s.split()) for s in split_sql_statements(ddl)) + "\n" + repr(RENAMES)
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
 # --------------------------------------------------------------------------------------
 # Pure decision helpers (no DB) — unit-tested directly.
 # --------------------------------------------------------------------------------------
@@ -588,6 +608,61 @@ class StateStore:
             autocommit=True,
         )
         return cls(conn)
+
+    @staticmethod
+    def _applied_version(cur) -> int:
+        cur.execute("select to_regclass(%s)", (f"{SCHEMA}.schema_version",))
+        if cur.fetchone()[0] is None:
+            return 0
+        cur.execute(f"select coalesce(max(version), 0) from {SCHEMA}.schema_version")
+        return int(cur.fetchone()[0])
+
+    def schema_version(self) -> int:
+        """The newest schema version applied to this database; 0 if none was recorded (a database
+        set up before versions existed, or an empty one)."""
+        with self._cursor() as cur:
+            return self._applied_version(cur)
+
+    def migrate(self, ddl: str, force: bool = False, lock_timeout_s: int = 60) -> Optional[dict]:
+        """Bring the schema to SCHEMA_VERSION: the pending RENAMES, then every statement of
+        lakebase_schema.sql (``ddl``), then record the version, all in ONE transaction, so a failure
+        (a constraint existing rows violate, a lock timeout) leaves the database as it was.
+
+        Returns None when the database is already at SCHEMA_VERSION, unless ``force`` (the setup job,
+        which re-applies every time); else {'from': version before, 'renames': [statements run]}.
+        A transaction-level advisory lock serializes migrators: one that waited finds the version
+        recorded and returns None. The DDL waits at most ``lock_timeout_s`` per table for statements
+        of running jobs or the app. Refuses a database newer than this code: re-applying older DDL
+        could undo the newer migration.
+        """
+        with self._cursor() as cur, cur.connection.transaction():
+            cur.execute("select pg_advisory_xact_lock(%s::int, %s::int)", SCHEMA_LOCK)
+            cur.execute(f"set local lock_timeout = '{int(lock_timeout_s)}s'")
+            before = self._applied_version(cur)
+            if before > SCHEMA_VERSION:
+                raise RuntimeError(f"the Lakebase schema is at version {before}, newer than this code's "
+                                   f"{SCHEMA_VERSION}: deploy the newer code instead")
+            if before == SCHEMA_VERSION and not force:
+                return None
+            # Instances created before the schema was renamed: move lakefed_ingest_mt (all tables and
+            # data) to lakefed_ingest first.
+            cur.execute("select nspname from pg_namespace where nspname in ('lakefed_ingest_mt', %s)", (SCHEMA,))
+            present = {r[0] for r in cur.fetchall()}
+            if "lakefed_ingest_mt" in present and SCHEMA not in present:
+                cur.execute(f"alter schema lakefed_ingest_mt rename to {SCHEMA}")
+            cur.execute("select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace "
+                        "where n.nspname = %s", (SCHEMA,))
+            relations = {r[0] for r in cur.fetchall()}
+            cur.execute("select table_name, column_name from information_schema.columns where table_schema = %s",
+                        (SCHEMA,))
+            renames = rename_statements(relations, {(r[0], r[1]) for r in cur.fetchall()})
+            for stmt in renames:
+                cur.execute(stmt)
+            for stmt in split_sql_statements(ddl):
+                cur.execute(stmt)
+            cur.execute(f"insert into {SCHEMA}.schema_version (version) values (%s) on conflict (version) "
+                        "do update set applied_at = now(), applied_by = current_user", (SCHEMA_VERSION,))
+        return {"from": before, "renames": renames}
 
     def get_task(self, task_id) -> dict:
         """Return one config row as a dict keyed by CONTROL_COLUMNS (empty dict if not found)."""

@@ -2,7 +2,8 @@
 
 All state for the default version lives in one Lakebase (Postgres) database, schema
 `lakefed_ingest`. The DDL is [`src/lakefed_ingest/lakebase_schema.sql`](../src/lakefed_ingest/lakebase_schema.sql),
-applied and migrated by the `lakefed_ingest_setup` job. The database is registered in Unity Catalog
+applied by the `lakefed_ingest_setup` job on a new deployment and migrated by the first ingestion run
+after an upgrade (see `schema_version` below). The database is registered in Unity Catalog
 (default catalog `lakefed_ingest_lakebase`), so every table below can be queried from a SQL warehouse
 as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitoring.md)).
 
@@ -13,6 +14,7 @@ as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitor
 | `reseed_queue` | **Log.** Every reseed the job queued, and why | The ingestion job |
 | `ingest_run` | **Telemetry.** One row per job run | The ingestion job |
 | `ingest_event` | **Telemetry.** One row per table per run | The ingestion job |
+| `schema_version` | **Bookkeeping.** Schema versions applied | The setup job, or the first ingestion run after an upgrade |
 
 ```mermaid
 erDiagram
@@ -224,3 +226,11 @@ when the watermark hasn't moved.
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.
+
+## `schema_version` — schema versions applied
+
+One row per version (`state_store.SCHEMA_VERSION`) applied: `version`, `applied_at`, `applied_by`.
+An ingestion run whose code needs a newer version than the newest row applies the DDL and pending
+renames first, in one transaction, under an advisory lock (so runs of other collections wait for it
+rather than migrating twice); a failure changes nothing. A database without the table (deployed
+before versions were recorded) counts as version 0.

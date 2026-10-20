@@ -12,13 +12,24 @@
 -- resume position (CT: the database CT version as text; cursor: JSON {col, type, value}). `reseed_queue`
 -- is used by the CT and cursor strategies.
 --
--- Idempotent: re-applying this file (lakefed_ingest_setup) migrates an existing instance in
--- place (add-column-if-not-exists / drop-and-re-add constraints / non-destructive backfills).
+-- Idempotent: re-applying this file migrates an existing instance in place
+-- (add-column-if-not-exists / drop-and-re-add constraints / non-destructive backfills). It is applied
+-- in one transaction by state_store.StateStore.migrate: from the setup job, and from an ingestion run
+-- that finds the database behind state_store.SCHEMA_VERSION (bump it with every change here).
 -- Table / column / index RENAMES (ct_checkpoint -> checkpoint, sweep_run -> ingest_run, ...) have no
--- IF EXISTS form in Postgres, so apply_lakebase_schema.ipynb runs them first, guarded, from
--- state_store.RENAMES. Statements are split on ';' by the applier, so no DO $$ blocks here.
+-- IF EXISTS form in Postgres, so the migration runs them first, guarded, from state_store.RENAMES.
+-- Statements are split on ';', so no DO $$ blocks here, and every statement must be valid in a
+-- transaction (no CREATE INDEX CONCURRENTLY).
 
 create schema if not exists lakefed_ingest;
+
+-- Schema versions applied (state_store.SCHEMA_VERSION), one row each. An ingestion run whose code
+-- needs a newer version than the newest here applies this file itself before it runs.
+create table if not exists lakefed_ingest.schema_version (
+    version     integer     primary key,
+    applied_at  timestamptz not null default now(),
+    applied_by  text        not null default current_user
+);
 
 -- Cold task config / placement map. One row per (source db, table) ingestion task.
 -- Array-typed columns (primary_key, sink_cluster_cols) are stored as comma-separated text.

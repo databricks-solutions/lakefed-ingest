@@ -89,7 +89,7 @@ catalog or set `lakebase_catalog` to its name — creating a second catalog for 
 
 ```bash
 databricks bundle deploy -t dev
-databricks bundle run lakefed_ingest_setup -t dev   # idempotent; re-run after upgrades
+databricks bundle run lakefed_ingest_setup -t dev   # idempotent
 ```
 
 > Deploying creates a **billable** Lakebase instance (unless you bound an existing one).
@@ -141,9 +141,12 @@ The first run seeds; later runs apply Change Tracking increments (`ct` rows), re
 watermark (`cursor` rows), or reload the table (`full` rows). Check progress and results with the telemetry queries in [monitoring.md](monitoring.md)
 (`ingest_run`, `ingest_event`, per-table freshness).
 
-**Upgrading an existing deployment:** re-run `lakefed_ingest_setup` after deploying. It renames the
-earlier `ct_checkpoint` / `sweep_run` tables and their CT-specific columns to the generic
-`checkpoint` / `ingest_run` names in place (data kept); re-running it is a no-op.
+**Upgrading an existing deployment:** pull and deploy. The next ingestion run finds the database
+behind its schema version and migrates it first, in one transaction (a failure changes nothing and
+fails the run with the cause). To migrate before the next run instead, run `lakefed_ingest_setup`.
+Either way the migration needs the schema's owner: the deployer, unless the jobs run as another
+identity. From an early deploy, it renames the `ct_checkpoint` / `sweep_run` tables and their
+CT-specific columns to the generic `checkpoint` / `ingest_run` names in place (data kept).
 
 **Scheduling:** the ingestion job's schedule (paused by default) can't pass parameters, so it only ingests
 the default `task_collection`. For per-collection cadence, deploy a job per collection or trigger runs

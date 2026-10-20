@@ -5,6 +5,8 @@ No database or psycopg needed — psycopg is imported lazily inside StateStore.c
 import json
 from pathlib import Path
 
+import pytest
+
 import state_store as ss
 
 
@@ -565,6 +567,138 @@ def test_split_sql_statements_on_the_real_schema_file():
     stmts = ss.split_sql_statements(_DDL)
     assert stmts[0] == "create schema if not exists lakefed_ingest"
     assert all("--" not in s for s in stmts) and len(stmts) > 40
+
+
+# ---- schema version and migration --------------------------------------------------------------
+
+# The DDL fingerprint each SCHEMA_VERSION was released with. Changed lakebase_schema.sql or RENAMES?
+# Bump state_store.SCHEMA_VERSION and add its fingerprint here: deployments then migrate on their
+# next ingestion run.
+SCHEMA_FINGERPRINTS = {
+    1: "c035b85032e0df245775f4858dcc2e450ae737e885f326071c7b8546527a96e1",
+}
+
+
+def test_schema_version_is_bumped_with_every_ddl_change():
+    got = ss.schema_fingerprint(_DDL)
+    assert SCHEMA_FINGERPRINTS.get(ss.SCHEMA_VERSION) == got, (
+        f"lakebase_schema.sql or RENAMES changed: bump state_store.SCHEMA_VERSION to "
+        f"{max(SCHEMA_FINGERPRINTS) + 1} and add {{{max(SCHEMA_FINGERPRINTS) + 1}: {got!r}}} to SCHEMA_FINGERPRINTS")
+    assert ss.SCHEMA_VERSION == max(SCHEMA_FINGERPRINTS)
+
+
+def test_schema_fingerprint_ignores_comments_and_whitespace():
+    assert ss.schema_fingerprint("create table a (x int); -- note\n") == ss.schema_fingerprint("create  table a\n(x int);")
+    assert ss.schema_fingerprint("create table a (x int);") != ss.schema_fingerprint("create table a (x bigint);")
+
+
+def test_ddl_creates_the_schema_version_table_and_runs_in_a_transaction():
+    stmts = ss.split_sql_statements(_DDL)
+    assert any(s.startswith("create table if not exists lakefed_ingest.schema_version") for s in stmts)
+    assert not any("concurrently" in s.lower() for s in stmts)       # not allowed in a transaction
+
+
+class MigrationDb:
+    """A scripted Postgres for migrate(): answers the catalog queries, records statements and
+    whether they ran inside the transaction."""
+
+    def __init__(self, version=None, schemas=("lakefed_ingest",), relations=(), columns=(), fail_on=None):
+        self.version, self.schemas, self.relations, self.columns = version, set(schemas), set(relations), set(columns)
+        self.fail_on, self.statements, self.in_tx, self.committed, self.rows = fail_on, [], False, None, []
+        self.connection = self
+
+    def cursor(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def transaction(self):
+        db = self
+
+        class Tx:
+            def __enter__(self):
+                db.in_tx = True
+
+            def __exit__(self, exc_type, *exc):
+                db.in_tx, db.committed = False, exc_type is None
+                return False
+        return Tx()
+
+    def execute(self, sql, params=None):
+        if self.fail_on and self.fail_on in sql:
+            raise RuntimeError("check constraint violated")
+        if sql.startswith("select pg_advisory_xact_lock"):
+            self.lock = params
+        self.statements.append((sql, self.in_tx))
+        if sql.startswith("select to_regclass"):
+            self.rows = [(None if self.version is None else "schema_version",)]
+        elif sql.startswith("select coalesce(max(version)"):
+            self.rows = [(self.version,)]
+        elif sql.startswith("select nspname"):
+            self.rows = [(s,) for s in self.schemas]
+        elif sql.startswith("select c.relname"):
+            self.rows = [(r,) for r in self.relations]
+        elif sql.startswith("select table_name"):
+            self.rows = list(self.columns)
+
+    def fetchone(self):
+        return self.rows[0]
+
+    def fetchall(self):
+        return self.rows
+
+    def ran(self):
+        return [s for s, _ in self.statements if not s.startswith(("select", "set local"))]
+
+
+def test_schema_version_is_zero_before_versions_were_recorded():
+    assert ss.StateStore(MigrationDb()).schema_version() == 0
+    assert ss.StateStore(MigrationDb(version=1)).schema_version() == 1
+
+
+def test_migrate_from_an_unversioned_database_applies_renames_ddl_and_version_in_one_transaction():
+    db = MigrationDb(relations={"ct_checkpoint", "checkpoint_control_pk"}, columns={("ct_checkpoint", "ct_version")})
+    out = ss.StateStore(db).migrate("create table if not exists lakefed_ingest.x (a int); alter table lakefed_ingest.x add b int;")
+    assert out == {"from": 0, "renames": ["alter table lakefed_ingest.ct_checkpoint rename to checkpoint",
+                                          "alter table lakefed_ingest.checkpoint rename column ct_version to position"]}
+    assert db.ran()[2:] == ["create table if not exists lakefed_ingest.x (a int)", "alter table lakefed_ingest.x add b int",
+                            "insert into lakefed_ingest.schema_version (version) values (%s) on conflict (version) "
+                            "do update set applied_at = now(), applied_by = current_user"]
+    assert all(in_tx for _, in_tx in db.statements) and db.committed is True
+    # Serialized by the schema lock, taken before the version is read; DDL waits are bounded.
+    first = [s for s, _ in db.statements[:3]]
+    assert first[0] == "select pg_advisory_xact_lock(%s::int, %s::int)" and first[1] == "set local lock_timeout = '60s'"
+    assert first[2].startswith("select to_regclass")
+    # Two int keys: never the one-key lock of a collection (even one named "schema"), nor a source lock.
+    assert db.lock == ss.SCHEMA_LOCK and len(db.lock) == 2 and db.lock[0] != ss.SOURCE_LOCK_CLASS
+
+
+def test_migrate_is_a_noop_at_the_current_version_unless_forced():
+    db = MigrationDb(version=ss.SCHEMA_VERSION)
+    assert ss.StateStore(db).migrate("create table t (a int);") is None and db.ran() == []
+    out = ss.StateStore(db).migrate("create table t (a int);", force=True)      # the setup job
+    assert out == {"from": ss.SCHEMA_VERSION, "renames": []} and "create table t (a int)" in db.ran()
+
+
+def test_migrate_moves_the_preview_schema_first():
+    db = MigrationDb(schemas={"lakefed_ingest_mt"})
+    ss.StateStore(db).migrate("select 1;")
+    assert db.ran()[0] == "alter schema lakefed_ingest_mt rename to lakefed_ingest"
+
+
+def test_migrate_failure_rolls_back_and_a_newer_database_is_refused():
+    db = MigrationDb(fail_on="valid_remote_query")
+    with pytest.raises(RuntimeError):
+        ss.StateStore(db).migrate("alter table c add constraint valid_remote_query check (x);")
+    assert db.committed is False and not any("schema_version (version)" in s for s in db.ran())
+    newer = MigrationDb(version=ss.SCHEMA_VERSION + 1)
+    with pytest.raises(RuntimeError, match="newer than this code"):
+        ss.StateStore(newer).migrate("create table t (a int);", force=True)
+    assert newer.ran() == [] and newer.committed is False
 
 
 def test_ddl_generic_checkpoint_and_telemetry_columns():
