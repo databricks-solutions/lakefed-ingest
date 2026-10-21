@@ -148,6 +148,39 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
 Re-run the grant job if the app is recreated (new service principal). Default privileges cover
 tables the same owner adds later, so schema upgrades don't need it.
 
+The grant job defaults to serverless jobs compute (it only calls the workspace APIs and Lakebase). If
+the workspace doesn't have serverless jobs, fall back to a classic single-node cluster in your target
+(set `node_type_id` for your cloud):
+
+```yaml
+targets:
+  <target>:
+    resources:
+      jobs:
+        lakefed_ingest_app_grants:
+          job_clusters:
+            - job_cluster_key: grants_cluster
+              new_cluster:
+                spark_version: 18.x-scala2.13
+                data_security_mode: SINGLE_USER
+                node_type_id: Standard_D4ds_v5
+                num_workers: 0
+                spark_conf:
+                  spark.databricks.cluster.profile: singleNode
+                  spark.master: "local[*]"
+                custom_tags:
+                  ResourceClass: SingleNode
+          tasks:
+            - task_key: grant_app_access
+              environment_key: ""             # clears the serverless environment
+              job_cluster_key: grants_cluster
+              libraries:
+                - pypi:
+                    package: "psycopg[binary]"
+                - pypi:
+                    package: "databricks-sdk==0.145.0"
+```
+
 ## Develop locally
 
 ```bash

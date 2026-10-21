@@ -94,9 +94,49 @@ databricks bundle run lakefed_ingest_setup -t dev   # idempotent
 
 > Deploying creates a **billable** Lakebase instance (unless you bound an existing one).
 
-The setup job runs on serverless jobs compute (it only applies DDL to Lakebase), so the workspace
-needs serverless jobs enabled. The ingestion and discovery jobs read the sources, so they run on job
-clusters with the source network path.
+### Compute: serverless by default for the setup job
+
+The setup job defaults to serverless jobs compute: it only applies DDL to Lakebase, so it shouldn't
+wait several minutes for a cluster to start. Its libraries (`psycopg`, the pinned SDK) come from a job
+environment. The ingestion and discovery jobs read the sources, so they always run on job clusters
+with the source network path. The operations app's grant job defaults to serverless too (see
+[app/README.md](../app/README.md)).
+
+If the workspace doesn't have serverless jobs (or serverless can't reach Lakebase there), fall back
+to a classic single-node cluster in your target:
+
+```yaml
+targets:
+  dev:
+    resources:
+      jobs:
+        lakefed_ingest_setup:
+          job_clusters:
+            - job_cluster_key: setup_cluster
+              new_cluster:
+                spark_version: 18.x-scala2.13
+                data_security_mode: SINGLE_USER
+                node_type_id: ${var.node_type_id}
+                num_workers: 0
+                spark_conf:
+                  spark.databricks.cluster.profile: singleNode
+                  spark.master: "local[*]"
+                custom_tags:
+                  ResourceClass: SingleNode
+          tasks:
+            - task_key: apply_lakebase_schema
+              environment_key: ""             # clears the serverless environment
+              job_cluster_key: setup_cluster
+              libraries:
+                - pypi:
+                    package: "psycopg[binary]"
+                - pypi:
+                    package: "databricks-sdk==0.145.0"
+```
+
+The job keeps its (now unused) environment definition; the task runs on the cluster. To use an
+existing all-purpose cluster instead, set `existing_cluster_id` on the task in place of
+`job_cluster_key` and `job_clusters` (the libraries are then installed on that cluster).
 
 ## 3. Steps outside the bundle
 
