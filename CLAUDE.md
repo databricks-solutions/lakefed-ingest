@@ -35,7 +35,7 @@ pytest job_orchestration/tests           # job orchestration version
 ```bash
 # Default version (repo root)
 databricks bundle deploy -t <target> -p <profile>
-databricks bundle run lakefed_ingest_setup -t <target> -p <profile>   # apply/migrate Lakebase schema
+databricks bundle run lakefed_ingest_setup -t <target> -p <profile>   # create the Lakebase schema (upgrades migrate on the next ingest run)
 databricks bundle run lakefed_ingest -t <target> -p <profile> --params task_collection=<name>
 
 # Job orchestration version
@@ -67,9 +67,15 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `ct_begin_version`, `pending_position`/`pending_run_id` (an append in flight). `reseed_queue` (ct, cursor).
 - `ingest_run`, `ingest_event` — telemetry (`run_id`, `position_from/to`). The DB is registered in UC
   (default catalog `lakefed_ingest_lakebase`) for DBSQL monitoring.
-- DDL is applied by `apply_lakebase_schema.ipynb`, which splits on `;` — no `DO $$` blocks. Migrations
-  must be idempotent (`if not exists`, `drop constraint if exists`). Renames (no IF EXISTS form in
-  Postgres) go in `state_store.RENAMES`; the applier runs only the pending ones before the DDL.
+- DDL is applied by `StateStore.migrate` (from `apply_lakebase_schema.ipynb`, and from `ingest.ipynb`
+  when `schema_version` is behind `state_store.SCHEMA_VERSION`, so upgrades are deploy-only): one
+  transaction, split on `;` — no `DO $$` blocks, no `CREATE INDEX CONCURRENTLY`. Migrations must be
+  idempotent (`if not exists`, `drop constraint if exists`). Renames (no IF EXISTS form in Postgres) go
+  in `state_store.RENAMES`; only the pending ones run, before the DDL. Every DDL or RENAMES change
+  bumps `SCHEMA_VERSION` (`tests/state_store_test.py` pins its fingerprint). Every upgrade re-applies the whole
+  file from any earlier version, so statements must be idempotent and additive; `ddl_problems` in the same test
+  checks the forms, and statements that change existing columns or rows need a `REVIEWED_NON_ADDITIVE` entry
+  (docs/lakebase_schema.md, "Changing the schema").
 
 ### Jobs (`resources/`)
 - `lakefed_ingest` → task `ingest` → `ingest.ipynb`: one run ingests a `task_collection`. Parameters:

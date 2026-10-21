@@ -2,7 +2,8 @@
 
 All state for the default version lives in one Lakebase (Postgres) database, schema
 `lakefed_ingest`. The DDL is [`src/lakefed_ingest/lakebase_schema.sql`](../src/lakefed_ingest/lakebase_schema.sql),
-applied and migrated by the `lakefed_ingest_setup` job. The database is registered in Unity Catalog
+applied by the `lakefed_ingest_setup` job on a new deployment and migrated by the first ingestion run
+after an upgrade (see `schema_version` below). The database is registered in Unity Catalog
 (default catalog `lakefed_ingest_lakebase`), so every table below can be queried from a SQL warehouse
 as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitoring.md)).
 
@@ -13,6 +14,7 @@ as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitor
 | `reseed_queue` | **Log.** Every reseed the job queued, and why | The ingestion job |
 | `ingest_run` | **Telemetry.** One row per job run | The ingestion job |
 | `ingest_event` | **Telemetry.** One row per table per run | The ingestion job |
+| `schema_version` | **Bookkeeping.** Schema versions applied | The setup job, or the first ingestion run after an upgrade |
 
 ```mermaid
 erDiagram
@@ -224,3 +226,37 @@ when the watermark hasn't moved.
 
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.
+
+## `schema_version` — schema versions applied
+
+One row per version (`state_store.SCHEMA_VERSION`) applied: `version`, `applied_at`, `applied_by`.
+An ingestion run whose code needs a newer version than the newest row applies the DDL and pending
+renames first, in one transaction, under an advisory lock (so runs of other collections wait for it
+rather than migrating twice); a failure changes nothing. A database without the table (deployed
+before versions were recorded) counts as version 0.
+
+## Changing the schema
+
+An upgrade doesn't run only the new statements: it re-applies the whole of `lakebase_schema.sql`, plus
+the pending `state_store.RENAMES`, to a database at any earlier version. So every statement must be:
+
+- **Idempotent:** safe to run again. Use `create ... if not exists`, `add column if not exists`, and
+  `drop constraint if exists` right before `add constraint`. A backfill (`update`) must be a no-op
+  once applied, for example `where control_id is null`.
+- **Additive:** no `drop table`, `drop column` or `truncate`. A change that can't be written this way
+  (a destructive change, a one-time step for one version) needs a per-version migration step, which
+  the framework doesn't have yet.
+- **Valid from any earlier version:** the statement may run on a database several versions behind.
+- **Valid in a transaction:** no `CREATE INDEX CONCURRENTLY`, no `DO $$` blocks.
+
+Renames go in `state_store.RENAMES`, which runs only the ones still pending. Prefer adding a column over
+renaming one: add the new column, write both, move the readers, and drop the old one in a later version.
+
+`tests/state_store_test.py` enforces this with no database. `test_ddl_statements_are_safe_to_re_apply`
+checks each statement's form. A statement that changes an existing column or rows (`alter column`,
+`update`) must be reviewed as a no-op once applied and listed in `REVIEWED_NON_ADDITIVE`. Then bump
+`state_store.SCHEMA_VERSION` and add the new fingerprint to `SCHEMA_FINGERPRINTS`; the test says what to add.
+
+Upgrades that only add columns, tables or indexes are safe while runs are going. A version that renames,
+or adds a constraint to a table the ingestion job writes, can fail tables of a run still on the old code
+(they're redone by the next run): for those, pause schedules or deploy between runs.

@@ -378,20 +378,26 @@ All metadata lives in Lakebase (`src/lakefed_ingest/lakebase_schema.sql`), schem
 
 Column-level reference, a diagram, and the checkpoint lifecycle: [docs/lakebase_schema.md](docs/lakebase_schema.md).
 
-Upgrading from an earlier deploy: re-run `lakefed_ingest_setup`. It renames `ct_checkpoint` →
-`checkpoint` (`ct_version` → `position`), `sweep_run` → `ingest_run` (`sweep_id` → `run_id`), and
-`ingest_event.ct_version_from/to` → `position_from/to` in place; data is kept. It also renames the
-checkpoint phase `cdc` to `incremental` (history included). Deploy the new code and run the setup
-together: after the setup, an older build's checkpoint writes are rejected. This only reaches the
-existing data if the bundle points to the existing instance and database. Preview deployments used
+Upgrading from an earlier deploy: pull and deploy. The database records its schema version
+(`schema_version`); the first ingestion run whose code needs a newer one migrates the schema before it
+starts, in one transaction, while runs of other collections wait for it. If the migration fails (for
+example, existing rows break a new constraint), nothing changes and the run fails with the cause; fix
+it and re-run. Running `lakefed_ingest_setup` after deploying migrates ahead of the first run instead,
+and the migration needs the schema's owner (the deployer, unless the jobs run as someone else). From an
+early deploy, the migration renames `ct_checkpoint` → `checkpoint` (`ct_version` → `position`),
+`sweep_run` → `ingest_run` (`sweep_id` → `run_id`), and `ingest_event.ct_version_from/to` →
+`position_from/to` in place; data is kept. It also renames the checkpoint phase `cdc` to `incremental`
+(history included); a run still going on the older code then has its checkpoint writes rejected, and
+the next run picks those tables up. This only reaches the existing data if the bundle points to the
+existing instance and database. Preview deployments used
 different names and a different bundle, so follow
 [Upgrading a preview deployment](docs/deploy.md#1-add-a-target) first; the defaults would create a new,
 empty instance.
 
-The setup also creates the one-row-per-sink unique index. If existing control rows already write
+The migration also creates the one-row-per-sink unique index. If existing control rows already write
 the same sink, it fails with `could not create unique index "control_sink_client_uq"`; those rows
 were overwriting each other's data. Find them, point each at its own sink (or set `client_id` to
-consolidate), and re-run the setup:
+consolidate), and re-run:
 
 ```sql
 select lower(sink_catalog), lower(sink_schema), lower(sink_table), array_agg(id order by id)
@@ -429,7 +435,7 @@ snapshot of every table that gained the column). New sinks get
 | Prerequisite | How |
 |---|---|
 | Lakebase instance, database, UC catalog | Bundle resources in `resources/lakefed_ingest_setup.yml` (created on deploy, or adopt existing ones with `bundle deployment bind`) |
-| Schema + migrations | `lakefed_ingest_setup` job (idempotent; re-run after upgrades) |
+| Schema + migrations | `lakefed_ingest_setup` job on a new deployment (idempotent); after an upgrade, the first ingestion run migrates the schema itself |
 | Lakebase auth | SDK-minted OAuth token at runtime; the run identity must be a Postgres role on the instance |
 | Cluster → Lakebase network path (port 5432) | Workspace IP access list must allow cluster egress, or use Private Link. Verify first. |
 | Per-database source credentials | One JSON secret `{"user","password"}` per source database, named by `control.secret_key`, in the `secret_scope` (may be Azure Key Vault-backed); or, for rows with `use_remote_query`, a UC connection on which the job's identity has `USE CONNECTION` and `MANAGE` |
@@ -450,7 +456,7 @@ Step-by-step setup for a new workspace: [docs/deploy.md](docs/deploy.md).
 # From the repo root (bundle lakefed_ingest_v2). Compute variables default to Azure node types.
 databricks bundle deploy -t <target> -p <profile>
 
-# One-time and after upgrades: apply / migrate the Lakebase schema.
+# One-time: create the Lakebase schema. (Upgrades migrate it on the next ingestion run.)
 databricks bundle run lakefed_ingest_setup -t <target> -p <profile>
 
 # Load one secret per source database (or use an Azure Key Vault-backed scope). Rows that read

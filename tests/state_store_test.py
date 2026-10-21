@@ -3,7 +3,10 @@
 No database or psycopg needed — psycopg is imported lazily inside StateStore.connect.
 """
 import json
+import re
 from pathlib import Path
+
+import pytest
 
 import state_store as ss
 
@@ -565,6 +568,236 @@ def test_split_sql_statements_on_the_real_schema_file():
     stmts = ss.split_sql_statements(_DDL)
     assert stmts[0] == "create schema if not exists lakefed_ingest"
     assert all("--" not in s for s in stmts) and len(stmts) > 40
+
+
+# ---- schema version and migration --------------------------------------------------------------
+
+# The DDL fingerprint each SCHEMA_VERSION was released with. Changed lakebase_schema.sql or RENAMES?
+# Bump state_store.SCHEMA_VERSION and add its fingerprint here: deployments then migrate on their
+# next ingestion run.
+SCHEMA_FINGERPRINTS = {
+    1: "c035b85032e0df245775f4858dcc2e450ae737e885f326071c7b8546527a96e1",
+}
+
+
+def test_schema_version_is_bumped_with_every_ddl_change():
+    got = ss.schema_fingerprint(_DDL)
+    assert SCHEMA_FINGERPRINTS.get(ss.SCHEMA_VERSION) == got, (
+        f"lakebase_schema.sql or RENAMES changed: bump state_store.SCHEMA_VERSION to "
+        f"{max(SCHEMA_FINGERPRINTS) + 1} and add {{{max(SCHEMA_FINGERPRINTS) + 1}: {got!r}}} to SCHEMA_FINGERPRINTS")
+    assert ss.SCHEMA_VERSION == max(SCHEMA_FINGERPRINTS)
+
+
+def test_schema_fingerprint_ignores_comments_and_whitespace():
+    assert ss.schema_fingerprint("create table a (x int); -- note\n") == ss.schema_fingerprint("create  table a\n(x int);")
+    assert ss.schema_fingerprint("create table a (x int);") != ss.schema_fingerprint("create table a (x bigint);")
+
+
+def test_ddl_creates_the_schema_version_table_and_runs_in_a_transaction():
+    stmts = ss.split_sql_statements(_DDL)
+    assert any(s.startswith("create table if not exists lakefed_ingest.schema_version") for s in stmts)
+    assert not any("concurrently" in s.lower() for s in stmts)       # not allowed in a transaction
+
+
+# Every upgrade re-applies the WHOLE lakebase_schema.sql (plus RENAMES) in one transaction, from
+# whatever version the database is at, so every statement must be idempotent, additive and valid on
+# any earlier version's schema (docs/lakebase_schema.md, "Changing the schema"). These tests check
+# the statement forms with no database: a statement that would fail or do harm when re-applied fails here
+# instead of failing the next upgrade on every deployment.
+
+# Statements that change existing columns or rows, each reviewed as a no-op once applied and valid from
+# any earlier version (a re-applied type change to the same type doesn't rewrite the table: checked on
+# Lakebase, Postgres 16). Matched by the start of the normalized statement. A new statement of these
+# kinds fails test_ddl_statements_are_safe_to_re_apply until it's reviewed and listed here.
+REVIEWED_NON_ADDITIVE = (
+    "alter table lakefed_ingest.control alter column src_port drop default",
+    "alter table lakefed_ingest.control alter column primary_key drop not null",
+    "alter table lakefed_ingest.control alter column job_name drop not null",
+    "alter table lakefed_ingest.control alter column use_remote_query set default false",
+    "update lakefed_ingest.checkpoint cc set control_id = m.id from",            # where cc.control_id is null
+    "alter table lakefed_ingest.checkpoint alter column position drop default",
+    "alter table lakefed_ingest.checkpoint alter column position drop not null",
+    "alter table lakefed_ingest.checkpoint alter column position type text using position::text",
+    "update lakefed_ingest.checkpoint set phase = 'incremental' where phase = 'cdc'",
+    "alter table lakefed_ingest.ingest_event alter column position_from type text using position_from::text",
+    "alter table lakefed_ingest.ingest_event alter column position_to type text using position_to::text",
+    "update lakefed_ingest.ingest_event set phase = 'incremental' where phase = 'cdc'",
+)
+_NON_ADDITIVE = re.compile(r"^(update|insert|delete)\b|\balter column\b|\bdrop (default|not null)\b|\bset not null\b")
+
+
+def ddl_problems(statements, reviewed=REVIEWED_NON_ADDITIVE):
+    """Why each statement isn't safe to re-apply on any earlier version's schema ([] = all safe)."""
+    out, dropped = [], set()
+    for raw in statements:
+        s = " ".join(raw.split()).lower()
+        short = s[:100]
+        if re.search(r"\brename\b", s):
+            out.append(f"rename (put it in state_store.RENAMES, which runs only pending renames): {short}")
+        elif re.match(r"(drop|truncate)\b", s) or re.search(r"\bdrop (column|table|schema|index|view)\b", s):
+            out.append(f"destructive (needs a per-version migration step, not the cumulative re-apply): {short}")
+        elif s.startswith("create"):
+            if not re.match(r"create (schema|table|(unique )?index) if not exists\b|create or replace (view|function)\b", s):
+                out.append(f"create without if not exists / or replace: {short}")
+        elif s.startswith("alter table"):
+            table = s.split()[2]
+            for name in re.findall(r"\bdrop constraint if exists (\w+)", s):
+                dropped.add((table, name))
+            for name in re.findall(r"\badd constraint (\w+)", s):
+                if (table, name) not in dropped:
+                    out.append(f"add constraint {name} without an earlier drop constraint if exists {name}: {short}")
+            if re.search(r"\badd (?!column if not exists\b|constraint\b)", s):
+                out.append(f"add without column if not exists: {short}")
+            if _NON_ADDITIVE.search(s) and not s.startswith(reviewed):
+                out.append(f"changes an existing column; review it and add it to REVIEWED_NON_ADDITIVE: {short}")
+        elif _NON_ADDITIVE.search(s):
+            if not s.startswith(reviewed):
+                out.append(f"changes existing rows; make it a no-op once applied, then add it to REVIEWED_NON_ADDITIVE: {short}")
+        elif not s.startswith("comment on"):
+            out.append(f"unrecognized statement kind: {short}")
+    return out
+
+
+def test_ddl_statements_are_safe_to_re_apply():
+    assert ddl_problems(ss.split_sql_statements(_DDL)) == []
+    # Every reviewed statement still exists (remove entries for statements taken out of the file).
+    stmts = [" ".join(s.split()).lower() for s in ss.split_sql_statements(_DDL)]
+    assert [r for r in REVIEWED_NON_ADDITIVE if not any(s.startswith(r) for s in stmts)] == []
+
+
+@pytest.mark.parametrize("stmt, why", [
+    ("create table lakefed_ingest.t (a int)", "create without if not exists"),
+    ("create index t_idx on lakefed_ingest.t (a)", "create without if not exists"),
+    ("alter table lakefed_ingest.t add column b int", "add without column if not exists"),
+    ("alter table lakefed_ingest.t add b int", "add without column if not exists"),
+    ("alter table lakefed_ingest.t add constraint c check (a > 0)", "without an earlier drop constraint if exists c"),
+    ("alter table lakefed_ingest.t drop column a", "destructive"),
+    ("drop table if exists lakefed_ingest.t", "destructive"),
+    ("truncate lakefed_ingest.t", "destructive"),
+    ("alter table lakefed_ingest.t rename column a to b", "rename"),
+    ("alter table lakefed_ingest.t alter column a type bigint", "REVIEWED_NON_ADDITIVE"),
+    ("alter table lakefed_ingest.t alter column a set not null", "REVIEWED_NON_ADDITIVE"),
+    ("update lakefed_ingest.t set a = 1", "REVIEWED_NON_ADDITIVE"),
+    ("delete from lakefed_ingest.t where a = 1", "REVIEWED_NON_ADDITIVE"),
+    ("grant select on lakefed_ingest.t to app", "unrecognized"),
+])
+def test_ddl_check_flags_statements_that_are_unsafe_to_re_apply(stmt, why):
+    problems = ddl_problems([stmt])
+    assert len(problems) == 1 and why in problems[0], problems
+
+
+def test_ddl_check_accepts_the_idempotent_forms():
+    assert ddl_problems([
+        "create table if not exists lakefed_ingest.t (a int)",
+        "create unique index if not exists t_uq on lakefed_ingest.t (a)",
+        "alter table lakefed_ingest.t add column if not exists b int, add column if not exists c text",
+        "alter table lakefed_ingest.t drop constraint if exists c",
+        "alter table lakefed_ingest.t add constraint c check (a > 0)",
+        "comment on table lakefed_ingest.t is 'x'",
+    ]) == []
+
+
+class MigrationDb:
+    """A scripted Postgres for migrate(): answers the catalog queries, records statements and
+    whether they ran inside the transaction."""
+
+    def __init__(self, version=None, schemas=("lakefed_ingest",), relations=(), columns=(), fail_on=None):
+        self.version, self.schemas, self.relations, self.columns = version, set(schemas), set(relations), set(columns)
+        self.fail_on, self.statements, self.in_tx, self.committed, self.rows = fail_on, [], False, None, []
+        self.connection = self
+
+    def cursor(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def transaction(self):
+        db = self
+
+        class Tx:
+            def __enter__(self):
+                db.in_tx = True
+
+            def __exit__(self, exc_type, *exc):
+                db.in_tx, db.committed = False, exc_type is None
+                return False
+        return Tx()
+
+    def execute(self, sql, params=None):
+        if self.fail_on and self.fail_on in sql:
+            raise RuntimeError("check constraint violated")
+        if sql.startswith("select pg_advisory_xact_lock"):
+            self.lock = params
+        self.statements.append((sql, self.in_tx))
+        if sql.startswith("select to_regclass"):
+            self.rows = [(None if self.version is None else "schema_version",)]
+        elif sql.startswith("select coalesce(max(version)"):
+            self.rows = [(self.version,)]
+        elif sql.startswith("select nspname"):
+            self.rows = [(s,) for s in self.schemas]
+        elif sql.startswith("select c.relname"):
+            self.rows = [(r,) for r in self.relations]
+        elif sql.startswith("select table_name"):
+            self.rows = list(self.columns)
+
+    def fetchone(self):
+        return self.rows[0]
+
+    def fetchall(self):
+        return self.rows
+
+    def ran(self):
+        return [s for s, _ in self.statements if not s.startswith(("select", "set local"))]
+
+
+def test_schema_version_is_zero_before_versions_were_recorded():
+    assert ss.StateStore(MigrationDb()).schema_version() == 0
+    assert ss.StateStore(MigrationDb(version=1)).schema_version() == 1
+
+
+def test_migrate_from_an_unversioned_database_applies_renames_ddl_and_version_in_one_transaction():
+    db = MigrationDb(relations={"ct_checkpoint", "checkpoint_control_pk"}, columns={("ct_checkpoint", "ct_version")})
+    out = ss.StateStore(db).migrate("create table if not exists lakefed_ingest.x (a int); alter table lakefed_ingest.x add b int;")
+    assert out == {"from": 0, "renames": ["alter table lakefed_ingest.ct_checkpoint rename to checkpoint",
+                                          "alter table lakefed_ingest.checkpoint rename column ct_version to position"]}
+    assert db.ran()[2:] == ["create table if not exists lakefed_ingest.x (a int)", "alter table lakefed_ingest.x add b int",
+                            "insert into lakefed_ingest.schema_version (version) values (%s) on conflict (version) "
+                            "do update set applied_at = now(), applied_by = current_user"]
+    assert all(in_tx for _, in_tx in db.statements) and db.committed is True
+    # Serialized by the schema lock, taken before the version is read; DDL waits are bounded.
+    first = [s for s, _ in db.statements[:3]]
+    assert first[0] == "select pg_advisory_xact_lock(%s::int, %s::int)" and first[1] == "set local lock_timeout = '60s'"
+    assert first[2].startswith("select to_regclass")
+    # Two int keys: never the one-key lock of a collection (even one named "schema"), nor a source lock.
+    assert db.lock == ss.SCHEMA_LOCK and len(db.lock) == 2 and db.lock[0] != ss.SOURCE_LOCK_CLASS
+
+
+def test_migrate_is_a_noop_at_the_current_version_unless_forced():
+    db = MigrationDb(version=ss.SCHEMA_VERSION)
+    assert ss.StateStore(db).migrate("create table t (a int);") is None and db.ran() == []
+    out = ss.StateStore(db).migrate("create table t (a int);", force=True)      # the setup job
+    assert out == {"from": ss.SCHEMA_VERSION, "renames": []} and "create table t (a int)" in db.ran()
+
+
+def test_migrate_moves_the_preview_schema_first():
+    db = MigrationDb(schemas={"lakefed_ingest_mt"})
+    ss.StateStore(db).migrate("select 1;")
+    assert db.ran()[0] == "alter schema lakefed_ingest_mt rename to lakefed_ingest"
+
+
+def test_migrate_failure_rolls_back_and_a_newer_database_is_refused():
+    db = MigrationDb(fail_on="valid_remote_query")
+    with pytest.raises(RuntimeError):
+        ss.StateStore(db).migrate("alter table c add constraint valid_remote_query check (x);")
+    assert db.committed is False and not any("schema_version (version)" in s for s in db.ran())
+    newer = MigrationDb(version=ss.SCHEMA_VERSION + 1)
+    with pytest.raises(RuntimeError, match="newer than this code"):
+        ss.StateStore(newer).migrate("create table t (a int);", force=True)
+    assert newer.ran() == [] and newer.committed is False
 
 
 def test_ddl_generic_checkpoint_and_telemetry_columns():
