@@ -99,7 +99,11 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
 - `lakefed_ingest_discover` → `discover_tables.ipynb`: table discovery for bulk onboarding (params
-  `discovery_id`, `spec` JSON); writes `discovery` / `discovered_table`.
+  `discovery_id`, `spec` JSON); writes `discovery` / `discovered_table`. Runs on the bundle's
+  single-node all-purpose cluster `lakefed_ingest utility` (`resources.clusters.lakefed_ingest_utility`,
+  auto-terminates after 60 min) so repeated runs skip cluster start; transient connection errors
+  (paused sources) retry with backoff (`discovery.CONNECT_RETRIES`).
+- Setup and the app's grant job run on serverless (job `environments`); ingestion on job clusters.
 - `lakefed_ingest_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
   instance, its UC catalog, and the secret scope (`database_instances.lakebase`,
   `database_catalogs.lakebase_catalog`, `secret_scopes.secret_scope`).

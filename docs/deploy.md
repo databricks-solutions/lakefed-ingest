@@ -18,7 +18,7 @@ targets:
     workspace:
       host: https://<your-workspace-host>/
     variables:
-      node_type_id: Standard_D8ds_v5          # ingestion workers / discovery single node
+      node_type_id: Standard_D8ds_v5          # ingestion workers / the single-node utility cluster
       driver_node_type_id: Standard_D16ds_v5  # the ingestion job is driver-bound: size this first
       num_workers: 2
       # Optional overrides (defaults shown):
@@ -94,18 +94,25 @@ databricks bundle run lakefed_ingest_setup -t dev   # idempotent
 
 > Deploying creates a **billable** Lakebase instance (unless you bound an existing one).
 
-### Compute: serverless by default for the setup job
+### Compute for the setup and discovery jobs
 
-The setup job defaults to serverless jobs compute: it only applies DDL to Lakebase, so it shouldn't
-wait several minutes for a cluster to start. Its libraries (`psycopg`, the pinned SDK) come from a job
-environment. The ingestion and discovery jobs read the sources, so they always run on job clusters
-with the source network path. The operations app's grant job defaults to serverless too (see
-[app/README.md](../app/README.md)).
+The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to start:
 
-If the workspace doesn't have serverless jobs (or serverless can't reach Lakebase there), run it on
-an existing all-purpose cluster instead. It's a one-time or ad hoc job, often run several times during
-initial setup, so a running cluster beats waiting for a job cluster to start each time. In your
-target:
+- **Setup** defaults to serverless jobs compute: it only applies DDL to Lakebase. Its libraries
+  (`psycopg`, the pinned SDK) come from a job environment. The operations app's grant job defaults to
+  serverless too (see [app/README.md](../app/README.md)).
+- **Discovery** reads the sources' catalogs, so it needs the source network path. It runs on the
+  bundle's `lakefed_ingest utility` cluster: a small single-node all-purpose cluster that stays up
+  between runs (onboarding is often several discovery runs in a row) and terminates after an hour
+  without use. Deploying creates it, and Databricks starts a new cluster on creation. To use a cluster
+  you already have, override the task's `existing_cluster_id` in your target. A source that is paused
+  or resuming (Azure SQL serverless) is retried three times, with pauses doubling from 15-30 s.
+- **Ingestion** runs on job clusters with the source network path (scheduled, recurring work).
+
+If the workspace doesn't have serverless jobs (or serverless can't reach Lakebase there), run setup
+on an all-purpose cluster instead, such as the utility cluster. It's a one-time or ad hoc job, often
+run several times during initial setup, so a running cluster beats waiting for a job cluster to start
+each time. In your target:
 
 ```yaml
 targets:
@@ -116,7 +123,7 @@ targets:
           tasks:
             - task_key: apply_lakebase_schema
               environment_key: ""                 # clears the serverless environment
-              existing_cluster_id: <cluster-id>   # an all-purpose cluster you can attach to
+              existing_cluster_id: ${resources.clusters.lakefed_ingest_utility.id}   # or any all-purpose cluster
               libraries:                          # installed on that cluster
                 - pypi:
                     package: "psycopg[binary]"

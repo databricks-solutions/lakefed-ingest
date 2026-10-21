@@ -99,15 +99,29 @@ def test_discover_database_retries_connection_failures_only(monkeypatch):
         return _R([{"oid": 1, "ord": 1, "col": "id"}])
     monkeypatch.setattr(ct_engine, "_spark", lambda: None)
     monkeypatch.setattr(ct_engine, "_read", read)
-    out = d.discover_database({"src_type": "sqlserver"}, sleep=sleeps.append)
-    assert [r["load_type"] for r in out] == ["ct"] and sleeps == [d.CONNECT_RETRY_S] and len(calls) == 4
+    out = d.discover_database({"src_type": "sqlserver"}, sleep=sleeps.append, rand=lambda: 1.0)
+    assert [r["load_type"] for r in out] == ["ct"] and sleeps == [d.CONNECT_RETRY_BASE_S] and len(calls) == 4
 
-    def bad(spark, cfg, sql, **kw):
-        raise RuntimeError("Login failed for user")
+    def bad(spark, cfg, sql, **kw):        # Spark wraps a refused login as a connection failure too
+        raise RuntimeError("[FAILED_JDBC.CONNECTION] Failed to connect: Login failed for user 'x'")
     monkeypatch.setattr(ct_engine, "_read", bad)
     with pytest.raises(RuntimeError, match="Login failed"):
         d.discover_database({"src_type": "sqlserver"}, sleep=sleeps.append)
-    assert len(sleeps) == 1                                   # non-connection errors are not retried
+    assert len(sleeps) == 1                                   # permanent errors are not retried
+
+
+def test_discover_database_waits_for_a_paused_database_with_backoff(monkeypatch):
+    import ct_engine
+    sleeps = []
+
+    def paused(spark, cfg, sql, **kw):
+        raise RuntimeError("[FAILED_JDBC.CONNECTION] Failed JDBC | caused by SQLServerException[code=40613,state=S0001]: "
+                           "Database 'db' on server 's' is not currently available.")
+    monkeypatch.setattr(ct_engine, "_spark", lambda: None)
+    monkeypatch.setattr(ct_engine, "_read", paused)
+    with pytest.raises(RuntimeError, match="40613"):
+        d.discover_database({"src_type": "sqlserver"}, sleep=sleeps.append, rand=lambda: 1.0)
+    assert sleeps == [30.0, 60.0, 120.0]                      # 3 retries, doubling, capped at 120 s
 
 
 def test_nullable_rowversion_is_not_a_cursor_candidate():

@@ -2,30 +2,38 @@
 # writes them to Lakebase (discovery, discovered_table) for review — usually started from the optional
 # operations app (app/), or run directly:
 #   databricks bundle run lakefed_ingest_discover -t <target> --params discovery_id=<id>,spec='<json>'
-# Catalog metadata only (no table data is read), on the same network path as ingestion. Small
-# single-node cluster: discovery is a few metadata queries per database.
+# Catalog metadata only (no table data is read), on the same network path as ingestion.
+#
+# It runs on a small single-node ALL-PURPOSE cluster, not a job cluster: onboarding often means several
+# discovery runs in a row (batches of databases, re-runs after fixing access), and a cluster that stays
+# up between them saves a cluster start each time. It terminates after an hour without use (billed at
+# the all-purpose rate while up). Deploying creates it, and Databricks starts a new cluster on creation.
+# To use a cluster you already have, override existing_cluster_id on the task in your target.
 resources:
+  clusters:
+    lakefed_ingest_utility:
+      cluster_name: "lakefed_ingest utility"
+      spark_version: 18.x-scala2.13
+      data_security_mode: SINGLE_USER
+      single_user_name: ${workspace.current_user.userName}
+      node_type_id: ${var.node_type_id}
+      num_workers: 0
+      autotermination_minutes: 60
+      spark_conf:
+        spark.databricks.cluster.profile: singleNode
+        spark.master: "local[*]"
+      custom_tags:
+        ResourceClass: SingleNode
+        project: lakefed_ingest
+
   jobs:
     lakefed_ingest_discover:
       name: "lakefed_ingest_discover"
       description: "Discover source tables and recommended control-row settings for bulk onboarding."
       max_concurrent_runs: 10
-      job_clusters:
-        - job_cluster_key: discover_cluster
-          new_cluster:
-            spark_version: 18.x-scala2.13
-            data_security_mode: SINGLE_USER
-            node_type_id: ${var.node_type_id}
-            num_workers: 0
-            spark_conf:
-              spark.databricks.cluster.profile: singleNode
-              spark.master: "local[*]"
-            custom_tags:
-              ResourceClass: SingleNode
-              project: lakefed_ingest
       tasks:
         - task_key: discover
-          job_cluster_key: discover_cluster
+          existing_cluster_id: ${resources.clusters.lakefed_ingest_utility.id}
           notebook_task:
             notebook_path: ../src/lakefed_ingest/discover_tables.ipynb
             base_parameters:

@@ -135,35 +135,35 @@ def assemble(tables, columns, pks) -> List[dict]:
     return sorted(out, key=lambda r: (r["src_schema"].lower(), r["src_table"].lower()))
 
 
-CONNECT_RETRIES, CONNECT_RETRY_S = 3, 20
+# A paused serverless source (e.g. Azure SQL serverless: error 40613, "not currently available")
+# refuses connections for a minute or more while it resumes. Transient errors (the table retries'
+# classifier, which keeps a refused login permanent) are retried with exponential backoff and equal
+# jitter: pauses of 15-30 s, 30-60 s and 60-120 s, so a database gets up to ~3.5 minutes to resume.
+CONNECT_RETRIES, CONNECT_RETRY_BASE_S, CONNECT_RETRY_MAX_S = 3, 30.0, 120.0
 
 
-def _is_connect_failure(exc: BaseException) -> bool:
-    text = str(exc)
-    return "FAILED_JDBC.CONNECTION" in text or "Failed to connect" in text
-
-
-def discover_database(cfg: dict, slots=None, sleep=None) -> List[dict]:
-    """Discover every user table of one source database (three catalog queries). A failed first
-    connection is retried a few times: serverless sources (e.g. Azure SQL serverless) may be
-    auto-paused and refuse connections while they resume."""
+def discover_database(cfg: dict, slots=None, sleep=None, rand=None) -> List[dict]:
+    """Discover every user table of one source database (three catalog queries), retrying a query
+    that fails with a transient error (``CONNECT_RETRIES``)."""
+    import random
     import time
     import ct_engine
+    import table_retry
     if sa.get_adapter(cfg.get("src_type")).src_type != sa.SQLSERVER:
         raise ValueError(f"discovery is not implemented yet for src_type '{cfg.get('src_type')}'")
-    sleep = sleep or time.sleep
+    sleep, rand = sleep or time.sleep, rand or random.random
     spark = ct_engine._spark()
     rows = []
     for sql in (TABLES_SQL, COLUMNS_SQL, PK_SQL):
-        for attempt in range(CONNECT_RETRIES):
+        for attempt in range(CONNECT_RETRIES + 1):
             try:
                 with ct_engine._unit(slots):
                     rows.append([r.asDict() for r in ct_engine._read(spark, cfg, sql).collect()])
                 break
             except Exception as e:
-                if not _is_connect_failure(e) or attempt == CONNECT_RETRIES - 1:
+                if attempt == CONNECT_RETRIES or table_retry.classify(e) != table_retry.TRANSIENT:
                     raise
-                sleep(CONNECT_RETRY_S * (attempt + 1))
+                sleep(table_retry.backoff_delay(attempt, CONNECT_RETRY_BASE_S, CONNECT_RETRY_MAX_S, rand))
     return assemble(*rows)
 
 
