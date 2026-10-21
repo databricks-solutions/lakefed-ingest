@@ -25,12 +25,25 @@ from typing import Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CADENCES = (5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 720, 1440)   # minutes; each divides a day
-PARAMETERS = {   # ingestion job parameters a schedule may set (strings, as job parameters are)
-    "parallelism": lambda v: v.isdigit() and 1 <= int(v) <= 256,
-    "detection_chunk": lambda v: v.isdigit() and 1 <= int(v) <= 5000,
-    "trust_server_certificate": lambda v: v in ("true", "false"),
+_whole = lambda lo, hi: (lambda v: v.isdigit() and lo <= int(v) <= hi)
+_flag = lambda v: v in ("true", "false")
+# Ingestion job parameters a schedule may set (strings, as job parameters are), checked the way
+# ingest.ipynb parses them; bounds only catch typos. The job's own defaults apply to the rest.
+PARAMETERS = {
+    "parallelism": _whole(1, 256),
+    "detection_chunk": _whole(1, 5000),
+    "trust_server_certificate": _flag,
     "secret_scope": lambda v: bool(re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", v)),
+    "snapshot_isolation": _flag,
+    "reseed_on_new_columns": _flag,
+    "append_batch_size": _whole(1, 10000),
+    "max_seeds_per_run": _whole(0, 100000),
+    "freshness_interval_s": lambda v: bool(re.fullmatch(r"\d{1,6}(\.\d+)?", v)) and float(v) <= 86400,
+    "max_queries_per_source": _whole(0, 1024),
+    "table_retries": _whole(0, 10),
+    "table_retry_budget": _whole(0, 100000),
 }
+FLAGS = [k for k, check in PARAMETERS.items() if check is _flag]
 TAG_SCHEDULE = "lakefed_ingest_schedule"
 TAG_COLLECTION = "lakefed_ingest_collection"
 TAG_OWNER = "lakefed_ingest_app"     # instance/database: apps of other deployments in the workspace keep out

@@ -211,3 +211,17 @@ def test_a_blank_time_zone_is_stored_as_utc(api):
     api.post("/api/schedules", json=dict(BODY, timezone="  "))
     assert api.store.schedules[1]["timezone"] == "UTC"
     assert api.get("/api/schedules").status_code == 200 and api.get("/api/timeline").status_code == 200
+
+
+def test_ingest_runs_started_by_a_wrapper_show_their_schedule(api, monkeypatch):
+    api.post("/api/schedules", json=BODY)
+    monkeypatch.setattr(main.jobs, "INGEST_JOB_ID", "555")
+    monkeypatch.setattr(main.jobs, "job_summary", lambda jid: {"job_id": 555, "parameters": {"parallelism": "32", "db_name": "x"}})
+    monkeypatch.setattr(main.jobs, "runs", lambda jid, active_only=False, limit=25: [
+        {"run_id": 1, "task_collection": "c1", "trigger": "RUN_JOB_TASK"},
+        {"run_id": 2, "task_collection": "c1", "trigger": "ONE_TIME"}])
+    r = api.get("/api/jobs/ingest").json()
+    assert [x["schedule"] for x in r["recent"]] == ["Prod 15", None]
+    opts = api.get("/api/schedules/options").json()
+    assert opts["defaults"] == {"parallelism": "32"} and "table_retries" in opts["parameters"]
+    assert opts["scheduled"] == {"c1": ["Prod 15"], "c2": ["Prod 15"]}

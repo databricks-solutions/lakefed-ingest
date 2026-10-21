@@ -228,3 +228,46 @@ def test_sla_is_a_cosmetic_bulk_edit_and_flows_through_bulk_import():
                                      "freshness_sla_minutes": 45})
     assert q.control_row_from_review(r, "c")["freshness_sla_minutes"] == 45
     assert "freshness_sla_minutes" in q.CONTROL_INSERT_COLUMNS
+
+
+# ---- UC-connection reads, write modes, client_attrs -------------------------------------------------
+
+def test_validate_remote_query_rows_need_the_connection_not_host_or_secret():
+    remote = _row(src_host="", secret_key="", use_remote_query=True, src_connection="conn")
+    assert q.validate_control_row(remote) == []
+    assert "src_connection is required when use_remote_query is set" in q.validate_control_row(dict(remote, src_connection=""))
+    assert q.validate_control_row(_row(src_host="", src_connection="conn")) == []      # JDBC, host from the connection
+    assert "secret_key is required" in q.validate_control_row(_row(secret_key=""))
+
+
+def test_validate_write_mode_and_client_attrs():
+    assert q.validate_control_row(_row(write_mode="append", client_attrs='{"tenant": "Acme", "n": 3}')) == []
+    assert "write_mode append supports load_type ct and full, not cursor" in q.validate_control_row(
+        _row(write_mode="append", load_type="cursor", cursor_column="rv"))
+    assert "write_mode must be merge or append" in q.validate_control_row(_row(write_mode="upsert"))
+    errs = " | ".join(q.validate_control_row(_row(client_attrs='{"__x": 1, "v": 2, "ok": [1]}')))
+    assert "'__x'" in errs and "'v' is also in select_list" in errs and "'ok': the value must be" in errs
+    assert "client_attrs must be a JSON object {column: value}" in q.validate_control_row(_row(client_attrs="[1]"))
+
+
+def test_control_params_defaults_for_new_fields():
+    d = dict(zip(q.CONTROL_INSERT_COLUMNS, q.control_params(_row(write_mode="", client_attrs={"a": "b"}))))
+    assert d["write_mode"] == "merge" and d["use_remote_query"] is False and d["client_attrs"] == '{"a": "b"}'
+    d = dict(zip(q.CONTROL_INSERT_COLUMNS, q.control_params(_row(use_remote_query="true", write_mode="Append"))))
+    assert d["use_remote_query"] is True and d["write_mode"] == "append"
+
+
+def test_plan_edit_new_fields():
+    row = dict(ROW, src_connection=None, use_remote_query=False, write_mode="merge", client_attrs=None)
+    (p,) = q.plan_edit([row], {"write_mode": "append"}, bulk=False)
+    assert any("write_mode can't change on the same sink" in e for e in p["errors"])
+    (p,) = q.plan_edit([row], {"write_mode": "append", "sink_table": "t_log"}, bulk=False)
+    assert not p["errors"] and p["reseed"] == "sink_changed"
+    (p,) = q.plan_edit([row], {"use_remote_query": True, "src_connection": "conn"}, bulk=True)
+    assert not p["errors"] and p["reseed"] is None and any("map source types differently" in n for n in p["notes"])
+    (p,) = q.plan_edit([dict(row, src_host=None, src_connection="a")], {"src_connection": "b"}, bulk=False)
+    assert p["reseed"] == "source_changed"                       # the connection is the source's host
+    (p,) = q.plan_edit([dict(row, client_attrs='{"a": 1}')], {"client_attrs": '{ "a" : 1 }'}, bulk=False)
+    assert p["changes"] == {}                                    # same object, different spelling
+    (p,) = q.plan_edit([row], {"client_attrs": {"tenant": "Acme"}}, bulk=False)
+    assert p["changes"]["client_attrs"][1] == '{"tenant": "Acme"}' and any("keep their client_attrs" in n for n in p["notes"])

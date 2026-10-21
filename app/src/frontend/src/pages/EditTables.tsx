@@ -9,15 +9,19 @@ import { Badge, ConfirmButton, ErrorBox, Grid, Notice, autoColumns, fmtTime } fr
 export const EDIT_FIELDS: { key: string; type?: "number" | "checkbox" | "select"; options?: string[]; help?: string }[] = [
   { key: "task_collection" }, { key: "task_enabled", type: "checkbox" }, { key: "tier" }, { key: "priority", type: "number" },
   { key: "freshness_sla_minutes", type: "number", help: "minutes; blank = no SLA" },
-  { key: "src_type", type: "select", options: ["sqlserver", "oracle", "postgresql", "mysql"] }, { key: "src_host" },
+  { key: "src_type", type: "select", options: ["sqlserver", "oracle", "postgresql", "mysql"] },
+  { key: "use_remote_query", type: "checkbox", help: "read through the UC connection in src_connection" },
+  { key: "src_connection" }, { key: "src_host" },
   { key: "src_port", type: "number" }, { key: "secret_key" }, { key: "src_database" }, { key: "src_schema" }, { key: "src_table" },
   { key: "select_list" }, { key: "primary_key" }, { key: "load_type", type: "select", options: ["ct", "cursor", "full"] },
   { key: "cursor_column" }, { key: "sink_catalog" }, { key: "sink_schema" }, { key: "sink_table" }, { key: "client_id" },
+  { key: "write_mode", type: "select", options: ["merge", "append"], help: "changing it needs a new sink" },
+  { key: "client_attrs", help: "JSON object {column: value}" },
   { key: "load_partitioned", type: "checkbox" }, { key: "partition_col" }, { key: "partition_size_mb", type: "number" },
   { key: "jdbc_options", help: "JSON object" },
 ];
 export const BULK_FIELDS = ["task_collection", "task_enabled", "tier", "priority", "freshness_sla_minutes", "load_partitioned",
-  "partition_col", "partition_size_mb", "jdbc_options", "sink_catalog", "sink_schema"];
+  "partition_col", "partition_size_mb", "jdbc_options", "sink_catalog", "sink_schema", "src_connection", "use_remote_query"];
 
 interface PlanResult { summary: Row; plans: Row[] }
 

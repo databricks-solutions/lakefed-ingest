@@ -249,8 +249,12 @@ def _require(job_id, name):
 @app.get("/api/jobs/ingest")
 def ingest_job():
     jid = _require(jobs.INGEST_JOB_ID, "ingestion")
-    return {"job": jobs.job_summary(jid), "active": jobs.runs(jid, active_only=True, limit=50),
-            "recent": jobs.runs(jid, active_only=False, limit=25)}
+    active, recent = jobs.runs(jid, active_only=True, limit=50), jobs.runs(jid, active_only=False, limit=25)
+    # A run a wrapper job started (trigger RUN_JOB_TASK) came from a schedule of its collection.
+    scheduled = _scheduled_collections()
+    for r in active + recent:
+        r["schedule"] = ", ".join(scheduled.get(r["task_collection"], [])) if r["trigger"] == "RUN_JOB_TASK" else None
+    return {"job": jobs.job_summary(jid), "active": active, "recent": recent}
 
 
 class RunRequest(BaseModel):
@@ -509,8 +513,8 @@ def list_schedules(details: bool = True):
             for s in rows]
 
 
-@app.get("/api/schedules/options")
-def schedule_options():
+def _scheduled_collections() -> dict:
+    """{collection: [names of the active schedules it's in]}."""
     scheduled = {}
     rows = db.query(q.schedules_sql())
     if rows:
@@ -518,7 +522,18 @@ def schedule_options():
         for m in db.query(q.schedule_members_sql(), (list(names),)):
             if m["removed_at"] is None:
                 scheduled.setdefault(m["task_collection"], []).append(names[m["schedule_id"]])
-    return {"cadences": sch.CADENCES, "parameters": list(sch.PARAMETERS), "variants": sorted(jobs.ingest_variants()),
+    return scheduled
+
+
+@app.get("/api/schedules/options")
+def schedule_options():
+    scheduled = _scheduled_collections()
+    try:     # the ingestion job's own defaults, shown as the editor's placeholders
+        defaults = {k: v for k, v in jobs.job_summary(jobs.INGEST_JOB_ID)["parameters"].items() if k in sch.PARAMETERS}
+    except Exception:
+        defaults = {}
+    return {"cadences": sch.CADENCES, "parameters": list(sch.PARAMETERS), "flags": sch.FLAGS, "defaults": defaults,
+            "variants": sorted(jobs.ingest_variants()),
             "collections": [r["task_collection"] for r in db.query(q.collections_sql())], "scheduled": scheduled,
             "view_group": jobs.SCHEDULE_JOB_VIEW_GROUP}
 

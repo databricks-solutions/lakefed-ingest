@@ -176,17 +176,59 @@ CONTROL_INSERT_COLUMNS = (
     "task_collection", "src_type", "src_host", "src_port", "secret_key", "src_database", "src_schema",
     "src_table", "select_list", "primary_key", "load_type", "cursor_column", "sink_catalog",
     "sink_schema", "sink_table", "client_id", "load_partitioned", "partition_col", "partition_size_mb",
-    "freshness_sla_minutes",
+    "freshness_sla_minutes", "src_connection", "use_remote_query", "write_mode", "client_attrs", "jdbc_options",
 )
+WRITE_MODES = ("merge", "append")
+_ATTR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")     # ct_engine.client_attrs
+
+
+def _truthy(v) -> bool:
+    return v if isinstance(v, bool) else str(v or "").strip().lower() in ("true", "1", "yes", "y")
+
+
+def _json_object(v):
+    """A JSON object given as text or a dict -> the dict; None when blank; raises ValueError otherwise."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    obj = json.loads(v) if isinstance(v, str) else v
+    if not isinstance(obj, dict):
+        raise ValueError("not a JSON object")
+    return obj
+
+
+def client_attrs_errors(attrs, select_list) -> List[str]:
+    """The ingestion job's client_attrs rules (ct_engine.client_attrs), plus no clash with select_list."""
+    try:
+        obj = _json_object(attrs)
+    except ValueError:
+        return ["client_attrs must be a JSON object {column: value}"]
+    errs, seen = [], set()
+    selected = {c.strip().lower() for c in str(select_list or "").split(",") if c.strip()}
+    for name, value in (obj or {}).items():
+        if not _ATTR_NAME.match(str(name)) or str(name).startswith("__"):
+            errs.append(f"client_attrs column '{name}': use letters, digits and _ (1-128 characters, not starting with __)")
+        elif name.lower() in seen:
+            errs.append(f"client_attrs column '{name}' is given twice")
+        elif name.lower() in selected:
+            errs.append(f"client_attrs column '{name}' is also in select_list")
+        if isinstance(value, (dict, list)):
+            errs.append(f"client_attrs column '{name}': the value must be a string, number, boolean or null")
+        seen.add(str(name).lower())
+    return errs
 
 
 def validate_control_row(row: dict) -> List[str]:
     """Form-level checks with clear messages (the database CHECK constraints are the backstop)."""
     errs = []
-    for col in ("task_collection", "src_host", "secret_key", "src_database", "src_schema", "src_table",
-                "select_list", "sink_catalog", "sink_schema", "sink_table"):
+    remote = _truthy(row.get("use_remote_query"))
+    # A UC-connection read needs the connection and no host or secret; a JDBC read needs both.
+    source = ("src_connection",) if remote else ("src_host", "secret_key")
+    for col in ("task_collection",) + source + ("src_database", "src_schema", "src_table",
+                                                "select_list", "sink_catalog", "sink_schema", "sink_table"):
+        if col == "src_host" and str(row.get("src_connection") or "").strip():
+            continue                     # JDBC falls back to the connection's host
         if not str(row.get(col) or "").strip():
-            errs.append(f"{col} is required")
+            errs.append(f"{col} is required" + (" when use_remote_query is set" if col == "src_connection" else ""))
     if row.get("src_type") not in SRC_TYPES:
         errs.append(f"src_type must be one of {', '.join(SRC_TYPES)}")
     lt = row.get("load_type")
@@ -223,6 +265,12 @@ def validate_control_row(row: dict) -> List[str]:
             ok = False
         if not ok:
             errs.append("jdbc_options must be a JSON object")
+    mode = str(row.get("write_mode") or "merge").strip().lower()
+    if mode not in WRITE_MODES:
+        errs.append("write_mode must be merge or append")
+    elif mode == "append" and lt not in ("ct", "full"):
+        errs.append(f"write_mode append supports load_type ct and full, not {lt}")
+    errs += client_attrs_errors(row.get("client_attrs"), row.get("select_list"))
     return errs
 
 
@@ -233,13 +281,20 @@ def insert_control_sql() -> str:
 
 
 def control_params(row: dict) -> tuple:
-    """Insert params in CONTROL_INSERT_COLUMNS order; blank strings become NULL."""
-    def clean(v):
+    """Insert params in CONTROL_INSERT_COLUMNS order; blank strings become NULL (write_mode and
+    use_remote_query get their defaults; JSON objects are stored as text)."""
+    def clean(c, v):
+        if c == "use_remote_query":
+            return _truthy(v)
+        if c in ("client_attrs", "jdbc_options") and isinstance(v, dict):
+            return json.dumps(v)
         if isinstance(v, str):
             v = v.strip()
-            return v or None
+            v = v or None
+        if c == "write_mode":
+            return (v or "merge").lower()
         return v
-    return tuple(clean(row.get(c)) for c in CONTROL_INSERT_COLUMNS)
+    return tuple(clean(c, row.get(c)) for c in CONTROL_INSERT_COLUMNS)
 
 
 # ---- bulk import (table discovery) --------------------------------------------------------------
@@ -402,10 +457,12 @@ CONTROL_EDIT_COLUMNS = (
     "task_collection", "task_enabled", "tier", "priority", "src_type", "src_host", "src_port", "secret_key",
     "src_database", "src_schema", "src_table", "select_list", "primary_key", "load_type", "cursor_column",
     "sink_catalog", "sink_schema", "sink_table", "client_id", "load_partitioned", "partition_col",
-    "partition_size_mb", "jdbc_options", "freshness_sla_minutes",
+    "partition_size_mb", "jdbc_options", "freshness_sla_minutes", "src_connection", "use_remote_query",
+    "write_mode", "client_attrs",
 )
 BULK_EDIT_FIELDS = ("task_collection", "task_enabled", "tier", "priority", "freshness_sla_minutes", "load_partitioned",
-                    "partition_col", "partition_size_mb", "jdbc_options", "sink_catalog", "sink_schema")
+                    "partition_col", "partition_size_mb", "jdbc_options", "sink_catalog", "sink_schema",
+                    "src_connection", "use_remote_query")
 RESEED_FIELDS = {
     "src_type": "source_changed", "src_host": "source_changed", "src_port": "source_changed",
     "src_database": "source_changed", "src_schema": "source_changed", "src_table": "source_changed",
@@ -413,14 +470,23 @@ RESEED_FIELDS = {
     "client_id": "sink_changed", "primary_key": "primary_key_changed",
 }
 INT_FIELDS = {"src_port", "priority", "partition_size_mb", "freshness_sla_minutes"}
-BOOL_FIELDS = {"task_enabled", "load_partitioned"}
+BOOL_FIELDS = {"task_enabled", "load_partitioned", "use_remote_query"}
+JSON_FIELDS = {"jdbc_options", "client_attrs"}
 DEFAULT_PORTS = {"sqlserver": 1433, "oracle": 1521, "postgresql": 5432, "mysql": 3306}
 CASE_INSENSITIVE = {"src_host", "src_database", "src_schema", "src_table", "sink_catalog", "sink_schema",
-                    "sink_table", "primary_key"}
+                    "sink_table", "primary_key", "src_connection", "write_mode"}
+SINK_FIELDS = ("sink_catalog", "sink_schema", "sink_table")
 
 
 def normalize_value(field: str, value):
-    """Form / JSON value -> the stored value (blank strings -> NULL, numbers and booleans typed)."""
+    """Form / JSON value -> the stored value (blank strings -> NULL, numbers and booleans typed; a blank
+    write_mode is merge and a blank use_remote_query false, the columns' defaults; JSON objects as text)."""
+    if field == "write_mode":
+        return str(value or "").strip().lower() or "merge"
+    if field == "use_remote_query":
+        return _truthy(value)
+    if field in JSON_FIELDS and isinstance(value, dict):
+        return json.dumps(value)
     if isinstance(value, str):
         value = value.strip()
         if value == "":
@@ -441,6 +507,13 @@ def _same(field: str, old, new, row: dict) -> bool:
     if field == "src_port":
         default = DEFAULT_PORTS.get(str(row.get("src_type") or "sqlserver"))
         return (old or default) == (new or default)
+    if field in JSON_FIELDS:            # compare the objects, not their spelling
+        try:
+            return _json_object(old) == _json_object(new)
+        except ValueError:
+            return old == new
+    if field == "use_remote_query":
+        return bool(old) == bool(new)
     return old == new
 
 
@@ -472,6 +545,11 @@ def plan_edit(rows: List[dict], changes: dict, bulk: bool) -> List[dict]:
         lt = merged.get("load_type")
         incremental = lt in ("ct", "cursor")
         reasons = [RESEED_FIELDS[f] for f in p["changes"] if f in RESEED_FIELDS]
+        if "src_connection" in p["changes"] and not merged.get("src_host"):
+            reasons.append("source_changed")     # the connection is the source's host (state_store.source_identity)
+        if "write_mode" in p["changes"] and not any(f in p["changes"] for f in SINK_FIELDS):
+            p["errors"].append("write_mode can't change on the same sink (an append sink is a change log, a merge "
+                               "sink the current rows): point the row at a new sink in the same edit")
         if incremental and reasons:
             p["reseed"] = reasons[0]
         if "load_type" in p["changes"] or ("cursor_column" in p["changes"] and lt == "cursor"):
@@ -488,6 +566,11 @@ def plan_edit(rows: List[dict], changes: dict, bulk: bool) -> List[dict]:
             p["notes"].append(f"the old sink {old_sink} is left in place; drop it once the new one is verified")
         if "client_id" in p["changes"]:
             p["notes"].append("the rows already written under the old client_id stay in the sink; delete them separately")
+        if "use_remote_query" in p["changes"]:
+            p["notes"].append("Spark JDBC and remote_query map source types differently: keep each sink's rows on "
+                              "one of the two (a new sink is safest)")
+        if "client_attrs" in p["changes"]:
+            p["notes"].append("rows already written keep their client_attrs values; columns added now are NULL on them")
         if "task_collection" in p["changes"]:
             p["notes"].append(f"moves to collection {merged['task_collection']}: that collection's runs and schedule apply")
         if p["reseed"]:

@@ -6,8 +6,8 @@ import { Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, fmtTime } from "
 // A schedule runs one or more collections at a cadence. The app turns each (schedule, collection)
 // into a small Databricks job that starts the ingestion job; editing here keeps those jobs in sync.
 
-interface Options { cadences: number[]; parameters: string[]; variants: string[]; collections: string[];
-  scheduled: Record<string, string[]>; view_group: string | null }
+interface Options { cadences: number[]; parameters: string[]; flags: string[]; defaults: Record<string, string>;
+  variants: string[]; collections: string[]; scheduled: Record<string, string[]>; view_group: string | null }
 
 const CADENCE_LABEL = (m: number) => (m < 60 ? `every ${m} minutes` : m === 60 ? "hourly" : m === 1440 ? "daily" : `every ${m / 60} hours`);
 const PARAM_LABEL = (k: string) => k.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
@@ -51,8 +51,16 @@ function Editor({ initial, options, onDone }: { initial?: Row; options: Options;
         <label>Time zone<input value={f.timezone} onChange={(e) => setF({ ...f, timezone: e.target.value })} />
           <span className="muted small">IANA name; UTC avoids daylight-saving gaps for 24/7 schedules</span></label>
         {[...options.parameters, ...Object.keys(params).filter((k) => !options.parameters.includes(k))].map((k) => (
-          <label key={k}>{PARAM_LABEL(k)}<input value={params[k] ?? ""} placeholder="job default"
-            onChange={(e) => setParams({ ...params, [k]: e.target.value })} /></label>
+          <label key={k}>{PARAM_LABEL(k)}
+            {options.flags.includes(k) ? (
+              <select value={params[k] ?? ""} onChange={(e) => setParams({ ...params, [k]: e.target.value })}>
+                <option value="">job default{options.defaults[k] ? ` (${options.defaults[k]})` : ""}</option>
+                <option>true</option><option>false</option>
+              </select>
+            ) : (
+              <input value={params[k] ?? ""} placeholder={options.defaults[k] ? `job default (${options.defaults[k]})` : "job default"}
+                onChange={(e) => setParams({ ...params, [k]: e.target.value })} />
+            )}</label>
         ))}
         {options.variants.length > 1 && (
           <label>Ingestion job

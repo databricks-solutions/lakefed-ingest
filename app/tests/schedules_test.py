@@ -220,3 +220,15 @@ def test_skipped_runs_lists_incrementally_and_counts_the_whole_window():
     fake.run_list[5].append({"run_id": 998, "start_time": now - 30 * H, "state": {"life_cycle_state": "SKIPPED"}})
     assert len(cache.starts(fake, 5, now - 48 * H, now + 90_000)) == 146                         # a longer window
     assert fake.calls[-1] == ("runs", 5, now - 48 * H, now - 24 * H)
+
+
+def test_new_job_parameters_validate_like_the_notebook_parses_them():
+    ok = dict(name="p", cadence_minutes=15, timezone="UTC", job_variant="default", members=["c1"],
+              parameters={"table_retries": "2", "table_retry_budget": "50", "max_queries_per_source": "8",
+                          "max_seeds_per_run": "0", "freshness_interval_s": "300.5", "append_batch_size": "200",
+                          "snapshot_isolation": "true", "reseed_on_new_columns": "false"})
+    assert sch.validate(ok, ["c1"], ["default"]) == []
+    for k, v in (("table_retries", "-1"), ("append_batch_size", "0"), ("freshness_interval_s", "1e3"),
+                 ("snapshot_isolation", "yes")):
+        assert f"parameters.{k}: invalid value" in " ".join(sch.validate(dict(ok, parameters={k: v}), ["c1"], ["default"]))
+    assert set(sch.FLAGS) == {"trust_server_certificate", "snapshot_isolation", "reseed_on_new_columns"}

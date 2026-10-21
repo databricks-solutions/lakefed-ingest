@@ -11,10 +11,10 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 | **Runs** | Recent runs (filter by collection); select one to see its per-table events and errors |
 | **Timeline** | Runs per collection over a window (6 hours to 7 days): planned triggers, runs colored by outcome, and triggers Databricks skipped because the previous run was still going |
 | **Schedules** | Run collections at a cadence (see [Schedules](#schedules)): create, edit, pause, resume and delete schedules; each member's next run, wrapper job, last run, p95 run time, skipped triggers, and warnings for overruns and SLAs a schedule can't meet |
-| **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag, SLA). Filter by collection, text, or failing / SLA breached / no SLA / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection), **enable**, **disable** or **force a reseed** |
-| **Jobs** | The ingestion job's schedule; active and recent runs; **start a run** for a collection; **cancel** a run; run the schema setup job |
+| **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag, SLA). Filter by collection, text, or failing / SLA breached / no SLA / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection, or switch to reads through a UC connection), **enable**, **disable** or **force a reseed**. Changing `write_mode` needs a new sink in the same edit (an append sink and a merge sink can't share a table) |
+| **Jobs** | The ingestion job's schedule; active and recent runs (with the schedule that started each); **start a run** for a collection; **cancel** a run; run the schema setup job |
 | **Changes** | The change log: every add, register, edit, enable / disable and reseed made in the app, with who, what and when |
-| **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop) |
+| **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop): a JDBC source (host and secret) or a UC connection (`use_remote_query`), `write_mode`, `client_attrs` and `jdbc_options` |
 | **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template, freshness SLA), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
 
 Every write asks for confirmation. The app never deletes rows (deleted schedules are marked deleted); it
@@ -26,7 +26,8 @@ A Databricks job schedule can't pass parameters, so the ingestion job's own sche
 default collection. Schedules in the app fill that gap:
 
 - **A schedule** has a cadence (every 5 minutes to daily; each cadence divides a day), a time zone,
-  ingestion job parameters (e.g. `parallelism`), optional failure e-mails, and one or more member
+  ingestion job parameters (any of the job's tuning parameters, such as `parallelism`, `table_retries` or
+  `max_queries_per_source`; the rest keep the job's defaults), optional failure e-mails, and one or more member
   collections. A collection can be in more than one schedule.
 - **One wrapper job per member.** The app creates a small Databricks job for each (schedule,
   collection): a cron schedule and one `run_job` task that starts the ingestion job with

@@ -36,7 +36,8 @@ export default function Jobs() {
             <Metric label="Schedule status" value={j.schedule_status ?? "–"} />
             <Metric label="Scheduled collection" value={j.default_task_collection ?? "–"} />
           </div>
-          <p className="muted small">A schedule only runs the job's default task_collection.</p>
+          <p className="muted small">The job's own schedule only runs its default task_collection; the Schedules page
+            runs any collection on a cadence (runs it starts show their schedule).</p>
           <div className="toolbar">
             <label>Collection
               <select value={coll} onChange={(e) => setCollection(e.target.value)}>
@@ -67,7 +68,8 @@ export default function Jobs() {
         <Grid rows={job.data?.recent} height={360} columns={autoColumns(job.data?.recent ?? [], stateCols)} />
       </Section>
       <Section title="Schema setup">
-        <p className="muted small">Applies or migrates the Lakebase schema. Safe to re-run; needed after upgrades.</p>
+        <p className="muted small">Creates or migrates the Lakebase schema. Safe to re-run; upgrades also migrate on the next
+          ingestion run.</p>
         <ConfirmButton label="Run setup job" onConfirm={() => post.mutateAsync({ path: "/jobs/setup/run" })} />
       </Section>
     </>
