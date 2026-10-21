@@ -7,6 +7,10 @@ starts the ingestion job with ``task_collection`` set. Wrapper jobs allow one ru
 queue, so a run that is still going when the next trigger fires makes Databricks skip that trigger;
 the collection's run lock stays the backstop for manual runs.
 
+Wrapper jobs carry tags naming their schedule, collection and app (the Lakebase database whose
+schedules they implement), so ``sync`` reconciles by tag: it adopts a job whose id was never recorded
+and deletes jobs no active member owns, whatever left them behind.
+
 Pure helpers (cron, offsets, next runs, job settings, drift, warnings) are unit-tested; ``sync`` and
 ``check`` take a ``JobsClient`` so they can be tested with a fake.
 """
@@ -14,6 +18,7 @@ Pure helpers (cron, offsets, next runs, job settings, drift, warnings) are unit-
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
@@ -28,6 +33,7 @@ PARAMETERS = {   # ingestion job parameters a schedule may set (strings, as job 
 }
 TAG_SCHEDULE = "lakefed_ingest_schedule"
 TAG_COLLECTION = "lakefed_ingest_collection"
+TAG_OWNER = "lakefed_ingest_app"     # instance/database: apps of other deployments in the workspace keep out
 JOB_NAME_PREFIX = "lakefed_ingest schedule"
 _EMAIL = re.compile(r"[^@\s,]+@[^@\s,]+\.[^@\s,]+")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.,:()-]{0,79}")
@@ -113,7 +119,7 @@ def describe(cadence: int, offset: int = 0, tz: str = "UTC") -> str:
 
 def fire_times(cadence: int, offset: int, tz: str, start: datetime, end: datetime) -> List[datetime]:
     """Trigger times in [start, end), as UTC datetimes."""
-    zone = ZoneInfo(tz)
+    zone = ZoneInfo(tz or "UTC")
     local = start.astimezone(zone)
     midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
     out, day = [], midnight
@@ -137,7 +143,7 @@ def job_name(schedule_name: str, collection: str) -> str:
 
 
 def job_settings(schedule: dict, collection: str, offset: int, ingest_job_id: int,
-                 view_group: Optional[str] = None) -> dict:
+                 view_group: Optional[str] = None, owner: Optional[str] = None) -> dict:
     """Jobs API 2.2 settings of a member's wrapper job."""
     params = {"task_collection": collection,
               **{k: str(v) for k, v in sorted((schedule.get("parameters") or {}).items())}}
@@ -153,7 +159,10 @@ def job_settings(schedule: dict, collection: str, offset: int, ingest_job_id: in
         "queue": {"enabled": False},
         "tasks": [{"task_key": "ingest",
                    "run_job_task": {"job_id": int(ingest_job_id), "job_parameters": params}}],
-        "tags": {TAG_SCHEDULE: str(schedule["id"]), TAG_COLLECTION: collection[:255]},
+        "tags": {TAG_SCHEDULE: str(schedule["id"]), TAG_COLLECTION: collection[:255],
+                 **({TAG_OWNER: owner[:255]} if owner else {})},
+        # Skipped triggers are how an overrun is absorbed, not failures: don't email them.
+        "notification_settings": {"no_alert_for_skipped_runs": True},
     }
     addrs = emails(schedule.get("notify_emails"))
     if addrs:
@@ -178,8 +187,9 @@ def _comparable(s: dict) -> dict:
         "tasks": len(s.get("tasks") or []),
         "target_job_id": rj.get("job_id"),
         "job_parameters": {k: str(v) for k, v in (rj.get("job_parameters") or {}).items()},
-        "tags": {k: v for k, v in (s.get("tags") or {}).items() if k in (TAG_SCHEDULE, TAG_COLLECTION)},
+        "tags": {k: v for k, v in (s.get("tags") or {}).items() if k in (TAG_SCHEDULE, TAG_COLLECTION, TAG_OWNER)},
         "notify": sorted((s.get("email_notifications") or {}).get("on_failure") or []),
+        "no_alert_for_skipped_runs": bool((s.get("notification_settings") or {}).get("no_alert_for_skipped_runs")),
     }
 
 
@@ -212,10 +222,12 @@ def warnings(cadence: int, p95_s: Optional[float], min_sla_minutes: Optional[flo
 # ---- sync with the Jobs API ---------------------------------------------------------------------
 
 class JobsClient:
-    """The Jobs API calls sync needs (wraps the SDK's raw API client, so settings stay plain JSON)."""
+    """The Jobs API calls sync needs. Settings stay plain JSON (the SDK's raw API client for get, create,
+    reset and delete; its paging iterators, as dicts, for listing jobs and runs)."""
 
-    def __init__(self, api_client):
-        self.api = api_client
+    def __init__(self, w):
+        self.w = w
+        self.api = w.api_client
 
     def get(self, job_id: int) -> Optional[dict]:
         try:
@@ -239,62 +251,111 @@ class JobsClient:
             if "does not exist" not in str(e) and "RESOURCE_DOES_NOT_EXIST" not in str(e):
                 raise
 
-    def runs(self, job_id: int, since_ms: int, limit: int = 200) -> List[dict]:
-        out, token = [], None
-        while len(out) < limit:
-            q = {"job_id": int(job_id), "start_time_from": since_ms, "limit": 25}
-            if token:
-                q["page_token"] = token
-            r = self.api.do("GET", "/api/2.2/jobs/runs/list", query=q)
-            out += r.get("runs") or []
-            token = r.get("next_page_token")
-            if not token:
-                break
-        return out[:limit]
+    def tagged(self, schedule_id: int, owner: Optional[str]) -> Dict[int, str]:
+        """The schedule's wrapper jobs, found by tag: {job_id: collection}. Lists every job the app can see
+        (the Jobs API can't filter by tag), so it runs once per sync, not per poll."""
+        out = {}
+        for j in self.w.jobs.list(limit=100):
+            tags = (j.settings.tags if j.settings else None) or {}
+            if tags.get(TAG_SCHEDULE) == str(schedule_id) and owner and tags.get(TAG_OWNER) == owner[:255]:
+                out[int(j.job_id)] = tags.get(TAG_COLLECTION) or ""
+        return out
+
+    def runs(self, job_id: int, since_ms: int, until_ms: Optional[int] = None) -> List[dict]:
+        """Every run of the job that started in [since_ms, until_ms) (no cap: the window bounds it)."""
+        return [r.as_dict() for r in self.w.jobs.list_runs(job_id=int(job_id), start_time_from=int(since_ms),
+                                                            start_time_to=int(until_ms) if until_ms else None)]
 
 
 @dataclass
 class MemberResult:
     task_collection: str
     job_id: Optional[int]
-    action: str            # created | updated | unchanged | deleted | error
+    action: str            # created | adopted | updated | unchanged | deleted | kept | error
     detail: str = ""
+    member_id: Optional[int] = None     # None: a job no member owns (an untracked job deleted, or a listing error)
 
 
-def sync(schedule: dict, members: List[dict], removed: List[dict], client: JobsClient, ingest_job_id: int,
-         view_group: Optional[str] = None) -> List[MemberResult]:
-    """Make each active member's wrapper job match the schedule (create, or reset when it drifted), and
-    delete the jobs of removed members (or of every member when the schedule is deleted)."""
-    out = []
+def sync(schedule: dict, members: List[dict], removed: List[dict], client: JobsClient,
+         ingest_job_id: Optional[int], view_group: Optional[str] = None,
+         owner: Optional[str] = None) -> List[MemberResult]:
+    """Make each active member's wrapper job match the schedule (create, adopt an unrecorded tagged job, or
+    reset when it drifted); delete the jobs of removed members (or of every member when the schedule is
+    deleted), then any other job tagged with the schedule. Callers serialize syncs of one schedule.
+    ``ingest_job_id`` None (its job variant is no longer configured): active members report an error,
+    deletes still happen."""
+    out: List[MemberResult] = []
     deleting = schedule.get("deleted_at") is not None
+    try:
+        tagged: Optional[Dict[int, str]] = client.tagged(schedule["id"], owner)
+    except Exception as e:      # without the listing, sync by the recorded ids and delete no untracked job
+        tagged = None
+        out.append(MemberResult("", None, "error", f"listing the schedule's jobs: {e}"[:500]))
+    claimed = set()             # job ids an active member keeps
     for m in (members if not deleting else []):
-        desired = job_settings(schedule, m["task_collection"], int(m["offset_minutes"]), ingest_job_id, view_group)
+        c = m["task_collection"]
+        if m.get("job_id"):
+            claimed.add(int(m["job_id"]))
+        if ingest_job_id is None:       # keep its jobs: only the target is unknown
+            claimed.update(t for t, tc in (tagged or {}).items() if tc == c[:255])
+            out.append(MemberResult(c, m.get("job_id"), "error",
+                                    f"no ingestion job configured for job variant '{schedule.get('job_variant')}'",
+                                    m.get("id")))
+            continue
+        desired = job_settings(schedule, c, int(m["offset_minutes"]), ingest_job_id, view_group, owner)
         try:
-            job = client.get(m["job_id"]) if m.get("job_id") else None
+            jid, job, action = m.get("job_id"), None, "updated"
+            if jid:
+                job = client.get(jid)
+            if job is None:     # never recorded, or deleted outside the app: adopt a tagged job before creating
+                for t, tc in sorted((tagged or {}).items()):
+                    if tc == c[:255] and t not in claimed:
+                        job = client.get(t)
+                        if job is not None:
+                            jid, action = t, "adopted"
+                            break
             if job is None:
                 jid = client.create(desired)
-                out.append(MemberResult(m["task_collection"], jid, "created"))
+                claimed.add(jid)
+                out.append(MemberResult(c, jid, "created", member_id=m.get("id")))
+                continue
+            claimed.add(int(jid))
+            diff = drift(job.get("settings") or {}, desired)
+            if diff:
+                client.reset(jid, desired)
+            if diff or action == "adopted":
+                out.append(MemberResult(c, jid, action, ", ".join(diff), m.get("id")))
             else:
-                diff = drift(job.get("settings") or {}, desired)
-                if diff:
-                    client.reset(m["job_id"], desired)
-                    out.append(MemberResult(m["task_collection"], m["job_id"], "updated", ", ".join(diff)))
-                else:
-                    out.append(MemberResult(m["task_collection"], m["job_id"], "unchanged"))
+                out.append(MemberResult(c, jid, "unchanged", member_id=m.get("id")))
         except Exception as e:
-            out.append(MemberResult(m["task_collection"], m.get("job_id"), "error", str(e)[:500]))
+            out.append(MemberResult(c, m.get("job_id"), "error", str(e)[:500], m.get("id")))
+    deleted = set()
     for m in removed + (members if deleting else []):
         if not m.get("job_id"):
             continue
+        if int(m["job_id"]) in claimed:     # the collection was added back and its member adopted the job
+            out.append(MemberResult(m["task_collection"], m["job_id"], "kept", "adopted by the active member",
+                                    m.get("id")))
+            continue
         try:
             client.delete(m["job_id"])
-            out.append(MemberResult(m["task_collection"], m["job_id"], "deleted"))
+            deleted.add(int(m["job_id"]))
+            out.append(MemberResult(m["task_collection"], m["job_id"], "deleted", member_id=m.get("id")))
         except Exception as e:
-            out.append(MemberResult(m["task_collection"], m["job_id"], "error", str(e)[:500]))
+            out.append(MemberResult(m["task_collection"], m["job_id"], "error", str(e)[:500], m.get("id")))
+    for t, tc in sorted((tagged or {}).items()):
+        if t in claimed or t in deleted:
+            continue
+        try:
+            client.delete(t)
+            out.append(MemberResult(tc, t, "deleted", "untracked job"))
+        except Exception as e:
+            out.append(MemberResult(tc, t, "error", f"deleting untracked job: {e}"[:500]))
     return out
 
 
-def check(schedule: dict, members: List[dict], client: JobsClient, ingest_job_id: int) -> Dict[str, dict]:
+def check(schedule: dict, members: List[dict], client: JobsClient, ingest_job_id: int,
+          owner: Optional[str] = None) -> Dict[str, dict]:
     """Per member: in_sync | drifted (with the fields) | missing | not_synced. Changes nothing."""
     out = {}
     for m in members:
@@ -305,7 +366,7 @@ def check(schedule: dict, members: List[dict], client: JobsClient, ingest_job_id
         if job is None:
             out[m["task_collection"]] = {"status": "missing"}
             continue
-        desired = job_settings(schedule, m["task_collection"], int(m["offset_minutes"]), ingest_job_id)
+        desired = job_settings(schedule, m["task_collection"], int(m["offset_minutes"]), ingest_job_id, owner=owner)
         diff = drift(job.get("settings") or {}, desired)
         out[m["task_collection"]] = {"status": "drifted", "fields": diff} if diff else {"status": "in_sync"}
     return out
@@ -313,10 +374,50 @@ def check(schedule: dict, members: List[dict], client: JobsClient, ingest_job_id
 
 def skipped_triggers(runs: List[dict]) -> int:
     """Wrapper runs Databricks skipped because the previous run was still going."""
-    n = 0
-    for r in runs:
-        st = r.get("state") or {}
-        if st.get("life_cycle_state") == "SKIPPED" or st.get("result_state") == "SKIPPED" \
-                or (r.get("status") or {}).get("state") == "SKIPPED":
-            n += 1
-    return n
+    return sum(1 for r in runs if _skipped(r))
+
+
+def _skipped(r: dict) -> bool:
+    st = r.get("state") or {}
+    return (st.get("life_cycle_state") == "SKIPPED" or st.get("result_state") == "SKIPPED"
+            or (r.get("status") or {}).get("state") == "SKIPPED")
+
+
+class SkippedRuns:
+    """Start times of the wrapper jobs' skipped runs, kept between requests. A job's runs are listed in full
+    once per window; after that a refresh (at most every ``ttl_s``) lists only the runs that started since
+    the previous refresh, so counts cover the whole window without paging a day of runs on every poll.
+    A skipped run is final when it appears, so nothing listed needs listing again."""
+
+    MARGIN_MS = 10 * 60 * 1000      # re-list a little overlap at each refresh (runs are de-duplicated by id)
+
+    def __init__(self, ttl_s: int = 60, keep_hours: int = 8 * 24):
+        self.ttl_ms, self.keep_ms = ttl_s * 1000, keep_hours * 3600 * 1000
+        self._jobs: Dict[int, dict] = {}
+        self._mu = threading.Lock()
+
+    def starts(self, client: JobsClient, job_id: int, since_ms: int, now_ms: int) -> List[int]:
+        """The job's skipped runs that started at or after ``since_ms`` (ms, ascending). Raises if the Jobs
+        API does; what was cached stays."""
+        job_id = int(job_id)
+        with self._mu:
+            e = self._jobs.get(job_id)
+            if e is None:
+                e = {"from": since_ms, "to": now_ms, "skipped": self._list(client, job_id, since_ms, None)}
+                self._jobs[job_id] = e
+            elif since_ms < e["from"]:          # a longer window than listed so far: list the earlier part
+                e["skipped"].update(self._list(client, job_id, since_ms, e["from"]))
+                e["from"] = since_ms
+            if now_ms - e["to"] >= self.ttl_ms:
+                e["skipped"].update(self._list(client, job_id, e["to"] - self.MARGIN_MS, None))
+                e["to"] = now_ms
+            floor = now_ms - self.keep_ms
+            if e["from"] < floor:
+                e["skipped"] = {r: t for r, t in e["skipped"].items() if t >= floor}
+                e["from"] = floor
+            return sorted(t for t in e["skipped"].values() if t >= since_ms)
+
+    @staticmethod
+    def _list(client, job_id, since_ms, until_ms) -> Dict[int, int]:
+        return {int(r["run_id"]): int(r["start_time"]) for r in client.runs(job_id, since_ms, until_ms)
+                if _skipped(r) and r.get("start_time")}

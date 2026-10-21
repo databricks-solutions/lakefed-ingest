@@ -19,7 +19,7 @@ class Store:
     """A tiny in-memory stand-in for the schedule tables, driven by the SQL main.py runs."""
 
     def __init__(self):
-        self.schedules, self.members, self.log, self.unique = {}, {}, [], False
+        self.schedules, self.members, self.log, self.unique, self.locks = {}, {}, [], False, []
 
     def now(self):
         return datetime.now(timezone.utc).isoformat()
@@ -53,9 +53,12 @@ class Store:
                 self.members[mid]["removed_at"] = self.now()
         elif sql.startswith(f"update {q.SCHEMA}.schedule_member set offset_minutes"):
             self.members[params[1]]["offset_minutes"] = params[0]
-        elif sql.startswith(f"update {q.SCHEMA}.schedule_member set job_id"):
-            m = self.members[params[2]]
-            m.update(job_id=params[0], sync_error=params[1], synced_at=self.now())
+        elif sql == q.member_synced_sql():
+            self.members[params[1]].update(job_id=params[0], sync_error=None, synced_at=self.now())
+        elif sql == q.member_sync_failed_sql():
+            self.members[params[1]]["sync_error"] = params[0]
+        elif sql == q.schedule_lock_sql():
+            self.locks.append(params)
         elif "control_change" in sql:
             self.log.append(params)
         return []
@@ -69,7 +72,8 @@ class Store:
             s = self.schedules.get(params[0])
             return [dict(s)] if s else []
         if sql == q.schedule_members_sql():
-            return [dict(m) for m in self.members.values() if m["schedule_id"] in params[0]]
+            pending = lambda m: bool(m["removed_at"] and m["job_id"] and (m["synced_at"] is None or m["synced_at"] < m["removed_at"]))
+            return [dict(m, delete_pending=pending(m)) for m in self.members.values() if m["schedule_id"] in params[0]]
         return []
 
 
@@ -89,6 +93,7 @@ def api(monkeypatch):
     store, jobs_api = Store(), FakeJobs()
     monkeypatch.setattr(main.db, "query", store.query)
     monkeypatch.setattr(main.db, "execute", lambda sql, params=(): store.run(sql, params) and 0)
+    monkeypatch.setattr(main.db, "fetch", lambda cur, sql, params=(): store.query(sql, params))
     monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cur(store))))
     monkeypatch.setattr(main.db, "workspace", lambda: type("W", (), {"config": type("C", (), {"host": "https://h"})()})())
     monkeypatch.setattr(main.jobs, "schedule_client", lambda: jobs_api)
@@ -177,3 +182,32 @@ def test_timeline_has_planned_triggers_for_scheduled_collections(api, monkeypatc
     rows = {r["task_collection"]: r for r in api.get("/api/timeline?hours=2").json()["collections"]}
     assert 7 <= len(rows["c1"]["planned"]) <= 9
     assert rows["c2"]["schedules"] == ["Prod 15 (every 15 minutes at :07 past)"]
+
+
+def test_sync_takes_the_schedule_lock_and_a_failed_delete_is_retried(api):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    assert api.store.locks and api.store.locks[-1] == (q.SCHEDULE_LOCK_CLASS, sid)
+    c1 = next(m for m in api.store.members.values() if m["task_collection"] == "c1")
+    real = api.jobs.delete
+    api.jobs.delete = lambda job_id: (_ for _ in ()).throw(RuntimeError("503 temporarily unavailable"))
+    r = api.post(f"/api/schedules/{sid}", json=dict(BODY, members=["c2"])).json()
+    assert {x["task_collection"]: x["action"] for x in r["sync"]}["c1"] == "error"
+    assert c1["job_id"] in api.jobs.jobs and "503" in c1["sync_error"]
+    api.jobs.delete = real
+    again = api.post(f"/api/schedules/{sid}/sync").json()["sync"]          # the delete is still pending
+    assert ("c1", "deleted") in {(x["task_collection"], x["action"]) for x in again}
+    assert c1["job_id"] not in api.jobs.jobs
+
+
+def test_delete_without_the_variant_still_deletes_the_jobs(api, monkeypatch):
+    sid = api.post("/api/schedules", json=BODY).json()["id"]
+    monkeypatch.setattr(main.jobs, "ingest_variants", lambda: {})
+    r = api.post(f"/api/schedules/{sid}/delete")
+    assert r.status_code == 200 and api.jobs.jobs == {}
+    assert api.post(f"/api/schedules/{sid}/sync").status_code == 200
+
+
+def test_a_blank_time_zone_is_stored_as_utc(api):
+    api.post("/api/schedules", json=dict(BODY, timezone="  "))
+    assert api.store.schedules[1]["timezone"] == "UTC"
+    assert api.get("/api/schedules").status_code == 200 and api.get("/api/timeline").status_code == 200

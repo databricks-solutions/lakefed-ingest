@@ -37,6 +37,7 @@ def test_fire_times_and_next_run_match_the_cron():
     assert sch.next_run(1440, 30, "UTC", start) == datetime(2026, 10, 17, 0, 30, tzinfo=UTC)
     # A time zone shifts the wall clock: 02:00 in New York (EDT, UTC-4) is 06:00 UTC.
     assert sch.next_run(1440, 120, "America/New_York", start) == datetime(2026, 10, 17, 6, 0, tzinfo=UTC)
+    assert sch.next_run(15, 7, "", start) == sch.next_run(15, 7, "UTC", start)      # a blank zone is UTC
 
 
 def test_describe():
@@ -70,11 +71,15 @@ def test_job_settings_and_drift():
         "job_id": 555, "job_parameters": {"task_collection": "c1", "parallelism": "32"}}}]
     assert s["tags"] == {sch.TAG_SCHEDULE: "7", sch.TAG_COLLECTION: "c1"}
     assert s["email_notifications"] == {"on_failure": ["ops@example.com"]}
+    assert s["notification_settings"] == {"no_alert_for_skipped_runs": True}
     assert s["access_control_list"] == [{"group_name": "users", "permission_level": "CAN_VIEW"}]
     assert sch.drift(s, s) == []
     edited = dict(s, schedule=dict(s["schedule"], pause_status="PAUSED"), max_concurrent_runs=5)
     assert sch.drift(edited, s) == ["paused", "max_concurrent_runs"]
     assert "job_parameters" in sch.drift(sch.job_settings(dict(SCHED, parameters={}), "c1", 7, 555), s)
+    assert sch.drift({k: v for k, v in s.items() if k != "notification_settings"}, s) == ["no_alert_for_skipped_runs"]
+    owned = sch.job_settings(SCHED, "c1", 7, 555, owner="inst/db")
+    assert owned["tags"][sch.TAG_OWNER] == "inst/db" and sch.drift(s, owned) == ["tags"]
     assert sch.job_settings(dict(SCHED, paused=True), "c1", 0, 1)["schedule"]["pause_status"] == "PAUSED"
 
 
@@ -93,8 +98,19 @@ def test_skipped_triggers():
 
 
 class FakeJobs(sch.JobsClient):
-    def __init__(self, jobs=None):
+    def __init__(self, jobs=None, runs=None):
         self.jobs, self.calls, self.next_id = dict(jobs or {}), [], 1000
+        self.run_list = dict(runs or {})      # job_id -> runs (dicts with run_id, start_time, state)
+
+    def tagged(self, schedule_id, owner):
+        tags = lambda s: s.get("tags") or {}
+        return {j: tags(s).get(sch.TAG_COLLECTION, "") for j, s in self.jobs.items()
+                if owner and tags(s).get(sch.TAG_SCHEDULE) == str(schedule_id) and tags(s).get(sch.TAG_OWNER) == owner}
+
+    def runs(self, job_id, since_ms, until_ms=None):
+        self.calls.append(("runs", job_id, since_ms, until_ms))
+        return [r for r in self.run_list.get(job_id, [])
+                if r["start_time"] >= since_ms and (until_ms is None or r["start_time"] < until_ms)]
 
     def get(self, job_id):
         return {"job_id": job_id, "settings": self.jobs[job_id]} if job_id in self.jobs else None
@@ -143,3 +159,64 @@ def test_sync_of_a_deleted_schedule_deletes_every_job_and_reports_errors():
     assert sch.check(SCHED, [dict(task_collection="c9", offset_minutes=0, job_id=None),
                              dict(task_collection="c8", offset_minutes=0, job_id=77)], fake, 555) == {
         "c9": {"status": "not_synced"}, "c8": {"status": "missing"}}
+
+
+OWNER = "inst/db"
+
+
+def test_sync_adopts_an_unrecorded_tagged_job_and_deletes_untracked_ones():
+    mine = lambda c: sch.job_settings(SCHED, c, 0, 555, owner=OWNER)
+    fake = FakeJobs({40: mine("c1"),                                     # created, but its id never recorded
+                     41: mine("c1"),                                     # a duplicate (e.g. a double sync)
+                     42: mine("c9"),                                     # a collection no longer in the schedule
+                     43: sch.job_settings(SCHED, "c1", 0, 555, owner="other/db")})   # another deployment's
+    out = sch.sync(SCHED, [dict(id=1, task_collection="c1", offset_minutes=0, job_id=None)], [], fake, 555,
+                   owner=OWNER)
+    res = {(r.job_id, r.action, r.member_id) for r in out}
+    assert res == {(40, "adopted", 1), (41, "deleted", None), (42, "deleted", None)}
+    assert set(fake.jobs) == {40, 43} and not [c for c in fake.calls if c[0] == "create"]
+
+
+def test_sync_of_a_collection_added_back_keeps_one_job():
+    # Removed (its delete still pending), then added back as a new member with no job yet.
+    fake = FakeJobs({10: sch.job_settings(SCHED, "c1", 0, 555, owner=OWNER)})
+    out = sch.sync(SCHED, [dict(id=2, task_collection="c1", offset_minutes=0, job_id=None)],
+                   [dict(id=1, task_collection="c1", offset_minutes=0, job_id=10)], fake, 555, owner=OWNER)
+    assert {(r.member_id, r.action, r.job_id) for r in out} == {(2, "adopted", 10), (1, "kept", 10)}
+    assert set(fake.jobs) == {10}
+
+
+def test_sync_without_the_ingestion_job_still_deletes():
+    fake = FakeJobs({10: sch.job_settings(SCHED, "c1", 0, 555, owner=OWNER),
+                     11: sch.job_settings(SCHED, "c2", 0, 555, owner=OWNER)})
+    out = sch.sync(SCHED, [dict(id=1, task_collection="c1", offset_minutes=0, job_id=None)],
+                   [dict(id=2, task_collection="c2", offset_minutes=0, job_id=11)], fake, None, owner=OWNER)
+    assert {(r.member_id, r.action) for r in out} == {(1, "error"), (2, "deleted")}
+    assert "no ingestion job" in out[0].detail and set(fake.jobs) == {10}       # c1's job is kept
+
+
+def test_sync_when_listing_fails_deletes_no_untracked_job():
+    class NoList(FakeJobs):
+        def tagged(self, schedule_id, owner):
+            raise RuntimeError("429")
+    fake = NoList({40: sch.job_settings(SCHED, "c9", 0, 555, owner=OWNER)})
+    out = sch.sync(SCHED, [dict(id=1, task_collection="c1", offset_minutes=0, job_id=None)], [], fake, 555, owner=OWNER)
+    assert [(r.action, r.member_id) for r in out] == [("error", None), ("created", 1)] and 40 in fake.jobs
+
+
+def test_skipped_runs_lists_incrementally_and_counts_the_whole_window():
+    H = 3600 * 1000
+    now = 100 * H
+    # A 5-minute cadence: 288 runs a day, every other one skipped (more than any page cap).
+    runs = [{"run_id": i, "start_time": now - 24 * H + i * 300_000,
+             "state": {"life_cycle_state": "SKIPPED" if i % 2 else "TERMINATED"}} for i in range(288)]
+    fake = FakeJobs(runs={5: runs})
+    cache = sch.SkippedRuns(ttl_s=60)
+    assert len(cache.starts(fake, 5, now - 24 * H, now)) == 144
+    assert len(cache.starts(fake, 5, now - 24 * H, now + 30_000)) == 144 and len(fake.calls) == 1   # within the ttl
+    fake.run_list[5].append({"run_id": 999, "start_time": now + 30_000, "state": {"life_cycle_state": "SKIPPED"}})
+    assert len(cache.starts(fake, 5, now - 24 * H, now + 90_000)) == 145
+    assert fake.calls[-1] == ("runs", 5, now - sch.SkippedRuns.MARGIN_MS, None)                  # only the new runs
+    fake.run_list[5].append({"run_id": 998, "start_time": now - 30 * H, "state": {"life_cycle_state": "SKIPPED"}})
+    assert len(cache.starts(fake, 5, now - 48 * H, now + 90_000)) == 146                         # a longer window
+    assert fake.calls[-1] == ("runs", 5, now - 48 * H, now - 24 * H)

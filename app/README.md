@@ -32,8 +32,9 @@ default collection. Schedules in the app fill that gap:
   collection): a cron schedule and one `run_job` task that starts the ingestion job with
   `task_collection` set. Wrapper jobs need no compute of their own, and every run still happens in the
   one bundle-deployed ingestion job, so a redeploy upgrades every schedule. They're named
-  `lakefed_ingest schedule: <schedule> / <collection>` and tagged `lakefed_ingest_schedule` and
-  `lakefed_ingest_collection`.
+  `lakefed_ingest schedule: <schedule> / <collection>` and tagged `lakefed_ingest_schedule`,
+  `lakefed_ingest_collection` and `lakefed_ingest_app` (the app's Lakebase `<instance>/<database>`, so
+  apps of other deployments in the workspace leave them alone). Skipped triggers send no failure e-mail.
 - **Overlap.** Wrapper jobs allow one run at a time and don't queue: if a collection's run is still going
   at its next trigger, Databricks skips that trigger (the Timeline marks it), and the next run catches
   up. Separate jobs per collection mean one slow collection never delays the others. Manual and
@@ -42,7 +43,9 @@ default collection. Schedules in the app fill that gap:
   collections every 15 minutes), so cluster starts and source queries don't all land at once.
 - **Sync and drift.** Every create, edit, pause, resume and delete syncs the wrapper jobs right away and is
   logged on the Changes page. "Check jobs" reports jobs edited or deleted outside the app; "Sync jobs"
-  recreates missing ones and undoes outside edits.
+  recreates missing ones and undoes outside edits. A sync reconciles by tag: it adopts a member's job
+  whose id was never recorded and deletes the schedule's jobs no member owns; a failed delete is retried
+  by the next sync. Syncs of one schedule take turns (a Lakebase advisory lock).
 - **Warnings** per member: p95 run time (7 days) close to or over the cadence (triggers will be skipped),
   skipped triggers in the last 24 hours, and "can't meet SLA" when the cadence plus the p95 run time is
   longer than the strictest `freshness_sla_minutes` among the collection's tables.

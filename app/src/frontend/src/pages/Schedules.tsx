@@ -10,21 +10,26 @@ interface Options { cadences: number[]; parameters: string[]; variants: string[]
   scheduled: Record<string, string[]>; view_group: string | null }
 
 const CADENCE_LABEL = (m: number) => (m < 60 ? `every ${m} minutes` : m === 60 ? "hourly" : m === 1440 ? "daily" : `every ${m / 60} hours`);
+const PARAM_LABEL = (k: string) => k.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+const paramsText = (p?: Row) => Object.entries(p ?? {}).map(([k, v]) => `${k.replace(/_/g, " ")} ${v}`).join(" · ");
 const mins = (s: unknown) => (s === null || s === undefined ? "" : `${Math.round((Number(s) / 60) * 10) / 10} min`);
 
 function Editor({ initial, options, onDone }: { initial?: Row; options: Options; onDone: () => void }) {
   const [f, setF] = useState<Row>(initial ? {
     name: initial.name, cadence_minutes: initial.cadence_minutes, timezone: initial.timezone, stagger: initial.stagger,
     paused: initial.paused, notify_emails: initial.notify_emails ?? "", job_variant: initial.job_variant,
-    parallelism: initial.parameters?.parallelism ?? "", members: initial.members.map((m: Row) => m.task_collection),
+    members: initial.members.map((m: Row) => m.task_collection),
   } : { name: "", cadence_minutes: 15, timezone: "UTC", stagger: true, paused: false, notify_emails: "",
-        job_variant: "default", parallelism: "", members: [] });
+        job_variant: "default", members: [] });
+  // Every parameter the schedule has is kept, shown or not; a blank field means the job's default.
+  const [params, setParams] = useState<Record<string, string>>(
+    Object.fromEntries(Object.entries(initial?.parameters ?? {}).map(([k, v]) => [k, String(v)])));
   const qc = useQueryClient();
   const save = useMutation({
     mutationFn: () => {
       const body = { name: f.name, cadence_minutes: Number(f.cadence_minutes), timezone: f.timezone, stagger: f.stagger,
         paused: f.paused, notify_emails: f.notify_emails || null, job_variant: f.job_variant, members: f.members,
-        parameters: f.parallelism ? { parallelism: String(f.parallelism) } : {} };
+        parameters: Object.fromEntries(Object.entries(params).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, v.trim()])) };
       return initial ? api.post(`/schedules/${initial.id}`, body) : api.post("/schedules", body);
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ["schedules"] }); onDone(); },
@@ -45,8 +50,10 @@ function Editor({ initial, options, onDone }: { initial?: Row; options: Options;
         </label>
         <label>Time zone<input value={f.timezone} onChange={(e) => setF({ ...f, timezone: e.target.value })} />
           <span className="muted small">IANA name; UTC avoids daylight-saving gaps for 24/7 schedules</span></label>
-        <label>Parallelism<input type="number" min={1} max={256} value={f.parallelism} placeholder="job default"
-          onChange={(e) => setF({ ...f, parallelism: e.target.value })} /></label>
+        {[...options.parameters, ...Object.keys(params).filter((k) => !options.parameters.includes(k))].map((k) => (
+          <label key={k}>{PARAM_LABEL(k)}<input value={params[k] ?? ""} placeholder="job default"
+            onChange={(e) => setParams({ ...params, [k]: e.target.value })} /></label>
+        ))}
         {options.variants.length > 1 && (
           <label>Ingestion job
             <select value={f.job_variant} onChange={(e) => setF({ ...f, job_variant: e.target.value })}>
@@ -86,8 +93,8 @@ function Editor({ initial, options, onDone }: { initial?: Row; options: Options;
 function SyncResult({ result }: { result?: Row }) {
   if (!result?.sync) return null;
   const errors = (result.sync as Row[]).filter((r) => r.action === "error");
-  const changed = (result.sync as Row[]).filter((r) => ["created", "updated", "deleted"].includes(r.action));
-  return errors.length ? <Notice tone="bad">Job sync failed for {errors.map((e) => `${e.task_collection}: ${e.detail}`).join("; ")}</Notice>
+  const changed = (result.sync as Row[]).filter((r) => ["created", "adopted", "updated", "deleted"].includes(r.action));
+  return errors.length ? <Notice tone="bad">Job sync failed for {errors.map((e) => `${e.task_collection || "the schedule"}: ${e.detail}`).join("; ")}</Notice>
     : <Notice tone="ok">Jobs in sync{changed.length ? `: ${changed.map((c) => `${c.task_collection} ${c.action}`).join(", ")}` : ""}.</Notice>;
 }
 
@@ -116,7 +123,7 @@ function ScheduleCard({ s, onEdit }: { s: Row; onEdit: () => void }) {
       <button onClick={() => act.mutate("sync")} disabled={act.isPending}>Sync jobs</button>
       <ConfirmButton label="Delete" danger onConfirm={() => act.mutateAsync("delete")} />
     </>}>
-      <p className="muted small">Time zone {s.timezone}{s.parameters?.parallelism ? ` · parallelism ${s.parameters.parallelism}` : ""}
+      <p className="muted small">Time zone {s.timezone}{paramsText(s.parameters) ? ` · ${paramsText(s.parameters)}` : ""}
         {s.notify_emails ? ` · failure emails to ${s.notify_emails}` : ""} · updated {fmtTime(s.updated_at)}{s.created_by ? ` · created by ${s.created_by}` : ""}</p>
       {warned > 0 && <Notice tone="warn">{warned} collection(s) have warnings: see the warnings column.</Notice>}
       <ErrorBox error={act.error || check.error} />

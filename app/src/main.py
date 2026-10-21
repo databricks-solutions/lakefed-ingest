@@ -21,7 +21,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 import jobs
 import lakebase as db
@@ -385,19 +385,35 @@ class ScheduleBody(BaseModel):
     notify_emails: Optional[str] = None
     members: List[str] = Field(min_length=1)
 
+    @field_validator("timezone")
+    @classmethod
+    def _tz(cls, v: str) -> str:
+        return (v or "").strip() or "UTC"      # stored as given: a blank one would break every page
+
+
+def _ingest_job_id(variant: str) -> Optional[int]:
+    jid = jobs.ingest_variants().get(variant or "default")
+    return int(jid) if jid else None
+
 
 def _variant_job_id(variant: str) -> int:
-    jid = jobs.ingest_variants().get(variant or "default")
-    if not jid:
+    jid = _ingest_job_id(variant)
+    if jid is None:
         raise HTTPException(503, f"no ingestion job configured for variant '{variant}'")
-    return int(jid)
+    return jid
 
 
-def _load_schedule(sid: int):
-    rows = db.query(q.schedule_sql(), (int(sid),))
+def _owner() -> str:
+    """The wrapper jobs' owner tag: this app's Lakebase database (other deployments' jobs keep out)."""
+    return f"{db.INSTANCE}/{db.DATABASE}"
+
+
+def _load_schedule(sid: int, cur=None):
+    get = (lambda sql, p: db.fetch(cur, sql, p)) if cur is not None else db.query
+    rows = get(q.schedule_sql(), (int(sid),))
     if not rows:
         raise HTTPException(404, f"schedule {sid} not found")
-    members = db.query(q.schedule_members_sql(), ([int(sid)],))
+    members = get(q.schedule_members_sql(), ([int(sid)],))
     return rows[0], members
 
 
@@ -409,23 +425,25 @@ def _validate_schedule(body: ScheduleBody):
 
 
 def _sync(sid: int, user: str) -> List[dict]:
-    """Bring the schedule's wrapper jobs in line with Lakebase and record the results."""
-    s, members = _load_schedule(sid)
-    active = [m for m in members if m["removed_at"] is None]
-    # Removed members whose job wasn't deleted yet (synced before removal, or never).
-    ts = lambda v: datetime.fromisoformat(v) if isinstance(v, str) else v
-    removed = [m for m in members if m["removed_at"] is not None and m["job_id"]
-               and (m["synced_at"] is None or ts(m["synced_at"]) < ts(m["removed_at"]))]
-    results = sch.sync(s, active, removed, jobs.schedule_client(), _variant_job_id(s["job_variant"]),
-                       jobs.SCHEDULE_JOB_VIEW_GROUP)
-    by_coll = {m["task_collection"]: m for m in active + removed}
+    """Bring the schedule's wrapper jobs in line with Lakebase and record the results. Runs under the
+    schedule's sync lock, with the members read after taking it, so concurrent syncs don't both create a
+    job. A failed sync never raises once the schedule's change is committed: errors are per member."""
     batch = uuid.uuid4().hex[:12]
     with db.transaction() as cur:
+        cur.execute(q.schedule_lock_sql(), (q.SCHEDULE_LOCK_CLASS, q.schedule_lock_key(sid)))
+        s, members = _load_schedule(sid, cur)
+        active = [m for m in members if m["removed_at"] is None]
+        removed = [m for m in members if m["delete_pending"]]
+        results = sch.sync(s, active, removed, jobs.schedule_client(), _ingest_job_id(s["job_variant"]),
+                           jobs.SCHEDULE_JOB_VIEW_GROUP, _owner())
         for r in results:
-            m = by_coll[r.task_collection]
-            cur.execute(q.member_synced_sql(), (r.job_id, r.detail if r.action == "error" else None, m["id"]))
-            if r.action in ("created", "updated", "deleted"):
-                _log(cur, user, "schedule_sync", None, r.task_collection, "job_id", None,
+            if r.member_id is not None:
+                if r.action == "error":
+                    cur.execute(q.member_sync_failed_sql(), (r.detail, r.member_id))
+                else:
+                    cur.execute(q.member_synced_sql(), (r.job_id, r.member_id))
+            if r.action in ("created", "adopted", "updated", "deleted"):
+                _log(cur, user, "schedule_sync", None, r.task_collection or None, "job_id", None,
                      f"{r.action} job {r.job_id}" + (f" ({r.detail})" if r.detail else ""), batch=batch)
     return [r.__dict__ for r in results]
 
@@ -451,28 +469,27 @@ def _members_view(s: dict, members: List[dict], stats: dict, skipped: dict, now:
     return out
 
 
-_skipped_cache: dict = {}
+_skipped = sch.SkippedRuns()
+
+
+def _skipped_starts(job_id, since: datetime, now: datetime, client=None) -> Optional[List[int]]:
+    """Start times (ms) of a wrapper job's skipped runs since `since`; None if the Jobs API failed."""
+    try:
+        return _skipped.starts(client or jobs.schedule_client(), job_id, int(since.timestamp() * 1000),
+                               int(now.timestamp() * 1000))
+    except Exception:
+        return None
 
 
 def _skipped_counts(members: List[dict]) -> dict:
-    """Skipped triggers per member over 24 hours, from the wrapper jobs' runs (cached for a minute)."""
+    """Skipped triggers per member over 24 hours, from the wrapper jobs' runs."""
     now = datetime.now(timezone.utc)
-    since_ms = int((now - timedelta(hours=24)).timestamp() * 1000)
     client, out = None, {}
     for m in members:
-        if not m.get("job_id"):
-            continue
-        hit = _skipped_cache.get(m["job_id"])
-        if hit and (now - hit[0]).total_seconds() < 60:
-            out[m["task_collection"]] = hit[1]
-            continue
-        try:
+        if m.get("job_id"):
             client = client or jobs.schedule_client()
-            n = sch.skipped_triggers(client.runs(m["job_id"], since_ms))
-        except Exception:
-            n = None
-        _skipped_cache[m["job_id"]] = (now, n)
-        out[m["task_collection"]] = n
+            starts = _skipped_starts(m["job_id"], now - timedelta(hours=24), now, client)
+            out[m["task_collection"]] = None if starts is None else len(starts)
     return out
 
 
@@ -617,7 +634,7 @@ def check_schedule(sid: int):
     """Drift report for the schedule's wrapper jobs; changes nothing."""
     s, members = _load_schedule(sid)
     active = [m for m in members if m["removed_at"] is None]
-    return sch.check(s, active, jobs.schedule_client(), _variant_job_id(s["job_variant"]))
+    return sch.check(s, active, jobs.schedule_client(), _variant_job_id(s["job_variant"]), _owner())
 
 
 @app.get("/api/timeline")
@@ -649,13 +666,8 @@ def timeline(hours: int = 24):
             row["planned"] += [t.isoformat() for t in
                                sch.fire_times(int(s["cadence_minutes"]), int(m["offset_minutes"]), s["timezone"], since, end)]
         if m.get("job_id"):
-            try:
-                client = client or jobs.schedule_client()
-                for jr in client.runs(m["job_id"], int(start.timestamp() * 1000), limit=500):
-                    if sch.skipped_triggers([jr]):
-                        row["skipped"].append(datetime.fromtimestamp(jr["start_time"] / 1000, timezone.utc).isoformat())
-            except Exception:
-                pass
+            client = client or jobs.schedule_client()
+            row["skipped"] += [jobs.ts(t) for t in (_skipped_starts(m["job_id"], start, end, client) or [])]
     return {"start": start.isoformat(), "end": end.isoformat(),
             "collections": [rows[k] for k in sorted(rows)]}
 

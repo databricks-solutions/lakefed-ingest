@@ -577,9 +577,27 @@ def schedule_sql() -> str:
 
 
 def schedule_members_sql() -> str:
-    """Members of the given schedules, active and removed. Param: list of schedule ids."""
-    return (f"select id, schedule_id, task_collection, offset_minutes, job_id, synced_at, sync_error, added_at, removed_at "
+    """Members of the given schedules, active and removed. ``delete_pending``: removed, and its job not
+    deleted yet (no successful sync since the removal). Param: list of schedule ids."""
+    return (f"select id, schedule_id, task_collection, offset_minutes, job_id, synced_at, sync_error, added_at, removed_at, "
+            f"(removed_at is not null and job_id is not null and (synced_at is null or synced_at < removed_at)) "
+            f"as delete_pending "
             f"from {SCHEMA}.schedule_member where schedule_id = any(%s) order by schedule_id, task_collection")
+
+
+# Syncs of one schedule are serialized: a second one waits, then sees the job ids the first recorded
+# (two concurrent syncs would each create a job for an unsynced member). Two int keys, a class of its
+# own: separate from the collection run locks (one key) and the job's other two-key classes.
+SCHEDULE_LOCK_CLASS = 0x6C667364
+
+
+def schedule_lock_sql() -> str:
+    """Wait for, and take, a schedule's sync lock for this transaction. Params: class, schedule key."""
+    return "select pg_advisory_xact_lock(%s::int, %s::int)"
+
+
+def schedule_lock_key(schedule_id: int) -> int:
+    return int(schedule_id) & 0x7FFFFFFF
 
 
 def insert_schedule_sql() -> str:
@@ -616,8 +634,14 @@ def remove_members_sql() -> str:
 
 
 def member_synced_sql() -> str:
-    """Record a sync result. Params: job_id, sync_error, member id."""
-    return f"update {SCHEMA}.schedule_member set job_id = %s, sync_error = %s, synced_at = now() where id = %s"
+    """Record a successful sync. Params: job_id, member id."""
+    return f"update {SCHEMA}.schedule_member set job_id = %s, sync_error = null, synced_at = now() where id = %s"
+
+
+def member_sync_failed_sql() -> str:
+    """Record a failed sync, keeping synced_at (a removed member's job delete stays pending and is retried).
+    Params: sync_error, member id."""
+    return f"update {SCHEMA}.schedule_member set sync_error = %s where id = %s"
 
 
 def collection_run_stats_sql() -> str:

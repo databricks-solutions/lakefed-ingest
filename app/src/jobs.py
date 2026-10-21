@@ -27,12 +27,13 @@ def ingest_variants() -> dict:
 
 
 def schedule_client():
-    """Jobs API client for schedule sync (plain JSON settings through the SDK's API client)."""
+    """Jobs API client for schedule sync and the wrapper jobs' runs."""
     import schedules
-    return schedules.JobsClient(workspace().api_client)
+    return schedules.JobsClient(workspace())
 
 
-def _ts(ms) -> Optional[str]:
+def ts(ms) -> Optional[str]:
+    """Epoch milliseconds (as the Jobs API reports times) to ISO 8601 UTC."""
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat() if ms else None
 
 
@@ -65,8 +66,8 @@ def runs(job_id, active_only: bool = False, limit: int = 25) -> List[dict]:
             "task_collection": params.get("task_collection"),
             "state": st.life_cycle_state.value if st and st.life_cycle_state else None,
             "result": st.result_state.value if st and st.result_state else None,
-            "started": _ts(r.start_time),
-            "ended": _ts(r.end_time) if r.end_time else None,
+            "started": ts(r.start_time),
+            "ended": ts(r.end_time),
             "trigger": r.trigger.value if r.trigger else None,
             "url": r.run_page_url,
         })

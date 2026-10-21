@@ -73,6 +73,13 @@ def query(sql: str, params: tuple = ()) -> List[dict]:
         return [{c: _jsonable(v) for c, v in zip(cols, row)} for row in cur.fetchall()]
 
 
+def fetch(cur, sql: str, params: tuple = ()) -> List[dict]:
+    """Like ``query``, on a cursor of an open transaction."""
+    cur.execute(sql, params)
+    cols = [d.name for d in cur.description]
+    return [{c: _jsonable(v) for c, v in zip(cols, row)} for row in cur.fetchall()]
+
+
 def execute(sql: str, params: tuple = ()) -> int:
     """Run a write; returns the affected row count."""
     with connect() as conn, conn.cursor() as cur:
