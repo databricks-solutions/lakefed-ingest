@@ -281,10 +281,11 @@ def insert_control_sql() -> str:
 
 
 def control_params(row: dict) -> tuple:
-    """Insert params in CONTROL_INSERT_COLUMNS order; blank strings become NULL (write_mode and
-    use_remote_query get their defaults; JSON objects are stored as text)."""
+    """Insert params in CONTROL_INSERT_COLUMNS order; blank strings become NULL (the NOT NULL columns
+    write_mode, use_remote_query and load_partitioned get their defaults when omitted; JSON objects are
+    stored as text)."""
     def clean(c, v):
-        if c == "use_remote_query":
+        if c in ("use_remote_query", "load_partitioned"):
             return _truthy(v)
         if c in ("client_attrs", "jdbc_options") and isinstance(v, dict):
             return json.dumps(v)

@@ -253,6 +253,7 @@ def test_validate_write_mode_and_client_attrs():
 def test_control_params_defaults_for_new_fields():
     d = dict(zip(q.CONTROL_INSERT_COLUMNS, q.control_params(_row(write_mode="", client_attrs={"a": "b"}))))
     assert d["write_mode"] == "merge" and d["use_remote_query"] is False and d["client_attrs"] == '{"a": "b"}'
+    assert d["load_partitioned"] is False                         # omitted: the column's default, not NULL
     d = dict(zip(q.CONTROL_INSERT_COLUMNS, q.control_params(_row(use_remote_query="true", write_mode="Append"))))
     assert d["use_remote_query"] is True and d["write_mode"] == "append"
 
