@@ -218,10 +218,11 @@ def test_ingest_runs_started_by_a_wrapper_show_their_schedule(api, monkeypatch):
     monkeypatch.setattr(main.jobs, "INGEST_JOB_ID", "555")
     monkeypatch.setattr(main.jobs, "job_summary", lambda jid: {"job_id": 555, "parameters": {"parallelism": "32", "db_name": "x"}})
     monkeypatch.setattr(main.jobs, "runs", lambda jid, active_only=False, limit=25: [
-        {"run_id": 1, "task_collection": "c1", "trigger": "RUN_JOB_TASK"},
-        {"run_id": 2, "task_collection": "c1", "trigger": "ONE_TIME"}])
+        {"run_id": 1, "task_collection": "c1", "trigger": "RUN_JOB_TASK", "started": "2999-01-01T00:00:00+00:00"},
+        {"run_id": 2, "task_collection": "c1", "trigger": "ONE_TIME", "started": "2999-01-01T00:00:00+00:00"},
+        {"run_id": 3, "task_collection": "c1", "trigger": "RUN_JOB_TASK", "started": "2020-01-01T00:00:00+00:00"}])
     r = api.get("/api/jobs/ingest").json()
-    assert [x["schedule"] for x in r["recent"]] == ["Prod 15", None]
+    assert [x["schedule"] for x in r["recent"]] == ["Prod 15", None, None]     # 3 ran before c1 joined
     opts = api.get("/api/schedules/options").json()
     assert opts["defaults"] == {"parallelism": "32"} and "table_retries" in opts["parameters"]
     assert opts["scheduled"] == {"c1": ["Prod 15"], "c2": ["Prod 15"]}

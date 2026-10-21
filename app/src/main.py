@@ -250,10 +250,14 @@ def _require(job_id, name):
 def ingest_job():
     jid = _require(jobs.INGEST_JOB_ID, "ingestion")
     active, recent = jobs.runs(jid, active_only=True, limit=50), jobs.runs(jid, active_only=False, limit=25)
-    # A run a wrapper job started (trigger RUN_JOB_TASK) came from a schedule of its collection.
-    scheduled = _scheduled_collections()
+    # A run a wrapper job started (trigger RUN_JOB_TASK) came from a schedule its collection was in
+    # when the run started.
+    joined = _scheduled_collections(with_added=True)
+    at = lambda v: datetime.fromisoformat(v) if isinstance(v, str) else v
     for r in active + recent:
-        r["schedule"] = ", ".join(scheduled.get(r["task_collection"], [])) if r["trigger"] == "RUN_JOB_TASK" else None
+        r["schedule"] = ", ".join(n for n, added in joined.get(r["task_collection"], [])
+                                  if r["started"] and at(r["started"]) >= at(added)) or None \
+            if r["trigger"] == "RUN_JOB_TASK" else None
     return {"job": jobs.job_summary(jid), "active": active, "recent": recent}
 
 
@@ -513,15 +517,16 @@ def list_schedules(details: bool = True):
             for s in rows]
 
 
-def _scheduled_collections() -> dict:
-    """{collection: [names of the active schedules it's in]}."""
+def _scheduled_collections(with_added: bool = False) -> dict:
+    """{collection: [names of the active schedules it's in]} (or [(name, added_at)])."""
     scheduled = {}
     rows = db.query(q.schedules_sql())
     if rows:
         names = {r["id"]: r["name"] for r in rows}
         for m in db.query(q.schedule_members_sql(), (list(names),)):
             if m["removed_at"] is None:
-                scheduled.setdefault(m["task_collection"], []).append(names[m["schedule_id"]])
+                name = names[m["schedule_id"]]
+                scheduled.setdefault(m["task_collection"], []).append((name, m["added_at"]) if with_added else name)
     return scheduled
 
 
