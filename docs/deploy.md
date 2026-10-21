@@ -102,8 +102,10 @@ environment. The ingestion and discovery jobs read the sources, so they always r
 with the source network path. The operations app's grant job defaults to serverless too (see
 [app/README.md](../app/README.md)).
 
-If the workspace doesn't have serverless jobs (or serverless can't reach Lakebase there), fall back
-to a classic single-node cluster in your target:
+If the workspace doesn't have serverless jobs (or serverless can't reach Lakebase there), run it on
+an existing all-purpose cluster instead. It's a one-time or ad hoc job, often run several times during
+initial setup, so a running cluster beats waiting for a job cluster to start each time. In your
+target:
 
 ```yaml
 targets:
@@ -111,32 +113,19 @@ targets:
     resources:
       jobs:
         lakefed_ingest_setup:
-          job_clusters:
-            - job_cluster_key: setup_cluster
-              new_cluster:
-                spark_version: 18.x-scala2.13
-                data_security_mode: SINGLE_USER
-                node_type_id: ${var.node_type_id}
-                num_workers: 0
-                spark_conf:
-                  spark.databricks.cluster.profile: singleNode
-                  spark.master: "local[*]"
-                custom_tags:
-                  ResourceClass: SingleNode
           tasks:
             - task_key: apply_lakebase_schema
-              environment_key: ""             # clears the serverless environment
-              job_cluster_key: setup_cluster
-              libraries:
+              environment_key: ""                 # clears the serverless environment
+              existing_cluster_id: <cluster-id>   # an all-purpose cluster you can attach to
+              libraries:                          # installed on that cluster
                 - pypi:
                     package: "psycopg[binary]"
                 - pypi:
                     package: "databricks-sdk==0.145.0"
 ```
 
-The job keeps its (now unused) environment definition; the task runs on the cluster. To use an
-existing all-purpose cluster instead, set `existing_cluster_id` on the task in place of
-`job_cluster_key` and `job_clusters` (the libraries are then installed on that cluster).
+The job keeps its (now unused) environment definition; the task runs on the cluster. The job's run-as
+identity needs permission to attach to the cluster, and the cluster must reach Lakebase on port 5432.
 
 ## 3. Steps outside the bundle
 

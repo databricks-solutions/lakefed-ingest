@@ -149,8 +149,8 @@ Re-run the grant job if the app is recreated (new service principal). Default pr
 tables the same owner adds later, so schema upgrades don't need it.
 
 The grant job defaults to serverless jobs compute (it only calls the workspace APIs and Lakebase). If
-the workspace doesn't have serverless jobs, fall back to a classic single-node cluster in your target
-(set `node_type_id` for your cloud):
+the workspace doesn't have serverless jobs, run it on an existing all-purpose cluster in your target
+(it's a one-time job, so a running cluster beats waiting for a job cluster to start):
 
 ```yaml
 targets:
@@ -158,23 +158,11 @@ targets:
     resources:
       jobs:
         lakefed_ingest_app_grants:
-          job_clusters:
-            - job_cluster_key: grants_cluster
-              new_cluster:
-                spark_version: 18.x-scala2.13
-                data_security_mode: SINGLE_USER
-                node_type_id: Standard_D4ds_v5
-                num_workers: 0
-                spark_conf:
-                  spark.databricks.cluster.profile: singleNode
-                  spark.master: "local[*]"
-                custom_tags:
-                  ResourceClass: SingleNode
           tasks:
             - task_key: grant_app_access
-              environment_key: ""             # clears the serverless environment
-              job_cluster_key: grants_cluster
-              libraries:
+              environment_key: ""                 # clears the serverless environment
+              existing_cluster_id: <cluster-id>   # an all-purpose cluster you can attach to
+              libraries:                          # installed on that cluster
                 - pypi:
                     package: "psycopg[binary]"
                 - pypi:
