@@ -156,10 +156,17 @@ def set_enabled_sql() -> str:
     return f"update {SCHEMA}.control set task_enabled = %s where id = any(%s)"
 
 
+# A reseed flip also clears the status (a requested reseed isn't a failing table, and the seed budget
+# defers failed seeds) and any pending append: the job settles a pending append before it looks at the
+# phase, so a left-over one would move the table back to incremental and undo the reseed. The job's
+# own reseed (state_store.upsert_checkpoint_sql) clears them the same way.
+_RESEED_SET = "phase = 'seeding', status = 'ok', pending_position = null, pending_run_id = null, updated_at = now()"
+
+
 def force_reseed_sql() -> str:
     """Flip checkpoints back to seeding (the next run re-copies those tables). Param: control ids."""
-    return (f"update {SCHEMA}.checkpoint set phase = 'seeding', detail = 'reseed requested from the app', "
-            f"updated_at = now() where control_id = any(%s)")
+    return (f"update {SCHEMA}.checkpoint set {_RESEED_SET}, detail = 'reseed requested from the app' "
+            f"where control_id = any(%s)")
 
 
 def log_reseed_sql() -> str:
@@ -608,8 +615,7 @@ def collection_lock_key(collection: str) -> str:
 
 def flip_to_seeding_sql() -> str:
     """Params: detail, control ids."""
-    return (f"update {SCHEMA}.checkpoint set phase = 'seeding', status = 'ok', detail = %s, updated_at = now() "
-            f"where control_id = any(%s)")
+    return f"update {SCHEMA}.checkpoint set {_RESEED_SET}, detail = %s where control_id = any(%s)"
 
 
 def mixed_sinks_for_sql() -> str:

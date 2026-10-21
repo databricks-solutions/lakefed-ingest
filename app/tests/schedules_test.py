@@ -91,10 +91,10 @@ def test_warnings():
     assert "2 trigger(s) skipped" in sch.warnings(15, None, None, skipped=2)[0]
 
 
-def test_skipped_triggers():
+def test_is_skipped():
     runs = [{"state": {"life_cycle_state": "SKIPPED"}}, {"state": {"life_cycle_state": "TERMINATED", "result_state": "SUCCESS"}},
             {"status": {"state": "SKIPPED"}}]
-    assert sch.skipped_triggers(runs) == 2
+    assert [sch.is_skipped(r) for r in runs] == [True, False, True]
 
 
 class FakeJobs(sch.JobsClient):

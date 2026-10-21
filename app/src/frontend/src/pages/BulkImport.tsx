@@ -18,12 +18,12 @@ interface Shared {
   freshness_sla_minutes: number | null; partition_threshold_mb: number; partition_size_mb: number; include_default: boolean;
 }
 
-function DiscoverForm({ onStarted }: { onStarted: (id: string) => void }) {
+function DiscoverForm({ onStarted }: { onStarted: (id: string, runId: number) => void }) {
   const [f, setF] = useState({ src_host: "", src_port: "", databases: "", secret_key_template: "{database}" });
   const start = useMutation({
     mutationFn: () => api.post<{ discovery_id: string; run_id: number; databases: number }>("/discoveries", {
       ...f, src_port: f.src_port ? Number(f.src_port) : null }),
-    onSuccess: (r) => onStarted(r.discovery_id),
+    onSuccess: (r) => onStarted(r.discovery_id, r.run_id),
   });
   return (
     <Section title="1. Discover tables">
@@ -52,6 +52,7 @@ export default function BulkImport() {
   const { config } = useSettings();
   const qc = useQueryClient();
   const [discoveryId, setDiscoveryId] = useState<string>("");
+  const [startedRun, setStartedRun] = useState<{ did: string; runId: number } | null>(null);
   // A discovery just started has no rows until its job runs: keep polling until its databases appear
   // and finish (polling only while a row said "running" stopped before the first row existed).
   const discoveries = useQuery({
@@ -64,17 +65,29 @@ export default function BulkImport() {
     },
   });
   const did = discoveryId || discoveries.data?.[0]?.discovery_id || "";
+  // The job run of a discovery started here: once it has ended, stop waiting for rows it won't write.
+  const runId = startedRun && startedRun.did === did ? startedRun.runId : null;
+  const run = useQuery({
+    queryKey: ["discovery-run", runId],
+    queryFn: () => api.get<Row>(`/discoveries/runs/${runId}`),
+    enabled: !!runId,
+    refetchInterval: (q) => (["TERMINATED", "INTERNAL_ERROR", "SKIPPED"].includes((q.state.data as Row | undefined)?.state)
+      ? false : 10_000),
+  });
+  const jobEnded = ["TERMINATED", "INTERNAL_ERROR", "SKIPPED"].includes(run.data?.state);
   const dbs = useQuery({
     queryKey: ["discovery-dbs", did],
     queryFn: () => api.get(`/discoveries/${did}/databases`),
     enabled: !!did,
     refetchInterval: (q) => {
       const ds = q.state.data as Row[] | undefined;
-      return !ds?.length || ds.some((d) => d.status === "running") ? 5_000 : false;
+      return !jobEnded && (!ds?.length || ds.some((d) => d.status === "running")) ? 5_000 : false;
     },
   });
-  const waiting = !!dbs.data && dbs.data.length === 0;          // the job hasn't started on it yet
-  const running = waiting || (dbs.data ?? []).some((d) => d.status === "running");
+  useEffect(() => { if (jobEnded) qc.invalidateQueries({ queryKey: ["discovery-dbs", did] }); }, [jobEnded, did, qc]);
+  const noRows = !!dbs.data && dbs.data.length === 0;
+  const waiting = noRows && !jobEnded;                           // the job hasn't started on it yet
+  const running = waiting || (!jobEnded && (dbs.data ?? []).some((d) => d.status === "running"));
   // Re-read the review whenever a database finishes (its status or table count changes).
   const progress = (dbs.data ?? []).map((d) => `${d.src_database}:${d.status}:${d.tables}`).join("|");
 
@@ -138,7 +151,9 @@ export default function BulkImport() {
   return (
     <>
       <h1>Bulk import</h1>
-      <DiscoverForm onStarted={(id) => { setDiscoveryId(id); qc.invalidateQueries({ queryKey: ["discoveries"] }); }} />
+      <DiscoverForm onStarted={(id, runId) => {
+        setDiscoveryId(id); setStartedRun({ did: id, runId }); qc.invalidateQueries({ queryKey: ["discoveries"] });
+      }} />
 
       <Section title="2. Review">
         <ErrorBox error={discoveries.error || dbs.error} />
@@ -161,6 +176,11 @@ export default function BulkImport() {
               error: { flex: 1, minWidth: 300, tooltipField: "error" } })} />
         )}
         {waiting && <Notice tone="warn">Waiting for the discovery job to start; this updates automatically.</Notice>}
+        {jobEnded && (noRows || run.data?.result !== "SUCCESS") && (
+          <Notice tone="bad">The discovery job run ended ({run.data?.result ?? run.data?.state}
+            {run.data?.message ? `: ${run.data.message}` : ""}){noRows ? " without discovering any database" : ""}.{" "}
+            {run.data?.url && <a href={run.data.url} target="_blank" rel="noreferrer">Open the run</a>}</Notice>
+        )}
         {running && !waiting && <Notice tone="warn">Discovery is still running; this updates automatically.</Notice>}
       </Section>
 

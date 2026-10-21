@@ -183,7 +183,9 @@ key changed, or its sink table no longer exists (`sink_missing`).
 **Forcing a reseed.** Set the phase back to `seeding`; the next run copies the table again:
 
 ```sql
-update lakefed_ingest.checkpoint set phase = 'seeding' where control_id in (...);
+-- Clear any pending append too: a run settles it before looking at the phase, which would undo the reseed.
+update lakefed_ingest.checkpoint set phase = 'seeding', status = 'ok', pending_position = null, pending_run_id = null
+where control_id in (...);
 ```
 
 ## `reseed_queue` — reseed log

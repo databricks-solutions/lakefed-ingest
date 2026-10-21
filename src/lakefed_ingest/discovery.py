@@ -23,7 +23,7 @@ Pure Python except ``discover_database`` (unit-tested in tests/discovery_test.py
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import load_strategies as ls
 import source_adapters as sa
@@ -172,14 +172,3 @@ def secret_key_for(spec: dict, database: str) -> str:
     ``secret_key``."""
     tpl = spec.get("secret_key_template")
     return tpl.replace("{database}", database) if tpl else spec["secret_key"]
-
-
-def parse_databases(text: Optional[str]) -> List[str]:
-    """Database names from a comma- / newline-separated list (order kept, duplicates dropped)."""
-    seen, out = set(), []
-    for part in str(text or "").replace("\n", ",").split(","):
-        name = part.strip()
-        if name and name not in seen:
-            seen.add(name)
-            out.append(name)
-    return out

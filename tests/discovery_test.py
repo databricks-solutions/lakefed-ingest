@@ -72,7 +72,6 @@ def test_catalog_queries_read_metadata_only():
 def test_helpers():
     assert d.secret_key_for({"secret_key_template": "creds-{database}"}, "db1") == "creds-db1"
     assert d.secret_key_for({"secret_key": "k"}, "db1") == "k"
-    assert d.parse_databases(" a, b\nc,,a ") == ["a", "b", "c"]
 
 
 def test_other_sources_are_placeholders(monkeypatch):

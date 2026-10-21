@@ -50,6 +50,8 @@ class FakeCursor:
             self._rows = [tuple(r[c] for c in cols) for r in rows]
         elif "pg_try_advisory_xact_lock" in sql:
             self._rows = [(params[0] not in self.db.running,)]
+        elif sql == q.mixed_sinks_for_sql():
+            self._rows = [(s,) for s in params[0] if s in self.db.mixed]
         elif sql.startswith("insert into lakefed_ingest.control ("):
             if self.db.unique_violation:
                 import psycopg
@@ -77,6 +79,7 @@ class FakeCursor:
 class FakeDB:
     def __init__(self):
         self.statements, self.rolled_back, self.running, self.unique_violation = [], [], set(), False
+        self.mixed = set()          # sinks the mixed-sink check reports
 
     def of(self, prefix):
         return [p for sql, p in self.statements if sql.startswith(prefix)]
@@ -190,3 +193,43 @@ def test_enable_and_reseed_are_locked_and_logged(client):
     assert actions == ["disable", "reseed", "reseed"]
     client.db.running = {"lakefed_ingest:c1"}
     assert client.post("/api/tables/reseed", json={"ids": [7]}).status_code == 409
+
+
+# ---- review findings: static files, inserts, discovery runs ----------------------------------------
+
+def test_static_files_never_leave_the_static_folder(client):
+    for path in ("/%2e%2e/main.py", "/%2e%2e/%2e%2e/README.md", "/..%2fmain.py"):
+        r = client.get(path)
+        assert "lakefed_ingest operations app" not in r.text and "fastapi" not in r.text.lower()[:200], path
+
+
+ROW = dict(task_collection="c1", src_type="sqlserver", src_host="h", secret_key="k", src_database="db1", src_schema="dbo",
+           src_table="t", select_list="id, v", primary_key="id", load_type="ct", sink_catalog="main", sink_schema="bronze",
+           sink_table="orders", client_id="db1")
+
+
+def test_add_table_takes_the_run_lock_and_refuses_a_mixed_sink(client):
+    assert client.post("/api/tables", json=ROW).status_code == 200
+    assert [p[0] for p in client.db.of("select pg_try_advisory_xact_lock")] == ["lakefed_ingest:c1"]
+    client.db.running = {"lakefed_ingest:c1"}
+    assert client.post("/api/tables", json=ROW).status_code == 409
+    client.db.running, client.db.mixed = set(), {"main.bronze.orders"}
+    r = client.post("/api/tables", json=ROW)
+    assert r.status_code == 409 and "claimed by a dedicated row and by other rows" in r.json()["detail"]
+
+
+def test_register_takes_the_run_lock_and_refuses_a_mixed_sink(client):
+    body = {"task_collection": "c9", "shared": {"sink_schema": "bronze"}}
+    assert client.post("/api/discoveries/d1/register", json=body).status_code == 200
+    assert [p[0] for p in client.db.of("select pg_try_advisory_xact_lock")] == ["lakefed_ingest:c9"]
+    client.db.mixed = {"main.bronze.orders"}
+    r = client.post("/api/discoveries/d1/register", json=body)
+    assert r.status_code == 409 and "main.bronze.orders" in r.json()["detail"]
+
+
+def test_discovery_run_state_only_for_discovery_runs(client, monkeypatch):
+    monkeypatch.setattr(main.jobs, "DISCOVER_JOB_ID", "55")
+    monkeypatch.setattr(main.jobs, "run_state", lambda rid: {"run_id": rid, "job_id": 55 if rid == 1 else 99,
+                                                              "state": "TERMINATED", "result": "FAILED", "message": "m", "url": "u"})
+    assert client.get("/api/discoveries/runs/1").json()["result"] == "FAILED"
+    assert client.get("/api/discoveries/runs/2").status_code == 404

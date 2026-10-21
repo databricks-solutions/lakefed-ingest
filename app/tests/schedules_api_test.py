@@ -92,7 +92,6 @@ class Cur:
 def api(monkeypatch):
     store, jobs_api = Store(), FakeJobs()
     monkeypatch.setattr(main.db, "query", store.query)
-    monkeypatch.setattr(main.db, "execute", lambda sql, params=(): store.run(sql, params) and 0)
     monkeypatch.setattr(main.db, "fetch", lambda cur, sql, params=(): store.query(sql, params))
     monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cur(store))))
     monkeypatch.setattr(main.db, "workspace", lambda: type("W", (), {"config": type("C", (), {"host": "https://h"})()})())

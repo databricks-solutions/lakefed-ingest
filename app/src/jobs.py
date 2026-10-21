@@ -82,5 +82,15 @@ def run_now(job_id, job_parameters: dict) -> int:
     return int(resp.run_id)
 
 
+def run_state(run_id) -> dict:
+    """A run's state: life cycle, result, the state message and its page."""
+    r = workspace().jobs.get_run(int(run_id))
+    st = r.state
+    return {"run_id": r.run_id, "job_id": r.job_id,
+            "state": st.life_cycle_state.value if st and st.life_cycle_state else None,
+            "result": st.result_state.value if st and st.result_state else None,
+            "message": st.state_message if st else None, "url": r.run_page_url}
+
+
 def cancel(run_id) -> None:
     workspace().jobs.cancel_run(run_id=int(run_id))

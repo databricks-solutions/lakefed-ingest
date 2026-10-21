@@ -272,3 +272,10 @@ def test_plan_edit_new_fields():
     assert p["changes"] == {}                                    # same object, different spelling
     (p,) = q.plan_edit([row], {"client_attrs": {"tenant": "Acme"}}, bulk=False)
     assert p["changes"]["client_attrs"][1] == '{"tenant": "Acme"}' and any("keep their client_attrs" in n for n in p["notes"])
+
+
+def test_reseed_flips_clear_status_and_any_pending_append():
+    # The job settles a pending append before it looks at the phase: a reseed must drop it.
+    for sql in (q.force_reseed_sql(), q.flip_to_seeding_sql()):
+        assert "phase = 'seeding'" in sql and "status = 'ok'" in sql
+        assert "pending_position = null" in sql and "pending_run_id = null" in sql

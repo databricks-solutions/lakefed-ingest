@@ -54,6 +54,20 @@ def _lock_collections(cur, collections):
             raise HTTPException(409, f"collection '{c}' is running; try again after the run finishes")
 
 
+def _refuse_mixed_sinks(cur, rows):
+    """After writing control rows, in the same transaction: refuse when a sink they write would be
+    claimed by a dedicated row and by other rows (the next run would stop every table on it)."""
+    sinks = sorted({".".join(str(r.get(k)).lower() for k in ("sink_catalog", "sink_schema", "sink_table"))
+                    for r in rows})
+    if not sinks:
+        return
+    cur.execute(q.mixed_sinks_for_sql(), (sinks,))
+    mixed = [r[0] for r in cur.fetchall()]
+    if mixed:
+        raise HTTPException(409, f"sink {mixed[0]} would be claimed by a dedicated row and by other rows; "
+                                 "a sink is either dedicated to one source table or shared by client_id")
+
+
 def _log(cur, user, action, control_id, collection, field=None, old=None, new=None, reseed=None, batch=None):
     as_text = lambda v: None if v is None else str(v)
     cur.execute(q.log_change_sql(), (user or None, action, control_id, collection, field, as_text(old),
@@ -162,8 +176,10 @@ def add_table(row: dict, request: Request):
     if errs:
         raise HTTPException(422, {"errors": errs})
     with db.transaction() as cur:
+        _lock_collections(cur, [row.get("task_collection")])
         cur.execute(q.insert_control_sql(), q.control_params(row))
         new_id = cur.fetchone()[0]
+        _refuse_mixed_sinks(cur, [row])
         _log(cur, _user(request), "add", new_id, row.get("task_collection"))
     return {"id": new_id}
 
@@ -218,13 +234,7 @@ def edit_tables(body: EditRequest, request: Request):
                 if p["reseed"]:
                     cur.execute(q.flip_to_seeding_sql(), (f"reseed after edit: {p['reseed']}", [p["id"]]))
                     cur.execute(q.log_reseed_sql(), (f"edit:{p['reseed']}", [p["id"]]))
-            sinks = sorted({".".join(str(r[k]).lower() for k in ("sink_catalog", "sink_schema", "sink_table"))
-                            for r in (dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans)})
-            cur.execute(q.mixed_sinks_for_sql(), (sinks,))
-            mixed = [r[0] for r in cur.fetchall()]
-            if mixed:
-                raise HTTPException(409, f"sink {mixed[0]} would be claimed by a dedicated row and by other rows; "
-                                         "a sink is either dedicated to one source table or shared by client_id")
+            _refuse_mixed_sinks(cur, [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans])
             summary["applied"] = True
             return {"summary": summary, "plans": plans}
     except psycopg.errors.UniqueViolation:
@@ -306,6 +316,16 @@ def start_discovery(body: DiscoverRequest, request: Request):
     return {"discovery_id": did, "run_id": rid, "databases": len(names)}
 
 
+@app.get("/api/discoveries/runs/{run_id}")
+def discovery_run(run_id: int):
+    """State of a discovery job run, so the page can tell a run that ended without results from one
+    still starting. Only runs of the discovery job."""
+    st = jobs.run_state(run_id)
+    if str(st["job_id"]) != str(jobs.DISCOVER_JOB_ID):
+        raise HTTPException(404, f"run {run_id} is not a discovery run")
+    return st
+
+
 @app.get("/api/discoveries")
 def discoveries(limit: int = 50):
     return db.query(q.discoveries_sql(), (int(limit),))
@@ -364,6 +384,7 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
     if not body.dry_run and valid:
         batch = uuid.uuid4().hex[:12]
         with db.transaction() as cur:
+            _lock_collections(cur, [body.task_collection])
             for name, row in valid:
                 cur.execute(q.insert_control_if_absent_sql(), q.control_params(row))
                 res = cur.fetchone()
@@ -372,6 +393,7 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
                 results.append({"table": name, "status": "registered" if res else "skipped",
                                 "id": res[0] if res else None,
                                 "errors": [] if res else ["sink already used by another control row"]})
+            _refuse_mixed_sinks(cur, [row for _, row in valid])     # all or nothing, like an edit
     else:
         results += [{"table": name, "status": "valid", "errors": []} for name, _ in valid]
     counts = {}
@@ -702,8 +724,9 @@ if (STATIC / "assets").is_dir():
 def spa(path: str):
     if path.startswith("api/"):
         raise HTTPException(404)
-    target = STATIC / path
-    if path and target.is_file():
+    # Only files inside static/: the path is decoded, so "%2e%2e/" must not climb out of it.
+    target = (STATIC / path).resolve()
+    if path and target.is_file() and target.is_relative_to(STATIC.resolve()):
         return FileResponse(target)
     index = STATIC / "index.html"
     if not index.is_file():

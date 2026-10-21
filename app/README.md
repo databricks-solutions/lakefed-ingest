@@ -188,9 +188,8 @@ Locally the app connects as you. Tests:
 
 ## Not in this version
 
-- Editing an existing control row: disable it and add a corrected one, or use SQL.
 - Per-user authorization: everyone with `CAN_USE` acts as the app's service principal.
-- Bulk import of control rows: use `notebooks/load_control_example.ipynb`.
+- Discovery for sources other than SQL Server: add their control rows with Add table or SQL.
 
 ## License
 

@@ -80,19 +80,6 @@ def fetch(cur, sql: str, params: tuple = ()) -> List[dict]:
     return [{c: _jsonable(v) for c, v in zip(cols, row)} for row in cur.fetchall()]
 
 
-def execute(sql: str, params: tuple = ()) -> int:
-    """Run a write; returns the affected row count."""
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(sql, params)
-        return cur.rowcount
-
-
-def execute_returning(sql: str, params: tuple = ()):
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchone()
-
-
 @contextlib.contextmanager
 def transaction():
     """A cursor in one transaction: committed when the block succeeds, rolled back on any error

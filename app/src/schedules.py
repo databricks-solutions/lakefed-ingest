@@ -385,12 +385,8 @@ def check(schedule: dict, members: List[dict], client: JobsClient, ingest_job_id
     return out
 
 
-def skipped_triggers(runs: List[dict]) -> int:
-    """Wrapper runs Databricks skipped because the previous run was still going."""
-    return sum(1 for r in runs if _skipped(r))
-
-
-def _skipped(r: dict) -> bool:
+def is_skipped(r: dict) -> bool:
+    """A wrapper run Databricks skipped because the previous run was still going."""
     st = r.get("state") or {}
     return (st.get("life_cycle_state") == "SKIPPED" or st.get("result_state") == "SKIPPED"
             or (r.get("status") or {}).get("state") == "SKIPPED")
@@ -433,4 +429,4 @@ class SkippedRuns:
     @staticmethod
     def _list(client, job_id, since_ms, until_ms) -> Dict[int, int]:
         return {int(r["run_id"]): int(r["start_time"]) for r in client.runs(job_id, since_ms, until_ms)
-                if _skipped(r) and r.get("start_time")}
+                if is_skipped(r) and r.get("start_time")}
