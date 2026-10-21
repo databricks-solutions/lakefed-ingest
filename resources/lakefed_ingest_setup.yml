@@ -39,20 +39,7 @@ resources:
     lakefed_ingest_setup:
       name: "lakefed_ingest_setup"
       description: "Apply / migrate the Lakebase schema (control, hot state, telemetry). Idempotent."
-      job_clusters:
-        # Small single-node cluster: the setup task only runs DDL against Lakebase.
-        - job_cluster_key: setup_cluster
-          new_cluster:
-            spark_version: 18.x-scala2.13
-            data_security_mode: SINGLE_USER
-            node_type_id: ${var.node_type_id}
-            num_workers: 0
-            spark_conf:
-              spark.databricks.cluster.profile: singleNode
-              spark.master: "local[*]"
-            custom_tags:
-              ResourceClass: SingleNode
-              project: lakefed_ingest
+      # Serverless: the task only runs DDL against Lakebase (no source reads), so no cluster to wait for.
       tasks:
         - task_key: apply_lakebase_schema
           notebook_task:
@@ -60,12 +47,14 @@ resources:
             base_parameters:
               db_instance: "{{job.parameters.db_instance}}"
               db_name: "{{job.parameters.db_name}}"
-          job_cluster_key: setup_cluster
-          libraries:
-            - pypi:
-                package: "psycopg[binary]"
-            - pypi:
-                package: "databricks-sdk==0.145.0"
+          environment_key: lakebase_client
+      environments:
+        - environment_key: lakebase_client
+          spec:
+            environment_version: "4"
+            dependencies:
+              - "psycopg[binary]"
+              - "databricks-sdk==0.145.0"
       tags:
         business_unit: ""
         project: lakefed_ingest

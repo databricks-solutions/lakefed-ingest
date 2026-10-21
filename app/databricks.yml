@@ -31,9 +31,6 @@ variables:
     description: Id of the table discovery job (bulk import; looked up by name, like ingest_job_id).
     lookup:
       job: lakefed_ingest_discover
-  node_type_id:
-    description: Node type for the single-node grant job.
-    default: Standard_D4ds_v5
 
 targets:
   dev:

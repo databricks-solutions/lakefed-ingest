@@ -18,7 +18,7 @@ targets:
     workspace:
       host: https://<your-workspace-host>/
     variables:
-      node_type_id: Standard_D8ds_v5          # ingestion workers / setup single node
+      node_type_id: Standard_D8ds_v5          # ingestion workers / discovery single node
       driver_node_type_id: Standard_D16ds_v5  # the ingestion job is driver-bound: size this first
       num_workers: 2
       # Optional overrides (defaults shown):
@@ -93,6 +93,10 @@ databricks bundle run lakefed_ingest_setup -t dev   # idempotent
 ```
 
 > Deploying creates a **billable** Lakebase instance (unless you bound an existing one).
+
+The setup job runs on serverless jobs compute (it only applies DDL to Lakebase), so the workspace
+needs serverless jobs enabled. The ingestion and discovery jobs read the sources, so they run on job
+clusters with the source network path.
 
 ## 3. Steps outside the bundle
 

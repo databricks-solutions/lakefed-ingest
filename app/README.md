@@ -134,7 +134,6 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
      bundle prefixes job names (`[dev your_name] lakefed_ingest`), so set the ids or the prefixed
      names for dev targets.
    - `app_name`: 30 characters max.
-   - `node_type_id`: for the single-node grant job (default is an Azure type).
 2. Deploy and start the app, then grant it Lakebase access. Run these from `app/`, as the user who
    manages the Lakebase instance and owns the tables (whoever ran the ingestion setup):
 

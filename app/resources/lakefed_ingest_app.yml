@@ -48,32 +48,22 @@ resources:
     lakefed_ingest_app_grants:
       name: "lakefed_ingest_app_grants"
       description: "Grant the operations app's service principal access to the lakefed_ingest Lakebase tables. Run as the tables' owner; idempotent."
-      job_clusters:
-        - job_cluster_key: grants_cluster
-          new_cluster:
-            spark_version: 18.x-scala2.13
-            data_security_mode: SINGLE_USER
-            node_type_id: ${var.node_type_id}
-            num_workers: 0
-            spark_conf:
-              spark.databricks.cluster.profile: singleNode
-              spark.master: "local[*]"
-            custom_tags:
-              ResourceClass: SingleNode
-              project: lakefed_ingest
+      # Serverless: the task only talks to the Lakebase instance and the workspace APIs.
       tasks:
         - task_key: grant_app_access
-          job_cluster_key: grants_cluster
+          environment_key: lakebase_client
           notebook_task:
             notebook_path: ../notebooks/grant_app_access.ipynb
             base_parameters:
               app_name: ${resources.apps.lakefed_ingest_app.name}
               db_instance: ${var.lakebase_instance}
               db_name: ${var.lakebase_database}
-          libraries:
-            - pypi:
-                package: "psycopg[binary]"
-            - pypi:
-                package: "databricks-sdk==0.145.0"
+      environments:
+        - environment_key: lakebase_client
+          spec:
+            environment_version: "4"
+            dependencies:
+              - "psycopg[binary]"
+              - "databricks-sdk==0.145.0"
       queue:
         enabled: false
