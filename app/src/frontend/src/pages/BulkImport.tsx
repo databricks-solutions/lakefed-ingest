@@ -52,19 +52,31 @@ export default function BulkImport() {
   const { config } = useSettings();
   const qc = useQueryClient();
   const [discoveryId, setDiscoveryId] = useState<string>("");
+  // A discovery just started has no rows until its job runs: keep polling until its databases appear
+  // and finish (polling only while a row said "running" stopped before the first row existed).
   const discoveries = useQuery({
     queryKey: ["discoveries"],
     queryFn: () => api.get("/discoveries"),
-    refetchInterval: (q) => ((q.state.data as Row[] | undefined)?.some((d) => Number(d.running) > 0) ? 10_000 : false),
+    refetchInterval: (q) => {
+      const ds = q.state.data as Row[] | undefined;
+      return ds?.some((d) => Number(d.running) > 0) || (discoveryId && !ds?.some((d) => d.discovery_id === discoveryId))
+        ? 5_000 : false;
+    },
   });
   const did = discoveryId || discoveries.data?.[0]?.discovery_id || "";
   const dbs = useQuery({
     queryKey: ["discovery-dbs", did],
     queryFn: () => api.get(`/discoveries/${did}/databases`),
     enabled: !!did,
-    refetchInterval: (q) => ((q.state.data as Row[] | undefined)?.some((d) => d.status === "running") ? 10_000 : false),
+    refetchInterval: (q) => {
+      const ds = q.state.data as Row[] | undefined;
+      return !ds?.length || ds.some((d) => d.status === "running") ? 5_000 : false;
+    },
   });
-  const running = (dbs.data ?? []).some((d) => d.status === "running");
+  const waiting = !!dbs.data && dbs.data.length === 0;          // the job hasn't started on it yet
+  const running = waiting || (dbs.data ?? []).some((d) => d.status === "running");
+  // Re-read the review whenever a database finishes (its status or table count changes).
+  const progress = (dbs.data ?? []).map((d) => `${d.src_database}:${d.status}:${d.tables}`).join("|");
 
   const [collection, setCollection] = useState("");
   const [shared, setShared] = useState<Shared>({
@@ -73,9 +85,9 @@ export default function BulkImport() {
     partition_size_mb: config?.defaults.partition_size_mb ?? 512, include_default: true,
   });
   const review = useQuery({
-    queryKey: ["review", did, shared, running],
+    queryKey: ["review", did, shared, progress],
     queryFn: () => api.post<Row[]>(`/discoveries/${did}/review`, { shared }),
-    enabled: !!did && !running,
+    enabled: !!did && !!dbs.data && !running,
   });
   const [rows, setRows] = useState<Row[]>([]);
   useEffect(() => { setRows(review.data ?? []); }, [review.data]);
@@ -148,7 +160,8 @@ export default function BulkImport() {
             columns={autoColumns(dbs.data, { status: { cellRenderer: (p: any) => <Badge value={p.value} /> },
               error: { flex: 1, minWidth: 300, tooltipField: "error" } })} />
         )}
-        {running && <Notice tone="warn">Discovery is still running; this updates automatically.</Notice>}
+        {waiting && <Notice tone="warn">Waiting for the discovery job to start; this updates automatically.</Notice>}
+        {running && !waiting && <Notice tone="warn">Discovery is still running; this updates automatically.</Notice>}
       </Section>
 
       {did && !running && (
