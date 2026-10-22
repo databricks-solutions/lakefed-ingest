@@ -291,7 +291,8 @@ with four extra columns:
   change set or a seed) the run records on the checkpoint the position the append reaches and its
   `run_id`; the checkpoint advance clears them. If a run stops in between, the next run looks in the sink for that client's
   rows with that `__run_id`: found, the append committed and the checkpoint advances (outcome
-  `recovered`); not found, the table reads again from its checkpoint.
+  `recovered`); not found, the table reads again from its checkpoint. If the row was meanwhile pointed at
+  another source, sink or key (or its sink is gone), the table reseeds instead: that append belonged to the old place.
 - Downstream (for example SCD2 or a current-state view), order a key's rows by `__change_version`.
 
 **Batched appends.** With many source databases per sink, most of a run is per-table overhead: a

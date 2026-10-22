@@ -166,9 +166,14 @@ def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=
             plans.append(_route_cursor(cfg, cp, reseed_on_new_columns, existing_sinks))
             continue
         # CT. A run stopped between an append and its checkpoint advance: find out first whether
-        # the append committed (never bulk-advanced or re-read blind).
+        # the append committed (never bulk-advanced or re-read blind). Unless the row now points at
+        # another source, sink or key, or its sink is gone: then that append belongs to the old place,
+        # and settling it would carry on from the old position under the new identity. Reseed instead
+        # (enqueue_reseed clears the pending append), however the row was edited: app, SQL or notebook.
         if cp is not None and cp.get("pending_run_id") is not None and ct_engine.is_append(cfg):
-            plans.append({"cfg": cfg, "route": "pending", "cp": cp})
+            moved = identity_change(cfg, cp) or sink_missing(cfg, existing_sinks)
+            plans.append({"cfg": cfg, "route": "reseed", "cp": cp, "reason": moved} if moved
+                         else {"cfg": cfg, "route": "pending", "cp": cp})
             continue
         # A checkpoint written by another strategy (load_type changed) can't be resumed: seed.
         if cp is None or cp.get("phase") != ss.INCREMENTAL or (cp.get("strategy") or ls.CT) != ls.CT:

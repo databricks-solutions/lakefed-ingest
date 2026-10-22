@@ -131,7 +131,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
    captured version. Append mode (`write_mode` append) appends instead (seed/full: op 'S'). A ct append
    records the pending append first; a `full` append doesn't (it adds one snapshot per run, so there
    is no position to protect). A `pending` route (run stopped before the advance) checks the sink
-   for that run's rows (`append_committed`) before anything else.
+   for that run's rows (`append_committed`) before anything else, unless the row now points at
+   another source, sink or key, or its sink is gone: then it reseeds (`enqueue_reseed` clears the pending append).
    With `table_retries` > 0, a transient source failure is retried in the run (`table_retry.with_retries`;
    the next attempt from `planner.retry_plan` on the fresh checkpoint). An append-mode retry goes to
    `pending`, or carries `verify_run_id` (stage `verify`): rows of this run in the sink → finish the

@@ -471,6 +471,20 @@ def test_edited_control_row_routes_to_reseed(change, reason):
     assert [(p["route"], p["reason"]) for p in plans] == [("reseed", reason)] and candidates == []
 
 
+def test_moved_table_with_a_pending_append_reseeds_instead_of_settling_it():
+    # The append in flight belongs to the old source or sink: settling it would continue from the old
+    # position under the new identity. This holds however the row was edited (app, SQL, notebook).
+    cfg = _ident_cfg(write_mode="append")
+    cp = _ident_cp(cfg, pending_position="150", pending_run_id=9)
+    for change, reason in (({"src_host": "srv2"}, "source_changed"), ({"sink_table": "a2"}, "sink_changed")):
+        plans, _, _ = planner.route_tables([dict(cfg, **change)], {1: cp})
+        assert [(p["route"], p["reason"]) for p in plans] == [("reseed", reason)]
+    plans, _, _ = planner.route_tables([cfg], {1: cp}, existing_sinks=set())             # sink dropped
+    assert [(p["route"], p["reason"]) for p in plans] == [("reseed", "sink_missing")]
+    plans, _, _ = planner.route_tables([cfg], {1: cp}, existing_sinks={"main.bronze.a"})  # unchanged
+    assert [p["route"] for p in plans] == ["pending"]
+
+
 def test_cosmetic_edits_do_not_reseed():
     cfg = _ident_cfg()
     for change in ({"src_host": "SRV1"}, {"src_port": 1433}, {"primary_key": " ID "}, {"sink_schema": "BRONZE"},
