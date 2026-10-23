@@ -287,6 +287,39 @@ renames first, in one transaction, under an advisory lock (so runs of other coll
 rather than migrating twice); a failure changes nothing. A database without the table (deployed
 before versions were recorded) counts as version 0.
 
+## Removing tables and old history
+
+Neither the ingestion job nor the operations app deletes configuration or history (a re-run
+discovery replaces only its own `discovered_table` rows), and the app has no `DELETE` privilege.
+
+**To stop ingesting a table,** disable it: `task_enabled = false`, or **Disable** in the app. Runs skip
+it from then on; it's reversible and logged.
+
+**To remove it for good,** connect to Lakebase as the tables' owner (the identity that ran setup) and
+delete its control row and checkpoint in one transaction, holding the collection's run lock so the
+delete can't race a running collection (the same lock the app takes for its edits):
+
+```sql
+begin;
+-- true = locked; false = the collection is running: roll back and retry later
+select pg_try_advisory_xact_lock(hashtextextended('lakefed_ingest:<task_collection>', 0));
+delete from lakefed_ingest.checkpoint where control_id in (...);
+delete from lakefed_ingest.control where id in (...);
+commit;
+```
+
+- No foreign key points at `control`, so that order is enough. Run history (`ingest_run`,
+  `ingest_event`), `reseed_queue` and `control_change` can stay: nothing reads them to decide what to
+  ingest.
+- **The sink isn't touched.** A dedicated sink: drop it in Unity Catalog if you don't need it. A
+  shared sink: `DELETE FROM <sink> WHERE __client_id__ = '<client_id>'` removes that database's rows.
+- **Schedules:** delete them in the app. It deletes their wrapper jobs and marks the schedule deleted.
+- **Old run history:** snapshot `ingest_run` and `ingest_event` to Delta ([monitoring.md](monitoring.md)),
+  then delete old rows as the owner, e.g.
+  `delete from lakefed_ingest.ingest_event where started_at < now() - interval '90 days';`
+- **Old discoveries:** `delete from lakefed_ingest.discovered_table where discovery_id = '...';`, then
+  the same for `discovery`.
+
 ## Changing the schema
 
 An upgrade doesn't run only the new statements: it re-applies the whole of `lakebase_schema.sql`, plus

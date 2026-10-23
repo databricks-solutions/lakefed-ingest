@@ -18,7 +18,8 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 | **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template, freshness SLA), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
 
 Every write asks for confirmation. The app never deletes rows (deleted schedules are marked deleted); it
-deletes only the wrapper jobs it created for schedules.
+deletes only the wrapper jobs it created for schedules. To remove tables for good or prune old history,
+see [Removing tables and old history](../docs/lakebase_schema.md#removing-tables-and-old-history).
 
 ## Schedules
 
