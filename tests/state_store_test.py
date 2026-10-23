@@ -90,8 +90,10 @@ def test_upsert_checkpoint_conflicts_on_control_id():
     sql = ss.upsert_checkpoint_sql()
     assert "on conflict (control_id) do update" in sql
     assert "src_database, src_schema, src_table" in sql   # readable identity still written
-    # control_id, db, schema, table, strategy, position, phase, status, detail, select_list
-    assert sql.count("%s") == 10
+    # control_id, db, schema, table, strategy, position, phase, status, detail, select_list,
+    # source_identity, sink_identity, merge_key
+    assert sql.count("%s") == 13
+    assert "source_identity = excluded.source_identity, sink_identity = excluded.sink_identity" in sql
     assert "strategy = excluded.strategy, position = excluded.position" in sql
     assert "select_list = coalesce(excluded.select_list, checkpoint.select_list)" in sql
 
@@ -357,7 +359,8 @@ def test_advance_checkpoint_binds_identity_strategy_then_text_position():
     conn = FakeConn(); ss.StateStore(conn).advance_checkpoint(CFG, 42)
     # strategy defaults to the row's load_type (ct when unset); the CT version is stored as text
     assert conn.calls == [(ss.upsert_checkpoint_sql(),
-                           (7, "d", "s", "t", "ct", "42", "incremental", "ok", None, None))]
+                           (7, "d", "s", "t", "ct", "42", "incremental", "ok", None, None,
+                            *ss.identity_values(CFG)))]
 
 
 def test_advance_checkpoint_full_strategy_has_no_position():
@@ -376,7 +379,8 @@ def test_enqueue_reseed_queues_then_flips_phase_to_seeding():
     assert conn.calls == [
         (ss.enqueue_reseed_sql(), (7, "d", "s", "t", "retention_miss")),
         (ss.upsert_checkpoint_sql(),
-         (7, "d", "s", "t", "ct", None, "seeding", "reseed_queued", "retention_miss", None)),
+         (7, "d", "s", "t", "ct", None, "seeding", "reseed_queued", "retention_miss", None,
+          *ss.identity_values(CFG))),
     ]
 
 
@@ -460,22 +464,23 @@ def test_get_checkpoints_one_query_any_array():
 
 
 def test_get_checkpoints_maps_rows_by_control_id():
-    conn = FakeConn(fetch=[(7, "100", "incremental", "ok", "a, b", "ct", 3, "150", 12, "2026-10-14"),
-                           (8, None, "loaded", "ok", None, "full", None, None, None, None)])
+    conn = FakeConn(fetch=[(7, "100", "incremental", "ok", "a, b", "ct", 3, "150", 12, "2026-10-14", "s1", "k1", "id"),
+                           (8, None, "loaded", "ok", None, "full", None, None, None, None, None, None, None)])
     got = ss.StateStore(conn).get_checkpoints(["7", 8])
     assert conn.calls == [(ss.get_checkpoints_sql(), ([7, 8],))]
     assert got == {7: {"position": "100", "phase": "incremental", "status": "ok", "select_list": "a, b",
                        "strategy": "ct", "ct_begin_version": 3, "pending_position": "150", "pending_run_id": 12,
-                       "last_success_at": "2026-10-14"},
+                       "last_success_at": "2026-10-14", "source_identity": "s1", "sink_identity": "k1", "merge_key": "id"},
                    8: {"position": None, "phase": "loaded", "status": "ok", "select_list": None,
                        "strategy": "full", "ct_begin_version": None, "pending_position": None,
-                       "pending_run_id": None, "last_success_at": None}}
+                       "pending_run_id": None, "last_success_at": None,
+                       "source_identity": None, "sink_identity": None, "merge_key": None}}
     assert ss.StateStore(FakeConn()).get_checkpoints([]) == {}
 
 
 def test_advance_checkpoint_records_select_list():
     conn = FakeConn(); ss.StateStore(conn).advance_checkpoint(CFG, 42, select_list="a, b")
-    assert conn.calls[0][1][-1] == "a, b"
+    assert conn.calls[0][1][9] == "a, b"
 
 
 def test_bulk_advance_never_moves_backwards_and_only_cdc():
@@ -485,7 +490,7 @@ def test_bulk_advance_never_moves_backwards_and_only_cdc():
     assert "where control_id = %s and phase = 'incremental' and strategy = 'ct'" in sql
     assert "last_success_at = now()" in sql and "select_list = coalesce(%s, select_list)" in sql
     assert "ct_begin_version = coalesce(ct_begin_version, %s)" in sql   # never overwrite a recorded one
-    assert sql.count("%s") == 4
+    assert sql.count("%s") == 7
 
 
 def test_bulk_advance_binds_each_rows_own_version():
@@ -493,7 +498,7 @@ def test_bulk_advance_binds_each_rows_own_version():
     conn = FakeConn()
     n = ss.StateStore(conn).bulk_advance_unchanged([(7, 500, None), (9, 12, "a, b", 4)])
     assert n == 2
-    assert conn.calls == [(ss.bulk_advance_unchanged_sql(), [(500, None, None, 7), (12, "a, b", 4, 9)])]
+    assert conn.calls == [(ss.bulk_advance_unchanged_sql(), [(500, None, None, None, None, None, 7), (12, "a, b", 4, None, None, None, 9)])]
     assert ss.StateStore(FakeConn()).bulk_advance_unchanged([]) == 0
 
 
@@ -577,6 +582,7 @@ def test_split_sql_statements_on_the_real_schema_file():
 # next ingestion run.
 SCHEMA_FINGERPRINTS = {
     1: "c035b85032e0df245775f4858dcc2e450ae737e885f326071c7b8546527a96e1",
+    2: "8e514a425a7684f353c288677bff216cfe32421980263c197ba453bc10ac989f",
 }
 
 
@@ -925,8 +931,10 @@ def test_bulk_batch_operations_bind_one_row_per_member():
     store.record_pending_many([], 42)                       # nothing to send: no round trip
     assert conn.calls == [
         (ss.record_pending_sql(), [(7, "d", "s", "t", "ct", "150", 42), (8, "d", "s", "t", "ct", "160", 42)]),
-        (ss.upsert_checkpoint_sql(), [(7, "d", "s", "t", "ct", "150", "incremental", "ok", None, "a, b"),
-                                      (8, "d", "s", "t", "ct", None, "loaded", "ok", "full load complete", "a")]),
+        (ss.upsert_checkpoint_sql(), [(7, "d", "s", "t", "ct", "150", "incremental", "ok", None, "a, b",
+                                       *ss.identity_values(a)),
+                                      (8, "d", "s", "t", "ct", None, "loaded", "ok", "full load complete", "a",
+                                       *ss.identity_values(b))]),
         (ss.record_ct_begin_version_sql(), [(7, 7)]),
     ]
 
@@ -1005,3 +1013,18 @@ def test_join_sources_holds_one_shared_lock_per_source_and_counts_their_holders(
     (sql, params), = conn.calls
     assert "mode = 'ShareLock'" in sql and "classid::bigint = %s" in sql and "objid::bigint = any(%s)" in sql
     assert params == (ss.SOURCE_LOCK_CLASS, list(keys.values()))
+
+def test_identity_values_normalize_case_port_and_key():
+    cfg = {"src_type": "sqlserver", "src_host": "Srv", "src_port": None, "src_database": "DB", "src_schema": "dbo",
+           "src_table": "T", "sink_catalog": "Main", "sink_schema": "B", "sink_table": "T", "primary_key": " Id, K "}
+    assert ss.identity_values(cfg) == ("sqlserver://srv:1433/db/dbo/t", "main.b.t", "id,k")
+    assert ss.sink_identity(dict(cfg, client_id="Tenant-1")) == "main.b.t#Tenant-1"
+    assert ss.merge_key(dict(cfg, primary_key=None)) is None
+
+
+def test_bulk_advance_records_identity_only_when_unknown():
+    sql = ss.bulk_advance_unchanged_sql()
+    assert "sink_identity = coalesce(sink_identity, %s)" in sql and sql.count("%s") == 7
+    conn = FakeConn()
+    ss.StateStore(conn).bulk_advance_unchanged([(7, 5, None, None, ("s", "k", "m")), (8, 6, None)])
+    assert conn.calls[0][1] == [(5, None, None, "s", "k", "m", 7), (6, None, None, None, None, None, 8)]

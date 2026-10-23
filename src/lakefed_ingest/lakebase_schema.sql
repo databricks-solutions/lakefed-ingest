@@ -69,7 +69,9 @@ create table if not exists lakefed_ingest.control (
     tier                  text,                               -- placement: cadence/SLA tier
     priority              int,                                -- placement: sweep priority
     warehouse_id          text,                               -- unused (this version is warehouse-free)
-    task_enabled          boolean     not null default true
+    task_enabled          boolean     not null default true,
+    freshness_sla_minutes int,                                -- max minutes since last success; NULL = no SLA
+    created_at            timestamptz not null default now()
 );
 
 -- Migrate an existing control table: JDBC host/port + per-DB secret key.
@@ -100,6 +102,10 @@ alter table lakefed_ingest.control add column if not exists write_mode text not 
 -- Identity columns written on every row next to __client_id__, as a JSON object {column: value}
 -- (for example the tenant name or the source server).
 alter table lakefed_ingest.control add column if not exists client_attrs text;
+-- Freshness SLA (monitoring only; the ingestion job doesn't read it): an enabled table breaches it
+-- when its last success (or, if it never succeeded, its creation) is older than this many minutes.
+alter table lakefed_ingest.control add column if not exists freshness_sla_minutes int;
+alter table lakefed_ingest.control add column if not exists created_at timestamptz not null default now();
 
 -- Constraints are (re-)declared here so re-applying the file updates existing tables. Older
 -- deploys had an inline load_type check (auto-named) and `mt_`-prefixed names; drop those too.
@@ -163,6 +169,10 @@ alter table lakefed_ingest.control add constraint valid_client_attrs check (
 alter table lakefed_ingest.control drop constraint if exists valid_client_id;
 alter table lakefed_ingest.control add constraint valid_client_id check (
     client_id is null or client_id ~ '^[A-Za-z0-9_.:-]{1,128}$'
+);
+alter table lakefed_ingest.control drop constraint if exists valid_freshness_sla;
+alter table lakefed_ingest.control add constraint valid_freshness_sla check (
+    freshness_sla_minutes is null or freshness_sla_minutes > 0
 );
 -- One writer per sink slice: a dedicated sink (client_id NULL) has exactly one control row, and a
 -- consolidated sink at most one row per client. (A sink mixing a dedicated row with consolidated
@@ -233,6 +243,12 @@ alter table lakefed_ingest.checkpoint add column if not exists last_success_at t
 -- CT begin_version recorded at seed time; a different current value means CT was re-enabled on the
 -- table since (changes made while it was off are invisible to CHANGETABLE), so the table re-seeds.
 alter table lakefed_ingest.checkpoint add column if not exists ct_begin_version bigint;
+-- What the checkpoint was written for: source (engine://host:port/db/schema/table), sink (+ #client_id)
+-- and merge key. A control row that now points elsewhere (edited) is reseeded instead of merging only
+-- new changes into the new place. NULL = not recorded yet (recorded on the next advance).
+alter table lakefed_ingest.checkpoint add column if not exists source_identity text;
+alter table lakefed_ingest.checkpoint add column if not exists sink_identity text;
+alter table lakefed_ingest.checkpoint add column if not exists merge_key text;
 
 -- The select_list the sink was last written with. The sweep compares it with control.select_list:
 -- a column ADDED to the control row means the table is reseeded (CT returns changed rows only, so
@@ -338,3 +354,113 @@ create index if not exists ingest_event_collection_idx
 -- NOTE: the two-level controller/batching was removed — one run ingests a whole task_collection in
 -- one task (see ingest.ipynb), so there is no `task_batch` table. A `task_batch` left over from an
 -- earlier deploy is harmless/orphaned; we don't drop it here.
+
+-- ---------------------------------------------------------------------------------------
+-- Table discovery (bulk onboarding). The lakefed_ingest_discover job lists a source database's
+-- tables with recommended control-row settings (discovery.py); the operations app shows them for
+-- review and creates control rows from the selection. One `discovery` row per (discovery, database)
+-- reports status / errors; `discovered_table` holds one row per table found.
+-- ---------------------------------------------------------------------------------------
+create table if not exists lakefed_ingest.discovery (
+    discovery_id  text        not null,
+    src_type      text,
+    src_host      text,
+    src_port      int,
+    src_database  text        not null,
+    secret_key    text,
+    status        text        not null default 'running',  -- running | ok | failed
+    error         text,
+    tables        int,
+    requested_by  text,
+    started_at    timestamptz not null default now(),
+    finished_at   timestamptz,
+    constraint discovery_pk primary key (discovery_id, src_database)
+);
+
+create table if not exists lakefed_ingest.discovered_table (
+    discovery_id          text        not null,
+    src_database          text        not null,
+    src_schema            text        not null,
+    src_table             text        not null,
+    row_count             bigint,
+    size_mb               numeric,
+    ct_enabled            boolean,
+    primary_key           text,
+    select_list           text,
+    excluded_columns      text,
+    rowversion_column     text,
+    identity_column       text,
+    load_type             text,                    -- recommended: ct | cursor | full
+    cursor_column         text,
+    partition_candidate   text,                    -- column a partitioned seed could split on
+    notes                 text,
+    discovered_at         timestamptz not null default now(),
+    constraint discovered_table_pk primary key (discovery_id, src_database, src_schema, src_table)
+);
+
+-- ---------------------------------------------------------------------------------------
+-- Change log for control rows: who changed what, when. Written by the operations app in the same
+-- transaction as each change (add, register, edit, move, enable / disable, reseed). Edits made with
+-- SQL aren't logged here; the ingestion planner still reseeds a table whose source, sink or key
+-- changed (checkpoint.source_identity / sink_identity / merge_key).
+-- ---------------------------------------------------------------------------------------
+create table if not exists lakefed_ingest.control_change (
+    id              bigserial   primary key,
+    changed_at      timestamptz not null default now(),
+    changed_by      text,                         -- signed-in user (app) or NULL
+    action          text        not null,         -- add | register | edit | enable | disable | reseed | schedule_*
+    control_id      bigint,                       -- -> control.id
+    task_collection text,                         -- the row's collection after the change
+    field           text,                         -- edited column (NULL for whole-row actions)
+    old_value       text,
+    new_value       text,
+    reseed_reason   text,                         -- set when the change flipped the table to seeding
+    batch_id        text                          -- groups the rows of one bulk action
+);
+create index if not exists control_change_control_idx
+    on lakefed_ingest.control_change (control_id, changed_at);
+create index if not exists control_change_time_idx
+    on lakefed_ingest.control_change (changed_at);
+
+-- ---- Schedules (written by the operations app) -------------------------------------------
+-- A schedule runs one or more collections at a fixed cadence. The app turns each member
+-- (schedule, collection) into a small Databricks job (a cron schedule and one run_job task that
+-- starts the ingestion job with that collection). Soft deletes: the app has no DELETE privilege.
+create table if not exists lakefed_ingest.schedule (
+    id              bigserial   primary key,
+    name            text        not null,
+    cadence_minutes int         not null,                     -- divides 1440: 5 .. 1440
+    timezone        text        not null default 'UTC',
+    parameters      jsonb       not null default '{}'::jsonb, -- ingestion job parameters, e.g. parallelism
+    job_variant     text        not null default 'default',   -- which ingestion job to start
+    stagger         boolean     not null default true,        -- spread members' start times over the cadence
+    paused          boolean     not null default false,
+    notify_emails   text,                                     -- comma-separated, on failure
+    created_by      text,
+    created_at      timestamptz not null default now(),
+    updated_at      timestamptz not null default now(),
+    deleted_at      timestamptz
+);
+create unique index if not exists schedule_name_uq
+    on lakefed_ingest.schedule (lower(name)) where deleted_at is null;
+alter table lakefed_ingest.schedule drop constraint if exists valid_schedule_cadence;
+alter table lakefed_ingest.schedule add constraint valid_schedule_cadence check (
+    cadence_minutes in (5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 720, 1440)
+);
+
+create table if not exists lakefed_ingest.schedule_member (
+    id              bigserial   primary key,
+    schedule_id     bigint      not null references lakefed_ingest.schedule (id),
+    task_collection text        not null,
+    offset_minutes  int         not null default 0,           -- start offset within the cadence
+    job_id          bigint,                                   -- the Databricks job the app created
+    synced_at       timestamptz,
+    sync_error      text,
+    added_at        timestamptz not null default now(),
+    removed_at      timestamptz
+);
+alter table lakefed_ingest.schedule_member add column if not exists added_at timestamptz not null default now();
+create unique index if not exists schedule_member_uq
+    on lakefed_ingest.schedule_member (schedule_id, task_collection) where removed_at is null;
+create index if not exists schedule_member_collection_idx
+    on lakefed_ingest.schedule_member (task_collection);

@@ -1279,3 +1279,23 @@ def test_units_take_a_permit_of_each_rows_source():
     with ce._unit(slots):                                    # Delta-only units take no permit
         assert slots.in_flight == 1
     assert ce._unit(None, _REMOTE) is not None and ce._units(None, [_REMOTE]) is not None
+
+
+def test_existing_sinks_query_and_fallback():
+    sql = ce.existing_sinks_sql("Main", ["Bronze", "it's"])
+    assert sql.startswith("SELECT lower(table_schema) AS s, lower(table_name) AS t FROM `Main`.information_schema.tables")
+    assert "IN ('bronze', 'it''s')" in sql
+
+    class _Spark:
+        def __init__(self, fail): self.fail = fail
+        def sql(self, q):
+            if self.fail:
+                raise RuntimeError("PERMISSION_DENIED")
+            return type("R", (), {"collect": lambda s: [{"s": "bronze", "t": "orders"}]})()
+    cfgs = [{"sink_catalog": "Main", "sink_schema": "Bronze", "sink_table": "Orders"}]
+    assert ce.existing_sinks(_Spark(False), cfgs) == {"main.bronze.orders"}
+    assert ce.existing_sinks(_Spark(True), cfgs) is None
+    assert ce.sink_lookup_key(cfgs[0]) == "main.bronze.orders"
+    # An already-quoted part (allowed by sink_fqn) is looked up unquoted, never as SQL text.
+    assert ce.sink_lookup_key(dict(cfgs[0], sink_catalog="`Main`")) == "main.bronze.orders"
+    assert ce.existing_sinks(_Spark(False), [dict(cfgs[0], sink_schema="`Bronze`")]) == {"main.bronze.orders"}

@@ -14,6 +14,9 @@ as `lakefed_ingest_lakebase.lakefed_ingest.<table>` (see [monitoring.md](monitor
 | `reseed_queue` | **Log.** Every reseed the job queued, and why | The ingestion job |
 | `ingest_run` | **Telemetry.** One row per job run | The ingestion job |
 | `ingest_event` | **Telemetry.** One row per table per run | The ingestion job |
+| `control_change` | **Audit.** Every change the operations app makes to control rows | The operations app |
+| `discovery`, `discovered_table` | **Onboarding.** Tables found by the discovery job, with recommended control-row settings | The discovery job |
+| `schedule`, `schedule_member` | **Scheduling.** Cadences for running collections, and the wrapper job per (schedule, collection) | The operations app |
 | `schema_version` | **Bookkeeping.** Schema versions applied | The setup job, or the first ingestion run after an upgrade |
 
 ```mermaid
@@ -42,6 +45,8 @@ erDiagram
         text select_list
         text cursor_column
         boolean task_enabled
+        int freshness_sla_minutes
+        timestamptz created_at
     }
     checkpoint {
         bigint control_id PK
@@ -102,6 +107,8 @@ for the run's `task_collection`). See "Control rows" in the [README](../README.m
 | `task_collection` | Which run ingests this row. One job run = one collection |
 | `task_enabled` | `false` skips the row without deleting its state |
 | `tier`, `priority` | Order within a run (`tier`, then `priority`, then `id`) |
+| `freshness_sla_minutes` | Optional freshness SLA: an enabled table breaches it when its `checkpoint.last_success_at` (or, if it has never succeeded, `created_at`) is older than this many minutes. NULL = no SLA, never flagged. Monitoring only (the operations app and DBSQL alerts); the ingestion job doesn't read it. Set it to the collection's schedule plus run time plus slack, e.g. 45 for a 15-minute schedule |
+| `created_at` | When the row was added (rows that predate this column show the migration time) |
 | `src_type` | Source adapter: `sqlserver` \| `oracle` \| `postgresql` \| `mysql` |
 | `src_host`, `src_port` | Source server; NULL port = the engine's default |
 | `src_database`, `src_schema`, `src_table` | Source table (Oracle: `src_database` is the service name) |
@@ -130,6 +137,7 @@ for the run's `task_collection`). See "Control rows" in the [README](../README.m
 - `use_remote_query` without `src_connection`;
 - a malformed `client_id`;
 - `write_mode` other than `merge` / `append`, or `append` with a load type other than `ct` / `full`.
+- a `freshness_sla_minutes` that isn't positive.
 
 A unique index allows only one row per sink, or one row per (sink, `client_id`) for shared sinks,
 so two rows can never overwrite each other's data.
@@ -149,6 +157,7 @@ at the start of a run.
 | `position` | Resume point, owned by the strategy. `ct`: the source database's CT version. `cursor`: JSON `{"col", "type", "value"}` (the watermark). `full`: NULL |
 | `status`, `detail` | `ok` or `failed`, with the last error in `detail` |
 | `select_list` | Columns the sink was last written with; compared with `control.select_list` to detect added columns |
+| `source_identity`, `sink_identity`, `merge_key` | What the checkpoint was written for: `engine://host:port/db/schema/table`, the sink (`catalog.schema.table`, plus `#client_id` for a shared sink) and the normalized primary key. A control row that now points elsewhere reseeds (`source_changed`, `sink_changed`, `primary_key_changed`). NULL until first recorded |
 | `ct_begin_version` | `ct`: the table's Change Tracking begin version at seed time. A change means CT was turned off and on, so the table reseeds |
 | `pending_position`, `pending_run_id` | Append sinks (`ct`): set just before a change or seed append, to the position it reaches and the run writing it; cleared when the checkpoint advances. Set at the start of a run means the last run stopped in between: the job checks the sink for that run's rows before doing anything else with the table. A `full` append isn't marked: each run appends one complete snapshot tagged with its `__run_id`, so a run that stopped after its commit leaves a complete snapshot and the next run appends its own |
 | `last_success_at` | When the table last ingested successfully, used for freshness and lag |
@@ -168,12 +177,15 @@ stateDiagram-v2
 ```
 
 A table reseeds when Change Tracking retention lapsed, CT was turned off or re-enabled on it,
-`select_list` gained columns, `cursor_column` changed, or `load_type` changed.
+`select_list` gained columns, `cursor_column` or `load_type` changed, its source, sink or primary
+key changed, or its sink table no longer exists (`sink_missing`).
 
 **Forcing a reseed.** Set the phase back to `seeding`; the next run copies the table again:
 
 ```sql
-update lakefed_ingest.checkpoint set phase = 'seeding' where control_id in (...);
+-- Clear any pending append too: a run settles it before looking at the phase, which would undo the reseed.
+update lakefed_ingest.checkpoint set phase = 'seeding', status = 'ok', pending_position = null, pending_run_id = null
+where control_id in (...);
 ```
 
 ## `reseed_queue` — reseed log
@@ -224,6 +236,46 @@ when the watermark hasn't moved.
 | `error` | Error message for a failed or retried attempt, with its deepest Java cause when Spark's message leaves it out |
 | `retry_count` | Earlier attempts of this table in the run: 0 for the first, 1 for the first retry. Write-conflict retries inside an attempt are logged in the job output only |
 
+## `control_change` — change log
+
+Written by the operations app in the same transaction as each change. Columns:
+- `changed_at`, `changed_by` (the signed-in user);
+- `action`: `add`, `register`, `edit`, `enable`, `disable` or `reseed`, or for schedules
+  `schedule_create`, `schedule_edit`, `schedule_pause`, `schedule_resume`, `schedule_delete`,
+  `schedule_sync`;
+- `control_id`, and `task_collection` (the row's collection after the change);
+- `field`, `old_value`, `new_value`, for edits;
+- `reseed_reason`, when the change flipped the table to seeding;
+- `batch_id`, which groups the rows of one bulk action.
+
+Edits made directly with SQL aren't logged, but the job still reseeds a table whose source, sink or
+key changed (see `checkpoint`).
+
+## `discovery` and `discovered_table` — bulk onboarding
+
+Written by the `lakefed_ingest_discover` job, which reads source catalog metadata only, and reviewed
+in the operations app's Bulk import page.
+- **`discovery`:** one row per (discovery, database), with the connection used (`src_host`,
+  `src_port`, `secret_key`), `status` (`running` | `ok` | `failed`), `error`, and the number of
+  tables found.
+- **`discovered_table`:** one row per table, with size and row counts, whether Change Tracking is
+  enabled, and the recommended settings: `select_list` (unsupported column types listed in
+  `excluded_columns`), `primary_key`, `load_type` (`ct` if CT and a PK; `cursor` on a rowversion
+  column if a PK; else `full`), `cursor_column`, and `partition_candidate`. Partitioning itself is
+  decided at review from a size threshold.
+
+Nothing here is used by ingestion; control rows are created only when a reviewer registers tables.
+
+## `schedule` and `schedule_member` — scheduling
+
+Written by the operations app (see "Schedules" in `app/README.md`); the ingestion job doesn't read them.
+- **`schedule`:** `name` (unique among active schedules), `cadence_minutes` (5, 10, 15, 20, 30, 60, 120,
+  180, 240, 360, 720 or 1440), `timezone`, `parameters` (ingestion job parameters, JSON), `job_variant`,
+  `stagger`, `paused`, `notify_emails`, who created it and when, and `deleted_at` (soft delete).
+- **`schedule_member`:** one row per (schedule, collection): `offset_minutes` (start offset within the
+  cadence), `job_id` (the wrapper job the app created), `synced_at`, `sync_error`, and `removed_at`
+  (soft remove; the next sync deletes the wrapper job).
+
 Telemetry tables grow with every run. To keep long-term history cheaply, snapshot them to Delta
 (see [monitoring.md](monitoring.md)) and prune old rows from Lakebase.
 
@@ -234,6 +286,39 @@ An ingestion run whose code needs a newer version than the newest row applies th
 renames first, in one transaction, under an advisory lock (so runs of other collections wait for it
 rather than migrating twice); a failure changes nothing. A database without the table (deployed
 before versions were recorded) counts as version 0.
+
+## Removing tables and old history
+
+Neither the ingestion job nor the operations app deletes configuration or history (a re-run
+discovery replaces only its own `discovered_table` rows), and the app has no `DELETE` privilege.
+
+**To stop ingesting a table,** disable it: `task_enabled = false`, or **Disable** in the app. Runs skip
+it from then on; it's reversible and logged.
+
+**To remove it for good,** connect to Lakebase as the tables' owner (the identity that ran setup) and
+delete its control row and checkpoint in one transaction, holding the collection's run lock so the
+delete can't race a running collection (the same lock the app takes for its edits):
+
+```sql
+begin;
+-- true = locked; false = the collection is running: roll back and retry later
+select pg_try_advisory_xact_lock(hashtextextended('lakefed_ingest:<task_collection>', 0));
+delete from lakefed_ingest.checkpoint where control_id in (...);
+delete from lakefed_ingest.control where id in (...);
+commit;
+```
+
+- No foreign key points at `control`, so that order is enough. Run history (`ingest_run`,
+  `ingest_event`), `reseed_queue` and `control_change` can stay: nothing reads them to decide what to
+  ingest.
+- **The sink isn't touched.** A dedicated sink: drop it in Unity Catalog if you don't need it. A
+  shared sink: `DELETE FROM <sink> WHERE __client_id__ = '<client_id>'` removes that database's rows.
+- **Schedules:** delete them in the app. It deletes their wrapper jobs and marks the schedule deleted.
+- **Old run history:** snapshot `ingest_run` and `ingest_event` to Delta ([monitoring.md](monitoring.md)),
+  then delete old rows as the owner, e.g.
+  `delete from lakefed_ingest.ingest_event where started_at < now() - interval '90 days';`
+- **Old discoveries:** `delete from lakefed_ingest.discovered_table where discovery_id = '...';`, then
+  the same for `discovery`.
 
 ## Changing the schema
 

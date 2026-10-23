@@ -10,6 +10,12 @@ Databricks Delta tables. Each is its own Databricks Asset Bundle:
 | **Default** | repo root (`databricks.yml`, `resources/`, `src/lakefed_ingest/`, `tests/`) | `lakefed_ingest_v2` | One job task per `task_collection`, in-process threads + FAIR pools on a job cluster; Lakebase (Postgres) state; Spark JDBC; source adapters (SQL Server, Oracle, PostgreSQL, MySQL) + load strategies (SQL Server Change Tracking and watermark cursor, full reload) |
 | **Job orchestration** | `job_orchestration/` | `lakefed_ingest` | Jobs `for_each` tasks; SQL warehouse + notebooks; Delta control table; Lakehouse Federation / `remote_query` |
 
+An optional operations app (Databricks App: FastAPI backend + React/TypeScript frontend) for the
+default version is its own bundle in `app/` (`lakefed_ingest_app`); see `app/README.md`. SQL lives in
+`app/src/queries.py` (unit-tested); Databricks Apps builds the frontend at deploy time. Schedules
+(`app/src/schedules.py`): one wrapper job per (schedule, collection), a cron + `run_job` task that starts the
+ingestion job with `task_collection`; `max_concurrent_runs` 1, no queue (overruns skip triggers).
+
 Never run bundle commands for one version from the other's directory. Local bundle state
 (`.databricks/bundle/<target>/`) is keyed by target only, so each version keeps its own cache in its
 own directory.
@@ -60,13 +66,16 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `cursor_column`, `cdc_capture_instance`, `jdbc_options` (JSON), `client_id` (optional: consolidated
   sink shared by many source DBs; written to sink column `__client_id__`), `client_attrs` (JSON
   {column: value}: identity columns written as STRING on every row), `write_mode` (`merge` default |
-  `append` for ct/full: change-log sink with `__change_op`/`__change_version`/`__extracted_at`/`__run_id`).
+  `append` for ct/full: change-log sink with `__change_op`/`__change_version`/`__extracted_at`/`__run_id`), `freshness_sla_minutes`
+  (optional; monitoring only, the app's "SLA breached" rule `queries.SLA_BREACHED`), `created_at`.
   CHECK constraints enforce valid combos; a unique index allows one row per (sink, client_id).
 - `checkpoint` — generic: `strategy` + `position` (text; CT version for `ct`, JSON {col,type,value} for
   `cursor`), phase (`seeding → incremental` for ct and cursor, `loaded` for full), status, freshness,
   `ct_begin_version`, `pending_position`/`pending_run_id` (an append in flight). `reseed_queue` (ct, cursor).
 - `ingest_run`, `ingest_event` — telemetry (`run_id`, `position_from/to`). The DB is registered in UC
   (default catalog `lakefed_ingest_lakebase`) for DBSQL monitoring.
+- `schedule`, `schedule_member` — written by the operations app (cadence, members, wrapper `job_id`);
+  soft deletes (`deleted_at`, `removed_at`): the app has no DELETE privilege.
 - DDL is applied by `StateStore.migrate` (from `apply_lakebase_schema.ipynb`, and from `ingest.ipynb`
   when `schema_version` is behind `state_store.SCHEMA_VERSION`, so upgrades are deploy-only): one
   transaction, split on `;` — no `DO $$` blocks, no `CREATE INDEX CONCURRENTLY`. Migrations must be
@@ -89,6 +98,12 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   transient source error, 0 = off; `table_retry.py`), `table_retry_budget` (retries per run),
   `db_instance`, `db_name`.
   The tuning parameters' defaults are bundle variables of the same name (`databricks.yml`).
+- `lakefed_ingest_discover` → `discover_tables.ipynb`: table discovery for bulk onboarding (params
+  `discovery_id`, `spec` JSON); writes `discovery` / `discovered_table`. Runs on the bundle's
+  single-node all-purpose cluster `lakefed_ingest utility` (`resources.clusters.lakefed_ingest_utility`,
+  auto-terminates after 60 min) so repeated runs skip cluster start; transient connection errors
+  (paused sources) retry with backoff (`discovery.CONNECT_RETRIES`).
+- Setup and the app's grant job run on serverless (job `environments`); ingestion on job clusters.
 - `lakefed_ingest_setup` → `apply_lakebase_schema.ipynb`; plus bundle resources for the Lakebase
   instance, its UC catalog, and the secret scope (`database_instances.lakebase`,
   `database_catalogs.lakebase_catalog`, `secret_scopes.secret_scope`).
@@ -104,6 +119,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
    checkpoint ahead of current version → reseed; CT disabled on the DB → fail loudly. Per-table CT
    status (`sys.change_tracking_tables`, read with the version, before the fast exit): CT off on a table,
    retention lapsed, or `begin_version` ≠ `checkpoint.ct_begin_version` (CT re-enabled) → reseed.
+   Identity backstop (ct / cursor): control row's source / sink / primary key ≠ the checkpoint's recorded
+   `source_identity` / `sink_identity` / `merge_key`, or the sink table is missing (one
+   `information_schema` query per sink catalog) → reseed. Never merge into a new, empty sink.
 3. Unchanged tables: one bulk Lakebase checkpoint advance.
 4. Per-table worker: full reload (`load_strategies.FullStrategy` → `ct_engine.seed`), seed (capture V0
    before seed; partitioned seed via staging + atomic swap),
@@ -113,7 +131,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
    captured version. Append mode (`write_mode` append) appends instead (seed/full: op 'S'). A ct append
    records the pending append first; a `full` append doesn't (it adds one snapshot per run, so there
    is no position to protect). A `pending` route (run stopped before the advance) checks the sink
-   for that run's rows (`append_committed`) before anything else.
+   for that run's rows (`append_committed`) before anything else, unless the row now points at
+   another source, sink or key, or its sink is gone: then it reseeds (`enqueue_reseed` clears the pending append).
    With `table_retries` > 0, a transient source failure is retried in the run (`table_retry.with_retries`;
    the next attempt from `planner.retry_plan` on the fresh checkpoint). An append-mode retry goes to
    `pending`, or carries `verify_run_id` (stage `verify`): rows of this run in the sink → finish the
@@ -131,6 +150,7 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 | `src/lakefed_ingest/planner.py` | Strategy routing + skip-no-change planning (no Spark/DB; unit-tested with fakes) |
 | `src/lakefed_ingest/parallel.py` | Thread pool, FAIR pools, `WorkSlots` budget, `SourceLimiter` (per-source permits) |
 | `src/lakefed_ingest/partitions.py` | Partitioned-seed planning |
+| `src/lakefed_ingest/discovery.py` | Table discovery for bulk onboarding (catalog queries + recommended control-row settings); run by `discover_tables.ipynb` / job `lakefed_ingest_discover` |
 | `src/lakefed_ingest/state_store.py` | Lakebase accessor (psycopg, SDK-minted OAuth token) + pure helpers |
 | `tests/conftest.py` | Puts `src/lakefed_ingest` on `sys.path` |
 | `tests/synthetic/` | Synthetic SQL Server DB generator, change generator, reconcile |
@@ -142,6 +162,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
 - No SQL warehouse dependency in the default version.
 - Checkpoints advance only after the Delta commit (at-least-once + idempotent MERGE). An append is
   not idempotent: record the pending append (`store.record_pending`) before it; the advance clears it.
+- App writes to `control` / `checkpoint` run in one transaction that takes the affected collections'
+  run locks (`pg_try_advisory_xact_lock`, same key as the job), flips tables to seeding when source /
+  sink / key change (`queries.plan_edit`), and logs to `control_change`.
 - Every sink write must be client-scoped when `client_id` is set: tag rows (`ct_engine._tag`, with
   `append_meta(cfg, ...)` for append writes), write `write_columns(cfg)`, MERGE on `merge_keys(cfg)`,
   overwrite via `insert_overwrite_sql(..., cfg)` (REPLACE WHERE client_id) or, in append mode, append

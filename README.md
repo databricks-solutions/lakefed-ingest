@@ -20,6 +20,10 @@ version doesn't support yet. Use the default version when you have many source d
 consolidated into shared tables, or need Change Tracking (incremental loads without a reliable
 watermark column, deletes included).
 
+An optional **operations app** (a Databricks App) for the default version is in [`app/`](app/README.md):
+run and table observability, control-row management, and starting or cancelling runs. It's a
+separate bundle, so workspaces that haven't approved Databricks Apps simply don't deploy it.
+
 > **Upgrading from an earlier release (deploy-path change).** The original version moved from the
 > repo root to [`job_orchestration/`](job_orchestration/README.md), unchanged and with the same bundle
 > name and uuid, so deploying it **from `job_orchestration/`** updates your existing jobs in place.
@@ -206,7 +210,13 @@ database, so detection is grouped by source database:
     first enabled), the toggle leaves no trace in SQL Server metadata. Checkpoints created before
     `ct_begin_version` existed record it the first time they're seen, so a toggle before that
     upgrade isn't detected either. After CT maintenance like this, force a reseed:
-    `update lakefed_ingest.checkpoint set phase = 'seeding' where control_id in (...);`
+    `update lakefed_ingest.checkpoint set phase = 'seeding', status = 'ok', pending_position = null,
+    pending_run_id = null where control_id in (...);` (or Force reseed in the operations app)
+- **Edited or missing sinks.** Each checkpoint records the source, sink and primary key it was
+  written for. A `ct` / `cursor` table whose control row now points at a different source, sink or
+  key, or whose sink table no longer exists, is reseeded rather than merging only new changes into
+  the new place (a silent gap). The sink check is one `information_schema` query per sink catalog
+  per run; it's skipped with a warning if a catalog can't be listed.
 
 ### Partitioned seed (large tables)
 
@@ -281,7 +291,8 @@ with four extra columns:
   change set or a seed) the run records on the checkpoint the position the append reaches and its
   `run_id`; the checkpoint advance clears them. If a run stops in between, the next run looks in the sink for that client's
   rows with that `__run_id`: found, the append committed and the checkpoint advances (outcome
-  `recovered`); not found, the table reads again from its checkpoint.
+  `recovered`); not found, the table reads again from its checkpoint. If the row was meanwhile pointed at
+  another source, sink or key (or its sink is gone), the table reseeds instead: that append belonged to the old place.
 - Downstream (for example SCD2 or a current-state view), order a key's rows by `__change_version`.
 
 **Batched appends.** With many source databases per sink, most of a run is per-table overhead: a
@@ -418,8 +429,14 @@ required for `ct`, `cursor` and `cdc`), `select_list` (explicit columns — `*` 
 `sink_catalog` / `sink_schema` / `sink_table`, `load_type` (`ct` | `full` | `cursor` | `cdc`), the
 optional partitioned-seed settings, `cursor_column` (required for `cursor`), `client_id`
 (consolidated sinks), `write_mode` (`merge` | `append`, see [Append sinks](#append-sinks-optional)),
-`client_attrs` (identity columns, JSON), and `jdbc_options`.
-`cdc_capture_instance` is reserved for the placeholder `cdc` strategy. Check constraints reject invalid combinations (e.g.
+`client_attrs` (identity columns, JSON), `jdbc_options`, and `freshness_sla_minutes` (optional freshness
+SLA for monitoring; see `docs/monitoring.md`).
+`cdc_capture_instance` is reserved for the placeholder `cdc` strategy.
+
+**Bulk onboarding.** The `lakefed_ingest_discover` job lists a SQL Server database's tables with
+recommended settings (load type from Change Tracking / rowversion / primary key, select list, partition
+column) into Lakebase. The optional operations app reviews them and creates control rows in bulk;
+without the app, query `discovered_table` and insert control rows yourself. Check constraints reject invalid combinations (e.g.
 `ct` on a non-SQL Server source). See `notebooks/load_control_example.ipynb`.
 
 **Schema changes.** Writes use schema evolution. Adding a column to `select_list` adds it to the
@@ -436,6 +453,7 @@ snapshot of every table that gained the column). New sinks get
 |---|---|
 | Lakebase instance, database, UC catalog | Bundle resources in `resources/lakefed_ingest_setup.yml` (created on deploy, or adopt existing ones with `bundle deployment bind`) |
 | Schema + migrations | `lakefed_ingest_setup` job on a new deployment (idempotent); after an upgrade, the first ingestion run migrates the schema itself |
+| Serverless jobs compute (default for setup) | The `lakefed_ingest_setup` job (and the operations app's grant job) default to serverless: they only talk to Lakebase, so they don't wait for a cluster. Without serverless, point them at an all-purpose cluster ([docs/deploy.md](docs/deploy.md#compute-for-the-setup-and-discovery-jobs)). Discovery reads the sources, so it runs on the bundle's single-node all-purpose `lakefed_ingest utility` cluster, which stays up between runs (auto-terminates after an hour). Ingestion runs on job clusters |
 | Lakebase auth | SDK-minted OAuth token at runtime; the run identity must be a Postgres role on the instance |
 | Cluster → Lakebase network path (port 5432) | Workspace IP access list must allow cluster egress, or use Private Link. Verify first. |
 | Per-database source credentials | One JSON secret `{"user","password"}` per source database, named by `control.secret_key`, in the `secret_scope` (may be Azure Key Vault-backed); or, for rows with `use_remote_query`, a UC connection on which the job's identity has `USE CONNECTION` and `MANAGE` |
@@ -514,8 +532,12 @@ team will help on a best-effort basis.
 
 | library | description | license | source |
 |---|---|---|---|
+| ag-grid-community | Data grid (operations app) | MIT | https://github.com/ag-grid/ag-grid |
+| ag-grid-react | React wrapper for AG Grid (operations app) | MIT | https://github.com/ag-grid/ag-grid |
 | certifi | Mozilla CA bundle (live SQL Server validation tests) | MPL-2.0 | https://pypi.org/project/certifi/ |
 | databricks-sdk | Databricks SDK for Python | Apache-2.0 | https://pypi.org/project/databricks-sdk/ |
+| fastapi | Web framework for APIs (operations app) | MIT | https://pypi.org/project/fastapi/ |
+| httpx | HTTP client (operations app API tests) | BSD-3-Clause | https://pypi.org/project/httpx/ |
 | ibm_db | IBM Db2 driver (Db2 test data generator, job orchestration version) | Apache-2.0 | https://pypi.org/project/ibm-db/ |
 | Microsoft JDBC Driver for SQL Server | SQL Server JDBC driver (included in Databricks Runtime) | MIT | https://github.com/microsoft/mssql-jdbc |
 | MySQL Connector/J | MySQL JDBC driver (optional cluster library) | GPL-2.0 with Universal FOSS Exception | https://github.com/mysql/mysql-connector-j |
@@ -523,6 +545,17 @@ team will help on a best-effort basis.
 | pandas | Data manipulation and analysis (table profiler notebook) | BSD-3-Clause | https://pypi.org/project/pandas/ |
 | PostgreSQL JDBC Driver | PostgreSQL JDBC driver (included in Databricks Runtime) | BSD-2-Clause | https://github.com/pgjdbc/pgjdbc |
 | psycopg | PostgreSQL database adapter (v3), for Lakebase | LGPL-3.0 | https://pypi.org/project/psycopg/ |
+| pydantic | Data validation using Python type hints (operations app) | MIT | https://pypi.org/project/pydantic/ |
 | pyspark | Apache Spark Python API (provided by Databricks Runtime) | Apache-2.0 | https://pypi.org/project/pyspark/ |
 | pytest | Testing framework | MIT | https://pypi.org/project/pytest/ |
 | python-tds | SQL Server TDS client (live SQL Server validation tests) | MIT | https://pypi.org/project/python-tds/ |
+| react | Library for building user interfaces (operations app) | MIT | https://github.com/facebook/react |
+| react-dom | React DOM rendering (operations app) | MIT | https://github.com/facebook/react |
+| react-router-dom | Routing for React (operations app) | MIT | https://github.com/remix-run/react-router |
+| @tanstack/react-query | Data fetching and caching for React (operations app) | MIT | https://github.com/TanStack/query |
+| @types/react | TypeScript types for React (operations app, build only) | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| @types/react-dom | TypeScript types for React DOM (operations app, build only) | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| typescript | TypeScript compiler (operations app, build only) | Apache-2.0 | https://github.com/microsoft/TypeScript |
+| uvicorn | ASGI web server (operations app) | BSD-3-Clause | https://pypi.org/project/uvicorn/ |
+| vite | Frontend build tool (operations app, build only) | MIT | https://github.com/vitejs/vite |
+| @vitejs/plugin-react | React support for Vite (operations app, build only) | MIT | https://github.com/vitejs/vite-plugin-react |

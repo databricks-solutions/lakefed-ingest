@@ -1,0 +1,68 @@
+# Table discovery for bulk onboarding: lists source tables with recommended control-row settings and
+# writes them to Lakebase (discovery, discovered_table) for review — usually started from the optional
+# operations app (app/), or run directly:
+#   databricks bundle run lakefed_ingest_discover -t <target> --params discovery_id=<id>,spec='<json>'
+# Catalog metadata only (no table data is read), on the same network path as ingestion.
+#
+# It runs on a small single-node ALL-PURPOSE cluster, not a job cluster: onboarding often means several
+# discovery runs in a row (batches of databases, re-runs after fixing access), and a cluster that stays
+# up between them saves a cluster start each time. It terminates after an hour without use (billed at
+# the all-purpose rate while up). Deploying creates it, and Databricks starts a new cluster on creation.
+# To use a cluster you already have, override existing_cluster_id on the task in your target.
+resources:
+  clusters:
+    lakefed_ingest_utility:
+      cluster_name: "lakefed_ingest utility"
+      spark_version: 18.x-scala2.13
+      data_security_mode: SINGLE_USER
+      single_user_name: ${workspace.current_user.userName}
+      node_type_id: ${var.node_type_id}
+      num_workers: 0
+      autotermination_minutes: 60
+      spark_conf:
+        spark.databricks.cluster.profile: singleNode
+        spark.master: "local[*]"
+      custom_tags:
+        ResourceClass: SingleNode
+        project: lakefed_ingest
+
+  jobs:
+    lakefed_ingest_discover:
+      name: "lakefed_ingest_discover"
+      description: "Discover source tables and recommended control-row settings for bulk onboarding."
+      max_concurrent_runs: 10
+      tasks:
+        - task_key: discover
+          existing_cluster_id: ${resources.clusters.lakefed_ingest_utility.id}
+          notebook_task:
+            notebook_path: ../src/lakefed_ingest/discover_tables.ipynb
+            base_parameters:
+              discovery_id: "{{job.parameters.discovery_id}}"
+              spec: "{{job.parameters.spec}}"
+              db_instance: "{{job.parameters.db_instance}}"
+              db_name: "{{job.parameters.db_name}}"
+              secret_scope: "{{job.parameters.secret_scope}}"
+              trust_server_certificate: "{{job.parameters.trust_server_certificate}}"
+          libraries:
+            - pypi:
+                package: "psycopg[binary]"
+            - pypi:
+                package: "databricks-sdk==0.145.0"
+      tags:
+        business_unit: ""
+        project: lakefed_ingest
+      queue:
+        enabled: true
+      parameters:
+        - name: discovery_id
+          default: ""
+        - name: spec
+          default: "{}"
+        - name: db_instance
+          default: ${var.lakebase_instance}
+        - name: db_name
+          default: ${var.lakebase_database}
+        - name: secret_scope
+          default: ${var.secret_scope}
+        - name: trust_server_certificate
+          default: "true"
