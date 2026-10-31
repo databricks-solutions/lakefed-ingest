@@ -159,7 +159,8 @@ export default function NewJob() {
       .then((ok) => ok && navigate("/ingestion-jobs"));
   };
 
-  // The two ways to add tables: the Add tables menu and the empty state both offer them.
+  // The two ways to add tables: the Add tables menu offers them, and so does the empty state, which is the same menu
+  // opened from anywhere in its box.
   const addTableChoices = (<>
     <button onClick={() => setDiscovering(true)}>Discover on a source</button>
     <button onClick={() => setImporting(true)}>Import a CSV</button>
@@ -191,10 +192,8 @@ export default function NewJob() {
       <fieldset className="create-lock" disabled={create.isPending}>
         <Section title="What it ingests"
           actions={<Menu label={<>Add tables <Chevron open /></>} buttonClass="ghost" title="Add tables">{addTableChoices}</Menu>}>
-          {!chosen ? <div className="empty-drop">
-            <p>No tables yet. Add them with <b>Add tables</b>.</p>
-            <div className="empty-choices">{addTableChoices}</div>
-          </div> : (
+          {!chosen ? <Menu label={<>No tables yet. Click to add them: discover on a source or import a CSV. <Chevron open /></>}
+            buttonClass="empty-drop" title="Add tables">{addTableChoices}</Menu> : (
             <>
               <p className="muted">From {chosen.label}.</p>
               {readProgress && <Busy label="Reading tables" {...readProgress} />}
