@@ -464,7 +464,8 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
   const [read, setRead] = useState<Record<string, string>>({});
   const [failed, setFailed] = useState<[string, string][]>([]);
   const [error, setError] = useState<unknown>(null);
-  // What a discovery run the dialog waits on is doing, and since when: the connection test, or the reading on Add.
+  // What a discovery run the dialog waits on is doing, and since when: the connection test, or the reading on Add. Its
+  // Busy line (a spinner and the label) is the one place the wait is said: the dialog's action stays off meanwhile.
   const [waiting, setWaiting] = useState<DialogWait | null>(null);
   const now = useNow(waiting !== null);
   const waitText = waiting ? waitLine(waiting.reading, waiting.asked, now) : null;
@@ -603,7 +604,8 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
     : step === 3 ? waitText ?? "Reading tables" : chosen ? undefined : "Choose the server, databases or tables first";
   return (
     <Modal title={title} action={step === 1 ? connectionNextLabel(testing) : step === 3 ? "Reading…" : "Add the tables chosen"}
-      actionDisabled={blocked} actionNote={step === 1 && testError != null ? testFailedNote(testError) : undefined} onClose={(ok) => {
+      actionDisabled={blocked} actionNote={step === 1 && testError != null ? testFailedNote(testError) : undefined}
+      busy={waiting !== null} onClose={(ok) => {
         if (!ok) return onClose(null);
         if (step === 1) return testThenNext();
         finish();
