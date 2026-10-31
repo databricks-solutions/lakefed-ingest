@@ -355,3 +355,61 @@ def test_the_timeline_draws_each_jobs_runs_in_its_own_lane_with_their_groups(cli
     # A trigger that did not run has no span; a running job run with no group run started yet ends now.
     assert all(r["ended_at"] is None for lane in lanes.values() for r in lane["runs"] if r["outcome"]["label"] == "Not run")
     assert not any(r["outcome"].get("paused") for r in lanes["Nightly"]["runs"])      # Nightly is paused
+
+
+def test_a_kept_deleted_job_adds_nothing_to_the_overview_sources_runs_or_timeline(client, monkeypatch):
+    monkeypatch.setattr(main.jobs, "schedule_client", lambda: None)
+    monkeypatch.setattr(main, "_skipped_starts", lambda job_id, since, now, client=None: [])
+
+    def views():
+        overview = client.get("/api/overview").json()
+        sources = client.get("/api/sources").json()
+        runs = client.get("/api/job-runs").json()
+        timeline = client.get("/api/timeline?hours=168").json()
+        return ({k: overview[k] for k in ("totals", "jobs_total", "paused_jobs", "next_triggers", "rows_24h",
+                                          "attention_total", "running_total", "not_in_job")},
+                [(i["server"], i["tables"], i["databases"], [j["name"] for j in i["jobs"]]) for i in sources["instances"]],
+                sources["ingested"], runs["counts"], runs["jobs"], [lane["name"] for lane in timeline["jobs"]],
+                timeline["not_in_job"])
+
+    real = main.db.query
+    deleted_at = datetime(2026, 10, 26, 13, 0, tzinfo=UTC)
+    gone = dict(SCHEDULES[1], id=9, name="Old nightly", deleted_at=deleted_at)
+    member = dict(id=9, schedule_id=9, task_collection="d1", offset_minutes=0, job_id=None, added_at=ADDED,
+                  removed_at=deleted_at)
+    read_groups = []
+
+    def with_deleted(sql, params=()):
+        if sql == q.schedules_sql():
+            return [dict(s) for s in SCHEDULES + [gone]]
+        if sql == q.schedule_members_sql():
+            return real(sql, params) + ([dict(member)] if 9 in params[0] else [])
+        if sql == q.rollup_states_sql():
+            return real(sql, params) + [dict(state("d1", 1000, current=1, late=3, failing=2), server="srv9")]
+        if sql in (q.rollup_group_names_sql(), q.control_group_names_sql()):
+            return real(sql, params) + [dict(task_collection="d1")]
+        if sql == q.deleted_groups_sql():
+            return [dict(task_collection="d1")]
+        if sql == q.deleted_tables_left_sql():
+            return [dict(schedule_id=9)]
+        if sql == q.rows_written_since_sql():
+            read_groups.append(list(params[0]))
+            return [dict(rows_written=10 * len(params[0]), uncounted=0)]
+        if sql == q.run_batch_rows_sql():
+            return [dict(run_id=31, task_collection="d1", detail={"batch_rows": 500})]
+        if sql == q.group_runs_sql() and "d1" in params[0]:
+            return real(sql, params) + [group_run(30, "d1", datetime(2026, 10, 26, 12, 0, 20, tzinfo=UTC),
+                                                  status="failed", failed=2)]
+        return real(sql, params)
+
+    def without(sql, params=()):
+        if sql == q.rows_written_since_sql():
+            return [dict(rows_written=10 * len(params[0]), uncounted=0)]
+        return real(sql, params)
+
+    monkeypatch.setattr(main.db, "query", without)
+    live_only = views()
+    monkeypatch.setattr(main.db, "query", with_deleted)
+    assert views() == live_only
+    assert read_groups and all("d1" not in groups for groups in read_groups)
+    assert live_only[0]["jobs_total"] == 2 and live_only[0]["paused_jobs"] == 1
