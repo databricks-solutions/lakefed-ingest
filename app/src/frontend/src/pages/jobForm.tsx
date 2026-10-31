@@ -49,7 +49,9 @@ export function WritesFields({ w, setW, stored, modeNote, targetsNote, reseed }:
   );
 }
 
-/** Identity columns: __client_id__ (fan-in only) and any others, each a template filled per database. */
+/** Identity columns: __client_id__ (fan-in only) and any others, each a template filled per database. With fan-in off
+ *  the __client_id__ row isn't shown at all, as no row is written with it; only what is shown changes, not what is
+ *  sent. */
 export function IdentityFields({ w, setW, identity, setIdentity, differing = {}, setDiffering, stored, tables, newJob, sharedKey }: {
   w: Row; setW: (w: Row) => void; identity: [string, string][]; setIdentity: (i: [string, string][]) => void;
   differing?: Record<string, string>; setDiffering?: (d: Record<string, string>) => void; stored?: Row; tables?: number;
@@ -63,12 +65,12 @@ export function IdentityFields({ w, setW, identity, setIdentity, differing = {},
           it.</Info></th><th></th></tr></thead>
         <tbody>
           {stored?.identity?.mixed && !Object.keys(differing).length && <tr><td colSpan={3}><Mixed s={stored.identity} /></td></tr>}
-          {newJob ? (
+          {w.fan_in === false ? null : newJob ? (
             <tr><td className="mono">__client_id__</td><td className="help">{w.fan_in === true
               ? <>filled from the server and database: <span className="mono">{sharedKey}</span></> : "fan-in only"}</td><td></td></tr>
           ) : (
             <tr><td className="mono">__client_id__<Info label="About __client_id__">Keeps each database's rows apart in the shared
-              tables (fan-in only).</Info></td><td><input className="mono" value={w.client_id ?? ""} disabled={w.fan_in === false}
+              tables (fan-in only).</Info></td><td><input className="mono" value={w.client_id ?? ""}
               onChange={(e) => setW({ ...w, client_id: e.target.value })} /></td><td></td></tr>
           )}
           {Object.entries(differing).map(([name, template]) => (
