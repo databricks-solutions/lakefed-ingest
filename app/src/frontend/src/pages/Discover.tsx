@@ -534,7 +534,9 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
   };
   const wholeKey = whole.join("\n");
   useEffect(() => { if (drafting) syncDrafts(); }, [drafting, wholeKey, wholeServer.on, wholeServer.filter]);
-  const draftSteps = useDraftReads(connection, draftIds, draftGeneration);
+  // The drafts' reads start as the choice is made and go on out of sight while the user chooses: their progress shows
+  // only once Add the tables chosen hands them to New job, whose page shows it.
+  useDraftReads(connection, draftIds, draftGeneration);
   const allDrafts = () => [draftState.current.server?.id, draftState.current.named].filter((id): id is string => Boolean(id));
   // Leaving the page with the dialog open, or closing it any way but Add, discards what it started reading.
   useEffect(() => {
@@ -542,10 +544,6 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
     window.addEventListener("pagehide", leave);
     return () => { window.removeEventListener("pagehide", leave); leave(); };
   }, []);
-  const draftProgress = Object.values(draftSteps).reduce((sum: Row, step: Row) => ({
-    databases: sum.databases + Number(step.databases ?? 0), done: sum.done + Number(step.done ?? 0),
-    failed: sum.failed + Number(step.failed ?? 0), tables: sum.tables + Number(step.tables ?? 0),
-    pending: sum.pending + Number(step.pending ?? 0) }), { databases: 0, done: 0, failed: 0, tables: 0, pending: 0 });
   const label = () => (wholeServer.on ? `${connection}, ${chosenWords}` : `${chosenWords} on ${connection}`)
     + (counts ? ` (${countsLine.replace(/^Chosen: /, "")})` : "");
   const finish = async () => {
@@ -617,7 +615,6 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
           failed={failed} setFailed={setFailed} onCounts={setCounts} />}
         {waiting && <Busy label={waiting.reading} since={waiting.asked} done={waiting.done} total={waiting.total} />}
         {step === 2 && chosen > 0 && <p className="muted">{chosenWords} chosen. {countsLine}.</p>}
-        {step === 2 && drafting && draftProgress.pending > 0 && <Busy label="Reading tables" {...readsDone(draftProgress)} />}
         <ErrorBox error={error} />
       </div>
     </Modal>
