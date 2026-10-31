@@ -839,6 +839,15 @@ def _selected_rows(kind: str, param, selection: Selection, whole_databases: Iter
         after = (last["server"], last["k_database"], last["line"], last["k_schema"], last["k_table"])
 
 
+def _no_tables_refusal(kind: str, param, selection: Selection) -> str:
+    """Why a selection takes no tables (new_job.no_tables_refusal): the source's servers are read only here, on the
+    refusal, to name its server keys when the selection names servers it doesn't have."""
+    named = [d.server for d in selection.databases] + [t.server for t in selection.tables]
+    if not named:
+        return nj.NO_TABLES
+    return nj.no_tables_refusal(named, [s["server"] for s in db.query(q.source_servers_sql(kind), (param, ""))])
+
+
 def _selected(selection: Selection) -> dict:
     """What a selection takes, read back from Lakebase: {"text": the CSV of its table rows, "rows": those rows (server,
     database, schema, table, line, fields), "columns": the header the CSV is written with, "lines": each row's line in
@@ -863,7 +872,7 @@ def _selected(selection: Selection) -> dict:
                                        line["database"]) for line in database_lines]
     rows = _selected_rows(kind, param, selection, whole_databases)
     if not rows and not database_lines:
-        raise HTTPException(422, {"errors": ["the selection takes no tables"]})
+        raise HTTPException(422, {"errors": [_no_tables_refusal(kind, param, selection)]})
     whole = ([s["server"] for s in db.query(q.source_servers_sql(kind), (param, selection.filter))]
              if selection.whole_server else [])
     covered = lambda server, database: (server.lower() in {w.lower() for w in whole}
@@ -4520,7 +4529,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
         errors.insert(0, "name the job")
     servers = db.query(q.selected_servers_sql(kind), (param, *rest))
     if not servers:
-        errors.append("the selection takes no tables")
+        errors.append(_no_tables_refusal(kind, param, selection))
     groups_of = by_database.groups_by_server(servers, _sizing(body))
     all_groups = [g for s in servers for g in nj.group_names(name or PREVIEW_NAME, s["server"], groups_of[s["server"]])]
     timezone_ = sch.timezone_for(run.cadence_minutes, run.timezone)
