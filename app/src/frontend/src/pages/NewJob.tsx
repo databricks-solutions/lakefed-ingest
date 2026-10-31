@@ -109,9 +109,13 @@ export default function NewJob() {
   const previewBody = body(true);
   const current = JSON.stringify({ ...previewBody, request_id: null });
   const settled = useSettled(current, 600);
+  // A change of how it writes asks for a new preview: until it answers, the tables chosen stay on screen as the last
+  // preview had them, with nothing loading in sight, and Create waits. Tables chosen anew never show the old ones.
+  const settledSource = JSON.stringify(JSON.parse(settled).source ?? null);
   const preview = useQuery({
     // Shown as soon as tables are chosen: a blank name or target only holds Create back, never the preview.
-    queryKey: ["new-job-preview", settled], enabled: !!chosen, retry: false,
+    queryKey: ["new-job-preview", settledSource, settled], enabled: !!chosen, retry: false,
+    placeholderData: (previous, previousQuery) => (previousQuery?.queryKey[1] === settledSource ? previous : undefined),
     queryFn: () => api.post<Row>("/ingestion-jobs", previewBody),
     // A file's database-only lines are discovered by name before the preview can count them, and a draft's tables are
     // read as they were chosen: asked again until they are (each preview also does a step of the draft's read).
@@ -142,7 +146,7 @@ export default function NewJob() {
   }, [taken, name, defaultName]);
   const blocked = !name.trim() ? "Name the job first" : !chosen ? "Add its tables first"
     : discoveringDatabases !== null ? "Reading tables"
-    : (preview.isFetching && preview.data === undefined) || settled !== current ? "Checking the tables"
+    : (preview.isFetching && preview.data === undefined) || preview.isPlaceholderData || settled !== current ? "Checking the tables"
     : preview.error ? "Fix what the check found first" : draftCreateBlock(reading)
     ?? (summary?.invalid?.length ? "Fix the invalid lines first" : targetBlock(w));
   const confirm = useConfirm();
