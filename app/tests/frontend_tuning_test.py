@@ -75,3 +75,17 @@ def test_reseed_on_new_columns_sits_in_how_it_writes_with_its_reload_cost():
     for name in ("NewJob.tsx", "JobEdit.tsx"):
         text = (PAGES / name).read_text()
         assert 'reseed={<ParameterField name="reseed_on_new_columns"' in text, name
+
+
+def test_a_tuning_flag_such_as_snapshot_isolation_sits_on_the_row_of_the_inputs_beside_it():
+    # "Read changes under snapshot isolation" is a flag beside "Tables per change check", a labelled input: the checkbox
+    # and its label line up with that input box, not with its label above it.
+    form = (PAGES / "jobForm.tsx").read_text()
+    field = form[form.index("export function ParameterField("):]
+    assert '? <label className="checkbox input-row"><input type="checkbox" checked={value === "true"}' in field
+    assert ": <label><span>{label}" in field     # the input beside it: its label above, the box below
+    css = (PAGES.parent / "styles.css").read_text()
+    assert ".form-grid label.checkbox.input-row { align-self: end; min-height: 32px; }" in css
+    assert "min-height: 32px; }" in css[css.index("input, select, textarea {"):]     # an input box's height
+    assert "align-items: start;" in css[css.index(".form-grid {"):]
+    assert 'snapshot_isolation: ["Read changes under snapshot isolation"' in form

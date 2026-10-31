@@ -164,7 +164,8 @@ export function ParameterFields({ params, setParams, options, hostReads = false 
   );
 }
 
-/** One tuning key's field. Advanced configuration shows most keys; How it writes shows reseed_on_new_columns. */
+/** One tuning key's field. Advanced configuration shows most keys; How it writes shows reseed_on_new_columns. A flag is a
+ *  checkbox on the row of the inputs beside it (input-row), not of their labels. */
 export function ParameterField({ name, params, setParams, options }: { name: string; params: Record<string, string>;
                                  setParams: (p: Record<string, string>) => void; options?: Row }) {
   if (!(options?.parameters ?? []).includes(name)) return null;
@@ -181,7 +182,7 @@ export function ParameterField({ name, params, setParams, options }: { name: str
   const resetButton = changed && <button className="ghost link reset" onClick={reset}
     title={`Back to the default${defaults[name] ? `, ${defaults[name]}` : ""}`}>Reset</button>;
   return (options?.flags ?? []).includes(name)
-    ? <label className="checkbox"><input type="checkbox" checked={value === "true"}
+    ? <label className="checkbox input-row"><input type="checkbox" checked={value === "true"}
         onChange={(e) => set(e.target.checked ? "true" : "false")} /> {label}
         {about && <Info label={`About ${label}`}>{about}</Info>}{resetButton}</label>
     : <label><span>{label}{about && <Info label={`About ${label}`}>{about}</Info>}{resetButton}</span>

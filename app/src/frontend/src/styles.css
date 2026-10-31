@@ -338,6 +338,9 @@ details.advanced .compute { margin-top: var(--db-space-4); }
 /* Fields stay inside their card: inputs fill their grid cell and never push past it. */
 .form-grid input, .form-grid select { width: 100%; min-width: 0; box-sizing: border-box; }
 .form-grid label.checkbox input { width: auto; }
+/* A checkbox among labelled fields, as Databricks forms set one: the box and its label on the inputs' row, level with
+   the input boxes beside it, not with their labels above them. */
+.form-grid label.checkbox.input-row { align-self: end; min-height: 32px; }
 .form-grid .emails { max-width: 640px; }
 label.checkbox .help { display: inline; }
 /* Identity columns: as wide as its fields, the action next to them, every cell aligned to the top. */
