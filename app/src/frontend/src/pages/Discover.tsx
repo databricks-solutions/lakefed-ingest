@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { Busy, ErrorBox, Info, Modal, Notice, Pager, Spinner, Tag, Tip, fmtInt, plural, Twisty, useNow } from "../components";
+import { Busy, ErrorBox, Info, Modal, Notice, Pager, Tag, Tip, fmtInt, plural, Twisty, useNow } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
 import { CreateConnectionChoices } from "./CreateConnectionChoices";
@@ -293,15 +293,14 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
   }, [listing.data]);
   const closed = (d: string) => accessOf(seen[d]) === "closed";
   // Through the SQL warehouse, the databases the page shows are checked, and only those: another page or filter checks
-  // its own. The answers stay on the listing in Lakebase, so a database is checked once.
+  // its own. The answers stay on the listing in Lakebase, so a database is checked once. The check runs out of sight:
+  // nothing on the page spins for it while the user chooses.
   const qc = useQueryClient();
-  const [checking, setChecking] = useState(false);
   const shownKey = shown.join("\n");
   useEffect(() => {
     if (!checksOn || discoveryId == null) return;
     let stopped = false;
     (async () => {
-      setChecking(true);
       try {
         for (;;) {
           const step = await api.post<Row>(`/discoveries/${encodeURIComponent(discoveryId)}/access${qs({ connection })}`,
@@ -313,7 +312,7 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
           await wait(1500);
           if (stopped) return;
         }
-      } catch (e) { if (!stopped) setError(e); } finally { if (!stopped) setChecking(false); }
+      } catch (e) { if (!stopped) setError(e); }
     })();
     return () => { stopped = true; };
   }, [checksOn, discoveryId, connection, shownKey, qc]);
@@ -391,10 +390,9 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
     <>
       <p className="muted">Tick the whole server, whole databases, or open a database for its tables.
         {checksOn && <>{" "}<Info>A database the connection's login can't open is greyed out; hover on it for why.</Info></>}</p>
-      <p className="pick-counts"><b>{countsText(counts, total)}</b>{counts.counting && <> <Spinner label="Counting tables" /></>}
+      <p className="pick-counts"><b>{countsText(counts, total)}</b>
         {counts.leftOut > 0 && <span className="muted"> · the whole server leaves out {fmtInt(counts.leftOut)} {plural(counts.leftOut, "database")} the
-          login can't open</span>}
-        {checking && <> <Spinner label="Checking access" /></>}</p>
+          login can't open</span>}</p>
       <div className="toolbar"><input className="search" placeholder="Filter databases, e.g. eng_0" value={filter}
         onChange={(e) => { setFilter(e.target.value); setOffset(0); }} />
         <button className="ghost" onClick={() => setAll(shown.filter((d) => !covered(d) && !closed(d)), "all")}>Select all shown</button></div>
