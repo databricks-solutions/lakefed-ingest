@@ -344,7 +344,7 @@ elsewhere, or whose sink table no longer exists, is reseeded instead of silently
 | Part | Where | What |
 |---|---|---|
 | Backend | `src/main.py` (FastAPI) | JSON API under `/api` (OpenAPI docs at `/api/docs`); serves the built frontend for every other path |
-| Data access | `src/lakebase.py`, `src/jobs.py` | Lakebase (psycopg, SDK-minted credential) and the Jobs API, as the app's service principal |
+| Data access | `src/lakebase.py`, `src/jobs.py` | Lakebase (psycopg, SDK-minted credential, a small pool of idle connections: `LAKEBASE_POOL_IDLE`, 0 = off) and the Jobs API, as the app's service principal |
 | Run poller | `src/run_poller.py` | One poller (every 15 seconds, one instance at a time through an advisory lock) writes the `databricks_run` table; the pages read that table, and it closes the ingest runs whose Databricks run has ended. `RUN_POLLER=0` turns it off on an instance. Until the table exists, the app reads the Jobs API as before |
 | SQL and rules | `src/queries.py` | Every statement (parameterized), form validation, bulk-import review logic |
 | Frontend | `src/frontend/` (React, TypeScript, Vite) | Pages under `src/frontend/src/pages/`; React Router, TanStack Query, AG Grid Community for the grids |
