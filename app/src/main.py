@@ -3171,14 +3171,15 @@ def manage_jobs(request: Request):
 
 @app.get("/api/manage/version")
 def manage_version(request: Request):
-    """Which version of the app runs: the source it was deployed from, and its deployment on Databricks Apps."""
+    """Which version of the app runs: the source it was deployed from, and its deployment on Databricks Apps. Also
+    the SQL warehouse its queries run on, and which setting chose it (warehouse.description)."""
     _refuse(_manage_refusal(_user(request)))
     try:
         deployment, error = jobs.app_deployment(), None
     except Exception as e:
         deployment, error = {}, str(e).split(". ")[0]
     return {"app": jobs.APP_NAME, "version": jobs.APP_VERSION, "deployment": deployment, "error": error,
-            "schema": _schema_state()}
+            "schema": _schema_state(), "warehouse": warehouse.description()}
 
 
 def _schema_state() -> dict:

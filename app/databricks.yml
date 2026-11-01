@@ -72,6 +72,13 @@ variables:
   discovery_warehouse_auto_stop_mins:
     description: Idle minutes before the discovery warehouse stops. It is used only while someone chooses tables.
     default: 5
+  app_warehouse_id:
+    description: Id of a SQL warehouse of your own for the app's queries (the connection test, the database list, the
+      access checks and the table reads through remote_query), say one that runs in your network and reaches sources
+      serverless can't. Blank (the default) uses the bundle's own discovery warehouse. It must be Pro or serverless, on
+      version 2025.35 or above; remote_query doesn't run on a Classic warehouse. The lakefed_ingest_app_grants job gives
+      the app's service principal CAN_USE on it, as whoever runs that job (who needs CAN_MANAGE on the warehouse).
+    default: ""
   jdbc_login_scope:
     description: Secret scope for the JDBC logins users type into the operations app. This bundle creates it, so its
       deployer holds MANAGE; the lakefed_ingest_app_grants job gives the app's service principal WRITE on it and nothing

@@ -29,3 +29,27 @@ export function schemaNote(schema: SchemaState | undefined): { tone: "info" | "w
   }
   return null;
 }
+
+/** The SQL warehouse the app's queries run on, as GET /api/manage/version reports it (warehouse.description). */
+export interface WarehouseInUse {
+  id: string | null;
+  chosen_by: string;
+  name: string | null;
+  type: string | null;
+  serverless: boolean | null;
+  state: string | null;
+  problem: string | null;
+}
+
+/** Serverless, Pro or Classic, as the SQL warehouses page says; "Not known" when the warehouse can't be read. */
+export function warehouseKind(warehouse: WarehouseInUse): string {
+  if (warehouse.serverless) return "Serverless";
+  if (warehouse.type === "PRO") return "Pro";
+  if (warehouse.type === "CLASSIC") return "Classic";
+  return warehouse.type ?? "Not known";
+}
+
+/** Which setting chose the warehouse: the bundle's own, or the bundle's app_warehouse_id variable. */
+export function warehouseChosenBy(warehouse: WarehouseInUse): string {
+  return warehouse.chosen_by === "app_warehouse_id" ? "app_warehouse_id (a warehouse of your own)" : "The bundle's own";
+}

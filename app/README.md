@@ -15,7 +15,7 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 | **Schedules** | Run collections at a cadence (see [Schedules](#schedules)): create, edit, pause, resume and delete schedules; each member's next run, wrapper job, last run, p95 run time, skipped triggers, and warnings for overruns and SLAs a schedule can't meet |
 | **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag, SLA). Filter by collection, text, or failing / SLA breached / no SLA / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection, or switch to reads through a UC connection), **enable**, **disable** or **force a reseed**. Changing `write_mode` needs a new sink in the same edit (an append sink and a merge sink can't share a table) |
 | **Databricks jobs** | Under Schedules and jobs: the Databricks ingestion job's active and recent runs (with the ingestion job that started each); **cancel** a run |
-| **Manage** | Only for those with Can Manage on the app itself (see [Security model](#security-model)): the app's version (the commit it was deployed from, and its active deployment) and the state database's schema version against the app's (see Schema upgrades, under Deploy); **Export as CSV** of one, several or every ingestion job's enabled tables, in the columns Create from one CSV reads, with an `ingestion_job` column naming each line's job (streamed a page at a time, so a 200,000-table export works; one job's lines import as a new ingestion job, and an import refuses a file of several jobs); and the Databricks jobs the app runs, each linked |
+| **Manage** | Only for those with Can Manage on the app itself (see [Security model](#security-model)): the app's version (the commit it was deployed from, and its active deployment) and the state database's schema version against the app's (see Schema upgrades, under Deploy); the SQL warehouse the app's queries run on, read only (its name and id, Pro or serverless, its state, and whether it is the bundle's own or `app_warehouse_id`, with a plain line when it is Classic or can't be read; see Discovery through the SQL warehouse); **Export as CSV** of one, several or every ingestion job's enabled tables, in the columns Create from one CSV reads, with an `ingestion_job` column naming each line's job (streamed a page at a time, so a 200,000-table export works; one job's lines import as a new ingestion job, and an import refuses a file of several jobs); and the Databricks jobs the app runs, each linked |
 | **Changes** | The change log: every add, register, edit, enable / disable and reseed made in the app, with who, what and when |
 | **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop): a JDBC source (host and secret) or a UC connection (`use_remote_query`), `write_mode`, `client_attrs` and `jdbc_options` |
 | **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template, freshness SLA), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
@@ -186,6 +186,14 @@ are the read's own `discovery` and `discovered_table` rows, marked `draft` in `l
 hour per cluster while it runs: at a list price of about 0.70 USD per serverless SQL DBU, about 2.80 USD an hour, about
 5.60 USD with both clusters; it stops after 5 idle minutes, so it costs only while someone chooses tables. Your
 contract's price may differ. The app gets `CAN_USE` on it as an app resource (`WAREHOUSE_ID`).
+
+**A warehouse of your own.** Where serverless can't reach the sources, set the bundle variable `app_warehouse_id` to a
+SQL warehouse that can, say a Pro warehouse that runs in your network. It must be Pro or serverless, on version 2025.35
+or above: `remote_query` doesn't run on a Classic warehouse. The app gets it as `APP_WAREHOUSE_ID` and runs every
+statement above there instead (`warehouse.chosen_warehouse`); blank, the default, keeps the bundle's own. The grants job
+gives the app's service principal `CAN_USE` on it (see Security model). Manage shows the warehouse in use and which
+setting chose it, and says so plainly when it is Classic or can't be read; the app starts either way. See
+[docs/deploy.md](../docs/deploy.md#the-apps-sql-warehouse).
 
 **At a whole server's size** (estimates): a check takes about a second, and only the page shown (100 databases) is
 checked, about 7 seconds at 16 at once whatever the server's size. A read of 1,000 tables is about 2 to 5 seconds per
@@ -382,6 +390,10 @@ The app runs as its own service principal (created with the app):
   the grant for any connection it can't see.
 - **Discovery warehouse:** `CAN_USE` on the bundle's `lakefed_ingest discovery` SQL warehouse, through an app
   resource. The statements run as the service principal, which holds `USE CONNECTION` on the connections above.
+  With `app_warehouse_id` set, the same job also gives it `CAN_USE` on that warehouse, as whoever runs the job, who
+  needs `CAN_MANAGE` on it. The grant adds the app's entry to the warehouse's access list (the Permissions API's
+  update, not its replace), so the other entries stay. A job that may not grant it fails, after the grants above,
+  and says that the warehouse's owner or a workspace admin grants it instead. Blank, nothing is granted.
 - **Azure SQL listing (optional):** for a login that can't open master, Discover's connection test can have the
   discovery job list an Azure SQL server's (or Managed Instance's) databases through Azure Resource Manager instead.
   It takes a Unity Catalog service credential (Catalog Explorer, External data, Credentials) on an access connector
@@ -445,6 +457,9 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
      who deploys.
    - `app_version`: what Manage shows as the version, by default the git commit deployed from. It is blank when the
      bundle is deployed from a folder that isn't a git checkout: pass `--var app_version=<commit>` there.
+   - `app_warehouse_id`: a Pro or serverless SQL warehouse (version 2025.35 or above) of your own for the app's
+     queries, when serverless can't reach the sources; blank keeps the bundle's own (see A warehouse of your own,
+     under Discovery through the SQL warehouse).
 2. Deploy and start the app, then run the grant job. Run these from `app/`, as the user who manages the Lakebase
    instance and owns the tables (whoever ran the ingestion setup). On a first deploy the order matters: the grant job
    needs the app's service principal, which exists only once the app is deployed.
@@ -453,14 +468,14 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
    cd app
    databricks bundle deploy -t <target>
    databricks bundle run lakefed_ingest_app -t <target>          # deploys the code and starts the app
-   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access, USE CONNECTION on source_connections, WRITE on the login scope
+   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access, USE CONNECTION on source_connections, WRITE on the login scope, CAN_USE on app_warehouse_id
    ```
 3. Check the login scope's access list. The grant job sets the app's `WRITE` there (the bundle declares no permission on
    the scope), so the list should show the app's service principal with `WRITE`, the deployer with `MANAGE`, and nothing
    else: `databricks secrets list-acls lakefed_ingest_jdbc_logins -p <profile>`.
 4. Grant `CAN_USE` on the app to your operators, then open the URL printed by `bundle run`.
 
-Re-run the grant job if the app is recreated (new service principal). It also sets the new principal's `WRITE` on the
+Re-run the grant job if the app is recreated (new service principal), or after changing `app_warehouse_id`. It also sets the new principal's `WRITE` on the
 login scope; the old principal's entry stays until you remove it (`databricks secrets delete-acl
 lakefed_ingest_jdbc_logins <old service principal>`). Default privileges cover tables the same owner adds later, so
 schema upgrades don't need it.

@@ -548,10 +548,12 @@ cluster size.
 - **The check** (`lakefed_ingest_check`) runs on serverless by default. A classic job cluster or an existing
   cluster can run it instead. The check reads the sources itself, so whichever compute it uses needs a network
   path to each source.
-- **The operations app's SQL warehouse** is the bundle's own serverless Pro warehouse by default. A customer's
-  Pro or serverless warehouse (version 2025.35 or above) can replace it.
-- No bundle variable switches either one: a task has one compute reference, and YAML has no conditionals. Each
-  alternative is a ready target override in [docs/deploy.md](docs/deploy.md#compute-for-the-check) and
+  No bundle variable switches it: a task has one compute reference, and YAML has no conditionals. Each alternative
+  is a ready target override in [docs/deploy.md](docs/deploy.md#compute-for-the-check).
+- **The operations app's SQL warehouse** is the bundle's own serverless Pro warehouse by default. The app bundle's
+  `app_warehouse_id` variable names a warehouse of your own instead, say a Pro warehouse in your network that reaches
+  sources serverless can't. It must be Pro or serverless, on version 2025.35 or above (`remote_query` doesn't run on
+  a Classic warehouse), and the app's grants job gives the app `CAN_USE` on it. See
   [docs/deploy.md](docs/deploy.md#the-apps-sql-warehouse).
 
 ## Tests
