@@ -294,6 +294,22 @@ def _taken_target(row: dict) -> str:
             + (f" on {server}" if server else ""))
 
 
+def _without_repeated_targets(rows: List[dict], skip_taken: bool) -> List[dict]:
+    """Rows that one insert would give the same target (and client_id) never reach it together: Postgres skips the
+    second as a conflict with the first (on conflict do nothing), and both would find the first's id, so neither would
+    be refused. The second refuses the lot, as a target another table writes does, or with skip_taken is left out."""
+    seen, kept = set(), []
+    for row in rows:
+        key = q.control_sink_key(q.control_params(row))
+        if key in seen:
+            if skip_taken:
+                continue
+            raise HTTPException(409, _taken_target(row))
+        seen.add(key)
+        kept.append(row)
+    return kept
+
+
 def _insert_controls(cur, rows, user, batch, skip_taken=False, progress=None,
                      log_per_statement=q.CONTROL_BATCH) -> List[tuple]:
     """Insert new control rows q.CONTROL_BATCH to a statement, then their "import" change log lines, log_per_statement
@@ -301,6 +317,7 @@ def _insert_controls(cur, rows, user, batch, skip_taken=False, progress=None,
     with skip_taken is left out. Returns (row, id) for each row written; progress(n) is told how many rows are done
     after each statement."""
     _refuse_deleted_databases(cur, rows)
+    rows = _without_repeated_targets(rows, skip_taken)
     written = []
     for at in range(0, len(rows), q.CONTROL_BATCH):
         chunk = rows[at:at + q.CONTROL_BATCH]
