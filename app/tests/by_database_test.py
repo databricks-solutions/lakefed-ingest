@@ -391,6 +391,9 @@ def big(monkeypatch):
 def _big_client(monkeypatch):
     source = Source({("sql_a", f"eng_{i:03d}"): [f"t{t}" for t in range(5)] for i in range(30)})
     store, tasks, fake = Store(), ByDatabaseTasks(), FakeDB()
+    # The earlier Create, a big one written in a task of its own (PREPARE_CREATES=0, the rollback); the Create that
+    # records the job at once and prepares it after is prepare_task_test's.
+    monkeypatch.setattr(main, "PREPARE_CREATES", False)
 
     def query(sql, params=()):
         if sql == q.selected_count_sql("upload"):

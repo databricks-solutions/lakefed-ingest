@@ -40,7 +40,7 @@ def prep(api, monkeypatch):  # noqa: F811
     record (set_prepare_sql), its selection, the reads of its claimed drafts, its groups' tables and logins."""
     store = api.store
     store.selection, store.reads, store.newest_logins, store.controls = {}, {}, {}, {}
-    store.connection_rows, store.claimed = {}, []
+    store.connection_rows, store.claimed, store.failed, store.started = {}, [], {}, []
     base_run, base_query = store.run, store.query
 
     def run(sql, params):
@@ -72,12 +72,22 @@ def prep(api, monkeypatch):  # noqa: F811
                     if key in store.newest_logins]
         if sql == q.claim_rediscovery_sql():
             return run(sql, params)
+        if sql == q.job_failed_reads_sql():
+            rows = store.failed.get(int(params[1]), [])
+            return [dict(r, total=len(rows)) for r in rows]
+        if sql in (q.prepare_read_again_sql(), q.prepare_leave_out_reads_sql()):
+            _, job, every, servers, names = params
+            rows = store.failed.get(int(job), [])
+            hit = [r for r in rows if every or (r["server"], r["src_database"].lower()) in set(zip(servers, names))]
+            store.failed[int(job)] = [r for r in rows if r not in hit]
+            return [dict(r) for r in hit]
         return base_query(sql, params)
 
     store.run, store.query = run, query
     monkeypatch.setattr(main.db, "query", query)
     monkeypatch.setattr(main.db, "execute", lambda sql, params=(): run(sql, params))
     monkeypatch.setattr(main.db, "fetch", lambda cur, sql, params=(): query(sql, params))
+    monkeypatch.setattr(main, "_start_prepare", lambda sid, backoff_s=0.0: store.started.append(sid))
     return api
 
 
@@ -330,7 +340,8 @@ def test_the_page_reads_the_state_the_reads_and_the_set_aside_databases(prep):
     assert shown["reading"]["read"] == 1240 and shown["reading"]["minutes_left"] == 15
     assert [(e["database"], e["kind"]) for e in shown["set_aside"]] == [("eng_1", "unreadable"), ("eng_2", "clash")]
     assert shown["set_aside"][1]["target"] == "main.bronze.orders" and shown["set_aside"][1]["job"] == "Sales nightly"
-    assert shown["actions"] == {"read_again": None, "leave_out": None, "targets": None, "delete": None}
+    assert shown["actions"] == {"read_again": None, "leave_out": None, "targets": None, "delete": None, "stop": None,
+                                "again": None}
 
 
 def test_a_job_made_before_the_record_reads_as_ready_with_nothing_to_act_on(prep):
@@ -341,24 +352,45 @@ def test_a_job_made_before_the_record_reads_as_ready_with_nothing_to_act_on(prep
     assert prep.post(f"/api/ingestion-jobs/{sid}/prepare/leave-out", json={}).status_code == 409
 
 
-def test_read_them_again_marks_the_unreadable_ones(prep):
+def _failed(prep, sid, *databases):
+    """The databases of the job's claimed drafts that couldn't be read, as their rows have them."""
+    prep.store.failed[sid] = [{"server": "sql_a", "src_database": name, "error": "Login failed for user 'ingest'",
+                               "whole_server": False} for name in databases]
+
+
+def test_read_them_again_resets_the_unreadable_rows_for_the_reader(prep):
     sid = _needs_you(prep)
+    _failed(prep, sid, "eng_1")
     marked = prep.post(f"/api/ingestion-jobs/{sid}/prepare/read-again", json={})
     assert marked.status_code == 200 and marked.json()["marked"] == 1 and marked.json()["state"] == p.NEEDS_YOU
-    entry = _record(prep, sid)["set_aside"][p.database_key("sql_a", "eng_1")]
-    assert entry["again"]["by"] == "op@example.com"
+    record = _record(prep, sid)
+    assert p.database_key("sql_a", "eng_1") not in record["set_aside"] and p.counts_of(record)[p.UNREADABLE] == 0
+    assert record["read_again"]["by"] == "op@example.com" and prep.store.failed[sid] == []
     assert any(line[1] == "prepare_read_again" for line in prep.store.log)
+    assert prep.store.started == []          # the clash still waits for a choice: nothing for the task yet
 
 
-def test_leave_them_out_takes_the_named_ones_out_of_the_choice(prep):
+def test_read_them_again_with_nothing_else_waiting_asks_the_prepare_task_to_go_on(prep):
+    sid = _job(prep, stage=p.WRITING, set_aside=[p.entry("sql_a", "eng_1", p.UNREADABLE, "Login failed")])
+    _failed(prep, sid, "eng_1", "eng_3")
+    marked = prep.post(f"/api/ingestion-jobs/{sid}/prepare/read-again",
+                       json={"databases": [{"server": "SQL_A", "database": "ENG_1"}]})
+    assert marked.json()["marked"] == 1 and [r["src_database"] for r in prep.store.failed[sid]] == ["eng_3"]
+    assert marked.json()["state"] == p.PREPARING and prep.store.started == [sid]
+    assert _record(prep, sid)["stage"] == p.READING
+
+
+def test_leave_them_out_takes_the_named_ones_out_of_the_choice_and_the_job_goes_on(prep):
     sid = _needs_you(prep)
+    _failed(prep, sid, "eng_1")
     left = prep.post(f"/api/ingestion-jobs/{sid}/prepare/leave-out",
                      json={"databases": [{"server": "sql_a", "database": "eng_2"}]})
-    assert left.json()["left_out"] == 1 and left.json()["state"] == p.NEEDS_YOU
+    assert left.json()["left_out"] == 1 and left.json()["state"] == p.NEEDS_YOU and prep.store.started == []
     left = prep.post(f"/api/ingestion-jobs/{sid}/prepare/leave-out", json={})
     assert left.json()["left_out"] == 1 and left.json()["state"] == p.PREPARING
     assert p.left_out_keys(sch.options_of(prep.store.schedules[sid])) == {
         p.database_key("sql_a", "eng_1"), p.database_key("sql_a", "eng_2")}
+    assert prep.store.failed[sid] == [] and prep.store.started == [sid]      # its row is marked left out too
 
 
 def test_change_the_target_names_previews_then_stores_only_the_templates(prep):
@@ -374,7 +406,8 @@ def test_change_the_target_names_previews_then_stores_only_the_templates(prep):
     assert applied.json()["applied"] is True and applied.json()["replan"] == 1
     record = _record(prep, sid)
     assert record["settings"] == {**SETTINGS, "sink_table": "{table}_v2"}
-    assert record["set_aside"][p.database_key("sql_a", "eng_2")]["replan"]["by"] == "op@example.com"
+    assert p.database_key("sql_a", "eng_2") not in record["set_aside"] and p.counts_of(record)[p.CLASH] == 0
+    assert record["targets_changed"]["by"] == "op@example.com"
 
 
 def test_the_set_aside_actions_need_can_manage_on_the_job_as_its_edits_do(prep, monkeypatch):

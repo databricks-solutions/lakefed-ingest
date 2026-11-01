@@ -7,6 +7,12 @@ A job goes through three states, kept on its record in the job's options (OPTION
 - Needs you: some of its databases are set aside, each with why (it couldn't be read, or its tables clash with another
   job's or with each other), until someone reads them again, leaves them out, or changes the job's target names;
 - Ready: it runs as any job does.
+Stop preparing (or Delete) stops a job that isn't Ready where it is (stopped, with why and by whom), and so does a check
+its write refused; Prepare again goes on from there.
+
+The record stays small, as every page of jobs reads it: whole counts of the set-aside databases by kind (counts), every
+clash, and only the first LISTED of the others. The rest of those that couldn't be read are on the job's claimed draft
+rows, which its page lists a page at a time.
 
 A job with no record is Ready: every job made before the record. The record also keeps what Create was asked for (the
 settings, the sizing, the secret scope and the source) and who asked (the maker), so the write, which may run later on
@@ -138,12 +144,14 @@ def with_turn_on(record: dict, turn_on: bool, user: str, now: Optional[datetime]
 
 def words(options: Optional[dict]) -> str:
     """Where the job stands, in a few words for a refusal: "preparing: reading tables", "needs you: 3 databases set
-    aside", or "ready"."""
+    aside", "stopped: ...", or "ready"."""
     state = state_of(options)
     if state == READY:
         return "ready"
+    if stopped_of(options):
+        return "stopped: Prepare again goes on from where it stopped"
     if state == NEEDS_YOU:
-        waiting = len(waiting_entries(record_of(options)))
+        waiting = waiting_count(record_of(options))
         return f"needs you: {waiting:,} {'database' if waiting == 1 else 'databases'} set aside"
     return f"preparing: {STAGE_WORDS.get(stage_of(options) or READING, STAGE_WORDS[READING])}"
 
@@ -210,11 +218,26 @@ def entry(server: str, database: str, kind: str, why: str, target: Optional[str]
             "job": job, "at": _now(now)}
 
 
+def counts_of(record: Optional[dict]) -> Dict[str, int]:
+    """How many databases are set aside, by kind. The prepare task stores the whole counts (COUNTED), as the record keeps
+    every clash but only the first LISTED of the others; a record without them counts its entries."""
+    record = record or {}
+    stored = record.get("counts")
+    if isinstance(stored, dict):
+        return {kind: max(0, int(stored.get(kind) or 0)) for kind in KINDS}
+    entries = (record.get("set_aside") or {}).values()
+    return {kind: sum(1 for e in entries if e.get("kind") == kind) for kind in KINDS}
+
+
+def waiting_count(record: Optional[dict]) -> int:
+    """How many set-aside databases wait for someone's choice: those that couldn't be read, and those that clash."""
+    counts = counts_of(record)
+    return sum(counts[kind] for kind in NEEDS_ACTION)
+
+
 def waiting_entries(record: Optional[dict]) -> List[dict]:
-    """The set-aside databases that wait for someone's choice: couldn't be read, or clash, and not yet marked to be read
-    again or planned again."""
-    return [e for e in ((record or {}).get("set_aside") or {}).values()
-            if e.get("kind") in NEEDS_ACTION and not e.get("again") and not e.get("replan")]
+    """The set-aside databases the record lists that wait for someone's choice: couldn't be read, or clash."""
+    return [e for e in ((record or {}).get("set_aside") or {}).values() if e.get("kind") in NEEDS_ACTION]
 
 
 def refreshed(record: dict, now: Optional[datetime] = None) -> dict:
@@ -223,84 +246,150 @@ def refreshed(record: dict, now: Optional[datetime] = None) -> dict:
     out = dict(record)
     if out.get("state") == READY:
         return out
-    out["state"] = NEEDS_YOU if waiting_entries(out) else PREPARING
+    out["state"] = NEEDS_YOU if waiting_count(out) else PREPARING
     out["updated_at"] = _now(now)
     return out
 
 
-def with_set_aside(record: dict, entries: Iterable[dict], now: Optional[datetime] = None) -> dict:
-    """The record with these databases set aside (each replacing an earlier one of the same database), and its state
-    refreshed. A database already left out stays out."""
-    set_aside = dict(record.get("set_aside") or {})
-    left_out = record.get("left_out") or {}
+def _counted(set_aside: dict, counts: Optional[dict]) -> dict:
+    """The counts to store: those given, or the entries' own."""
+    if counts is not None:
+        return {kind: max(0, int(counts.get(kind) or 0)) for kind in KINDS}
+    return {kind: sum(1 for e in set_aside.values() if e.get("kind") == kind) for kind in KINDS}
+
+
+def _kept_entries(entries: Iterable[dict], left_out: dict) -> Dict[str, dict]:
+    """The entries by database key, less those left out: every clash, and the first LISTED of the others by name."""
+    clashes, others = {}, {}
     for item in entries:
         key = database_key(item["server"], item["database"])
         if key not in left_out:
-            set_aside[key] = dict(item)
-    return refreshed(dict(record, set_aside=set_aside), now)
+            (clashes if item.get("kind") == CLASH else others)[key] = dict(item)
+    listed = sorted(others, key=lambda k: (str(others[k].get("server") or "").lower(),
+                                           str(others[k].get("database") or "").lower()))[:LISTED]
+    return {**clashes, **{k: others[k] for k in listed}}
+
+
+def with_set_aside(record: dict, entries: Iterable[dict], now: Optional[datetime] = None,
+                   counts: Optional[dict] = None) -> dict:
+    """The record with these databases set aside as well (each replacing an earlier one of the same database), and its
+    state refreshed. A database already left out stays out. counts are the whole counts by kind when the entries are
+    only the first of them (the record keeps every clash, and the first LISTED of the rest)."""
+    left_out = record.get("left_out") or {}
+    set_aside = _kept_entries(list((record.get("set_aside") or {}).values()) + list(entries), left_out)
+    return refreshed(dict(record, set_aside=set_aside, counts=_counted(set_aside, counts)), now)
+
+
+def found(record: dict, entries: Iterable[dict], counts: Dict[str, int], now: Optional[datetime] = None) -> dict:
+    """The record with what a prepare pass found set aside, in place of what an earlier pass found: each pass reads and
+    plans again every database not written yet, so its findings are the whole list. counts are the whole counts by
+    kind (only the first LISTED of the unreadable and closed ones are kept as entries; every clash is)."""
+    left_out = record.get("left_out") or {}
+    set_aside = _kept_entries(entries, left_out)
+    return refreshed(dict(record, set_aside=set_aside, counts=_counted(set_aside, counts)), now)
 
 
 def cleared(record: dict, keys: Iterable[str], now: Optional[datetime] = None) -> dict:
-    """The record once the prepare task has read or planned these databases again and taken them: off the list."""
-    set_aside = {k: v for k, v in (record.get("set_aside") or {}).items() if k not in set(keys)}
-    return refreshed(dict(record, set_aside=set_aside), now)
-
-
-def _chosen(record: dict, keys: Optional[Iterable[str]], kinds: Iterable[str]) -> List[str]:
-    """The set-aside databases an action names (all of its kinds when keys is None) that are there and of those kinds."""
-    set_aside = record.get("set_aside") or {}
-    wanted = set_aside if keys is None else [k for k in dict.fromkeys(keys) if k in set_aside]
-    return [k for k in wanted if set_aside[k].get("kind") in set(kinds)]
-
-
-def read_again(record: dict, keys: Optional[Iterable[str]], user: str,
-               now: Optional[datetime] = None) -> tuple:
-    """Read them again: the databases that couldn't be read (those named, or all of them) are marked to be read again,
-    and the job is Preparing again when none waits for a choice. The read itself is the prepare task's. Returns
-    (the record, how many were marked)."""
-    chosen = _chosen(record, keys, (UNREADABLE,))
-    at = _now(now)
+    """The record once these databases are taken after all: off the list, and off the counts."""
+    gone = set(keys)
     set_aside = dict(record.get("set_aside") or {})
-    for key in chosen:
-        set_aside[key] = dict(set_aside[key], again={"by": user or None, "at": at})
-    out = refreshed(dict(record, set_aside=set_aside), now)
-    if chosen and out["state"] == PREPARING:
+    counts = counts_of(record)
+    for key in gone & set(set_aside):
+        counts[set_aside.pop(key)["kind"]] -= 1
+    return refreshed(dict(record, set_aside=set_aside, counts=_counted(set_aside, counts)), now)
+
+
+def asked(record: dict) -> dict:
+    """The record with one more request for the prepare task to go on (asks), so a pass that started before it runs
+    once more when it ends."""
+    return dict(record, asks=int(record.get("asks") or 0) + 1)
+
+
+def read_again(record: dict, keys: Optional[Iterable[str]], user: str, reset: int,
+               now: Optional[datetime] = None) -> tuple:
+    """Read them again: the databases that couldn't be read (those named, or all of them) were reset for the reader to
+    take (reset of them); they come off the list, and the job is Preparing again when none waits for a choice. The read
+    itself is the prepare task's. Returns (the record, reset)."""
+    set_aside = dict(record.get("set_aside") or {})
+    counts = counts_of(record)
+    named = None if keys is None else set(keys)
+    for key in [k for k, e in set_aside.items() if e.get("kind") == UNREADABLE and (named is None or k in named)]:
+        set_aside.pop(key)
+    counts[UNREADABLE] = 0 if named is None else max(0, counts[UNREADABLE] - int(reset))
+    out = refreshed(asked(dict(record, set_aside=set_aside, counts=counts)), now)
+    if reset and out["state"] == PREPARING:
         out["stage"] = READING
-    return out, len(chosen)
+    out["read_again"] = {"by": user or None, "at": _now(now), "databases": int(reset)}
+    return out, int(reset)
 
 
-def leave_out(record: dict, keys: Optional[Iterable[str]], user: str, now: Optional[datetime] = None) -> tuple:
-    """Leave them out: the set-aside databases named (or all that wait for a choice) come out of the job's choice: off
-    the set-aside list, onto the left-out one, which the write and a later re-discovery leave out. The job goes on.
-    Returns (the record, how many were left out)."""
-    chosen = _chosen(record, keys, NEEDS_ACTION) if keys is not None else [
-        database_key(e["server"], e["database"]) for e in waiting_entries(record)]
+def leave_out(record: dict, entries: Iterable[dict], user: str, now: Optional[datetime] = None) -> tuple:
+    """Leave them out: these set-aside databases (entries, each with its server, database and kind) come out of the
+    job's choice: off the set-aside list and its counts, onto the left-out one, which the write and a later re-discovery
+    leave out. The job goes on. Returns (the record, how many were left out)."""
     at = _now(now)
     set_aside = dict(record.get("set_aside") or {})
     left_out = dict(record.get("left_out") or {})
-    for key in chosen:
-        left_out[key] = dict(set_aside.pop(key), left_out={"by": user or None, "at": at})
-    return refreshed(dict(record, set_aside=set_aside, left_out=left_out), now), len(chosen)
+    counts = counts_of(record)
+    taken = 0
+    for item in entries:
+        key = database_key(item["server"], item["database"])
+        if key in left_out or item.get("kind") not in NEEDS_ACTION:
+            continue
+        set_aside.pop(key, None)
+        counts[item["kind"]] = max(0, counts[item["kind"]] - 1)
+        left_out[key] = {"server": item["server"], "database": item["database"], "kind": item["kind"],
+                         "left_out": {"by": user or None, "at": at}}
+        taken += 1
+    out = refreshed(asked(dict(record, set_aside=set_aside, left_out=left_out, counts=counts)), now)
+    return out, taken
 
 
 def change_targets(record: dict, templates: dict, user: str, now: Optional[datetime] = None) -> tuple:
     """Change the job's target names: only the target templates given (TARGET_FIELDS) change in the record's settings,
-    and the databases set aside for a clash are marked to be planned again with them, by the prepare task. Returns
-    (the record, how many were marked)."""
+    and the databases set aside for a clash come off the list, to be planned again with them by the prepare task.
+    Returns (the record, how many clashes there were)."""
     at = _now(now)
     settings = dict(record.get("settings") or {})
     settings.update({k: templates[k] for k in TARGET_FIELDS if k in templates})
-    set_aside = dict(record.get("set_aside") or {})
-    marked = 0
-    for key, item in set_aside.items():
-        if item.get("kind") == CLASH:
-            set_aside[key] = dict(item, replan={"by": user or None, "at": at})
-            marked += 1
-    out = dict(record, settings=settings, set_aside=set_aside, targets_changed={"by": user or None, "at": at})
-    out = refreshed(out, now)
-    if marked and out["state"] == PREPARING:
+    set_aside = {k: e for k, e in (record.get("set_aside") or {}).items() if e.get("kind") != CLASH}
+    counts = counts_of(record)
+    clashes = counts[CLASH]
+    counts[CLASH] = 0
+    out = dict(record, settings=settings, set_aside=set_aside, counts=counts, targets_changed={"by": user or None,
+                                                                                              "at": at})
+    out = refreshed(asked(out), now)
+    if clashes and out["state"] == PREPARING:
         out["stage"] = WRITING
-    return out, marked
+    return out, clashes
+
+
+def stopped(record: dict, user: str, why: str, now: Optional[datetime] = None) -> dict:
+    """The record once its preparation stopped: Stop preparing (or Delete) by a user, or a check the write refused (the
+    maker lost a right since Create, a login typed again for another connection). The job stays paused with its choice
+    and what was read; nothing goes on until Prepare again."""
+    return dict(record, stopped={"by": user or None, "at": _now(now), "why": str(why or "")[:2000]},
+                updated_at=_now(now))
+
+
+def restarted(record: dict, now: Optional[datetime] = None) -> dict:
+    """Prepare again: the record no longer stopped, and the task asked to go on from where it stopped."""
+    out = {k: v for k, v in record.items() if k != "stopped"}
+    return refreshed(asked(out), now)
+
+
+def stopped_of(options: Optional[dict]) -> Optional[dict]:
+    """Why and by whom the job's preparation stopped, or None while it goes on (or once it is Ready)."""
+    record = record_of(options)
+    if not record or state_of(options) == READY:
+        return None
+    return record.get("stopped") or None
+
+
+def has_work(record: Optional[dict]) -> bool:
+    """Whether the prepare task has something to do for this record: it isn't Ready, it isn't stopped, and nothing
+    waits for a choice (Needs you waits for one of its actions, which asks the task to go on)."""
+    return bool(record) and record.get("state") == PREPARING and not record.get("stopped")
 
 
 def left_out_keys(options: Optional[dict]) -> Set[str]:
@@ -378,9 +467,8 @@ def view(options: Optional[dict], reads: Optional[dict] = None) -> dict:
     state = state_of(options)
     set_aside = list((record.get("set_aside") or {}).values())
     left_out = list((record.get("left_out") or {}).values())
-    waiting = waiting_entries(record)
-    by_kind = {kind: sum(1 for e in set_aside if e.get("kind") == kind) for kind in KINDS}
-    waiting_by_kind = {f"waiting_{kind}": sum(1 for e in waiting if e.get("kind") == kind) for kind in NEEDS_ACTION}
+    by_kind = counts_of(record)
+    waiting_by_kind = {f"waiting_{kind}": by_kind[kind] for kind in NEEDS_ACTION}
     settings = record.get("settings") or {}
     return {"state": state, "stage": stage_of(options), "words": words(options),
             "recorded": bool(record), "made_at": record.get("made_at"), "ready_at": record.get("ready_at"),
@@ -390,8 +478,9 @@ def view(options: Optional[dict], reads: Optional[dict] = None) -> dict:
             "reading": reading_view(reads) if state != READY else None,
             "progress": record.get("progress") or {},
             "set_aside": _listed(set_aside), "left_out": _listed(left_out),
-            "counts": {"set_aside": len(set_aside), "waiting": len(waiting), **waiting_by_kind, **by_kind,
-                       "left_out": len(left_out)}}
+            "stopped": stopped_of(options), "listed": LISTED,
+            "counts": {"set_aside": sum(by_kind.values()), "waiting": waiting_count(record), **waiting_by_kind,
+                       **by_kind, "left_out": len(left_out)}}
 
 
 def summary(options: Optional[dict]) -> dict:
@@ -399,7 +488,8 @@ def summary(options: Optional[dict]) -> dict:
     words, whether its schedule turns on when it is ready, and how many databases wait for a choice."""
     record = record_of(options) or {}
     return {"state": state_of(options), "stage": stage_of(options), "words": words(options),
-            "turn_on": bool(record.get("turn_on")), "waiting": len(waiting_entries(record))}
+            "turn_on": bool(record.get("turn_on")), "waiting": waiting_count(record),
+            "stopped": bool(stopped_of(options))}
 
 
 def status_cell(options: Optional[dict]) -> Optional[dict]:
@@ -409,8 +499,10 @@ def status_cell(options: Optional[dict]) -> Optional[dict]:
     if state == READY:
         return None
     record = record_of(options) or {}
+    if stopped_of(options):
+        return {"label": "Stopped", "tone": "warn", "cause": None, "detail": ["Prepare again goes on"]}
     if state == NEEDS_YOU:
-        waiting = len(waiting_entries(record))
+        waiting = waiting_count(record)
         return {"label": "Needs you", "tone": "warn", "cause": None,
                 "detail": [f"{waiting:,} {'database' if waiting == 1 else 'databases'} set aside"]}
     progress = record.get("progress") or {}

@@ -116,44 +116,67 @@ def test_one_the_login_cant_open_in_a_whole_server_choice_is_only_left_out_and_l
     assert p.view(_options(record))["counts"]["closed"] == 1
 
 
-def test_read_them_again_marks_only_the_unreadable_and_the_job_prepares_again():
+def test_read_them_again_takes_only_the_unreadable_off_the_list_and_the_job_prepares_again():
     record = p.with_set_aside(p.moved(_record(), stage=p.WRITING), [_unreadable("eng_1"), _unreadable("eng_3")])
-    once, marked = p.read_again(record, [p.database_key("sql_a", "eng_1")], "bob", now=NOW)
-    assert marked == 1 and p.state_of(_options(once)) == p.NEEDS_YOU
-    assert once["set_aside"][p.database_key("sql_a", "eng_1")]["again"] == {"by": "bob", "at": NOW.isoformat()}
-    every, marked = p.read_again(record, None, "bob", now=NOW)
-    assert marked == 2 and p.state_of(_options(every)) == p.PREPARING and p.stage_of(_options(every)) == p.READING
+    once, reset = p.read_again(record, [p.database_key("sql_a", "eng_1")], "bob", reset=1, now=NOW)
+    assert reset == 1 and p.state_of(_options(once)) == p.NEEDS_YOU
+    assert list(once["set_aside"]) == [p.database_key("sql_a", "eng_3")] and p.counts_of(once)[p.UNREADABLE] == 1
+    assert once["read_again"] == {"by": "bob", "at": NOW.isoformat(), "databases": 1} and once["asks"] == 1
+    every, reset = p.read_again(record, None, "bob", reset=2, now=NOW)
+    assert reset == 2 and p.state_of(_options(every)) == p.PREPARING and p.stage_of(_options(every)) == p.READING
     clash = p.with_set_aside(_record(), [_clash("eng_2")])
-    assert p.read_again(clash, None, "bob")[1] == 0
+    out, reset = p.read_again(clash, None, "bob", reset=0)
+    assert reset == 0 and p.state_of(_options(out)) == p.NEEDS_YOU
 
 
 def test_leave_them_out_takes_them_out_of_the_choice_and_the_job_goes_on():
     record = p.with_set_aside(_record(), [_unreadable("eng_1"), _clash("eng_2")])
-    out, left = p.leave_out(record, [p.database_key("sql_a", "eng_2"), p.database_key("sql_a", "nope")], "bob", now=NOW)
-    assert left == 1 and p.state_of(_options(out)) == p.NEEDS_YOU
+    out, left = p.leave_out(record, [_clash("eng_2"), p.entry("sql_a", "hr", p.CLOSED, "no access")], "bob", now=NOW)
+    assert left == 1 and p.state_of(_options(out)) == p.NEEDS_YOU      # a closed one is never left out by hand
     assert p.left_out_keys(_options(out)) == {p.database_key("sql_a", "eng_2")}
     assert out["left_out"][p.database_key("sql_a", "eng_2")]["left_out"] == {"by": "bob", "at": NOW.isoformat()}
-    out, left = p.leave_out(out, None, "bob")
+    out, left = p.leave_out(out, [_unreadable("eng_1")], "bob")
     assert left == 1 and p.state_of(_options(out)) == p.PREPARING and out["set_aside"] == {}
+    assert p.counts_of(out) == {p.UNREADABLE: 0, p.CLASH: 0, p.CLOSED: 0}
     again = p.with_set_aside(out, [_unreadable("eng_1")])      # left out, it stays out
     assert again["set_aside"] == {}
 
 
-def test_change_the_target_names_changes_only_the_templates_and_marks_the_clashes_to_plan_again():
+def test_change_the_target_names_changes_only_the_templates_and_takes_the_clashes_off_the_list():
     record = p.with_set_aside(p.moved(_record(), stage=p.WRITING), [_clash("eng_2"), _unreadable("eng_1")])
-    out, marked = p.change_targets(record, {"sink_schema": "bronze_{server}", "load_type": "full"}, "bob", now=NOW)
-    assert marked == 1 and out["settings"] == {**SETTINGS, "sink_schema": "bronze_{server}"}
-    assert out["set_aside"][p.database_key("sql_a", "eng_2")]["replan"]["by"] == "bob"
+    out, clashes = p.change_targets(record, {"sink_schema": "bronze_{server}", "load_type": "full"}, "bob", now=NOW)
+    assert clashes == 1 and out["settings"] == {**SETTINGS, "sink_schema": "bronze_{server}"}
+    assert list(out["set_aside"]) == [p.database_key("sql_a", "eng_1")] and out["targets_changed"]["by"] == "bob"
     assert p.state_of(_options(out)) == p.NEEDS_YOU          # the unreadable one still waits
-    out, _ = p.leave_out(out, None, "bob")
+    out, _ = p.leave_out(out, [_unreadable("eng_1")], "bob")
     assert p.state_of(_options(out)) == p.PREPARING and p.stage_of(_options(out)) == p.WRITING
 
 
-def test_the_prepare_task_clears_a_database_once_it_is_taken():
+def test_a_pass_replaces_what_the_last_one_found_keeping_every_clash_and_the_first_of_the_rest(monkeypatch):
+    monkeypatch.setattr(p, "LISTED", 2)
+    record = p.with_set_aside(_record(), [_unreadable("eng_9")])
+    entries = [_unreadable(f"eng_{i}") for i in range(5)] + [_clash(f"hr_{i}") for i in range(3)]
+    out = p.found(record, entries, {p.UNREADABLE: 40, p.CLASH: 3, p.CLOSED: 7})
+    assert sorted(e["database"] for e in out["set_aside"].values()) == ["eng_0", "eng_1", "hr_0", "hr_1", "hr_2"]
+    assert p.counts_of(out) == {p.UNREADABLE: 40, p.CLASH: 3, p.CLOSED: 7} and p.waiting_count(out) == 43
+    assert p.words(_options(out)) == "needs you: 43 databases set aside"
+
+
+def test_a_database_taken_after_all_comes_off_the_list_and_its_count():
     record = p.with_set_aside(_record(), [_unreadable("eng_1")])
-    record, _ = p.read_again(record, None, "bob")
     record = p.cleared(record, [p.database_key("sql_a", "eng_1")])
-    assert record["set_aside"] == {} and p.state_of(_options(record)) == p.PREPARING
+    assert record["set_aside"] == {} and p.state_of(_options(record)) == p.PREPARING and p.waiting_count(record) == 0
+
+
+def test_stop_preparing_keeps_the_record_until_prepare_again_and_the_task_has_nothing_to_do_meanwhile():
+    record = p.stopped(_record(), "bob", "stopped by bob", now=NOW)
+    options = _options(record)
+    assert p.stopped_of(options) == {"by": "bob", "at": NOW.isoformat(), "why": "stopped by bob"}
+    assert p.words(options) == "stopped: Prepare again goes on from where it stopped" and not p.has_work(record)
+    assert p.status_cell(options)["label"] == "Stopped" and p.summary(options)["stopped"] is True
+    again = p.restarted(record)
+    assert "stopped" not in again and p.has_work(again) and again["asks"] == 1
+    assert not p.has_work(p.ready(again)) and p.stopped_of(_options(p.ready(record))) is None
 
 
 def test_a_ready_job_stays_ready_whatever_is_set_aside():
@@ -162,7 +185,7 @@ def test_a_ready_job_stays_ready_whatever_is_set_aside():
 
 
 def test_a_rediscovery_leaves_out_the_databases_the_job_left_out():
-    record, _ = p.leave_out(p.with_set_aside(_record(), [_unreadable("Eng_1")]), None, "bob")
+    record, _ = p.leave_out(p.with_set_aside(_record(), [_unreadable("Eng_1")]), [_unreadable("Eng_1")], "bob")
     rows = [{"server": "sql_a", "src_database": "eng_1"}, {"server": "sql_a:1433", "src_database": "ENG_1"},
             {"server": "sql_a", "src_database": "eng_2"}]
     assert p.without_left_out(rows, _options(record)) == [{"server": "sql_a", "src_database": "eng_2"}]
@@ -211,7 +234,7 @@ def test_the_page_view_counts_the_reads_and_lists_what_is_set_aside():
 
 def test_the_view_lists_at_most_LISTED_databases_but_counts_them_all(monkeypatch):
     monkeypatch.setattr(p, "LISTED", 2)
-    record = p.with_set_aside(_record(), [_unreadable(f"eng_{i}") for i in range(5)])
+    record = p.with_set_aside(_record(), [_unreadable(f"eng_{i}") for i in range(5)], counts={p.UNREADABLE: 5})
     shown = p.view(_options(record))
     assert len(shown["set_aside"]) == 2 and shown["counts"]["set_aside"] == 5
 
@@ -231,7 +254,8 @@ def test_pause_while_preparing_keeps_the_schedule_off_once_ready():
     record = p.with_turn_on(_record(), False, "bob", now=NOW)
     assert record["turn_on"] is False and record["turn_on_by"] is None
     assert p.summary(_options(record)) == {"state": p.PREPARING, "stage": p.READING,
-                                           "words": "preparing: reading tables", "turn_on": False, "waiting": 0}
+                                           "words": "preparing: reading tables", "turn_on": False, "waiting": 0,
+                                           "stopped": False}
 
 
 def test_an_unknown_kind_of_set_aside_database_is_refused():

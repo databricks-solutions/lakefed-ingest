@@ -70,8 +70,11 @@ def test_a_discarded_draft_cant_be_created_from(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_database_lines(monkeypatch):
-    """A choice by reference to discoveries has no CSV lines naming only a database (they would be read by name)."""
+    """A choice by reference to discoveries has no CSV lines naming only a database (they would be read by name). The
+    Create here is the earlier one, which waits for the read in a task of its own (PREPARE_CREATES=0, the rollback);
+    the one that records the job at once is prepare_task_test's."""
     monkeypatch.setattr(main, "_has_database_lines", lambda source: False)
+    monkeypatch.setattr(main, "PREPARE_CREATES", False)
 
 
 def _body(dry_run):

@@ -17,7 +17,10 @@ DETAILS = {"select_list": "id, a", "primary_key": "id"}
 
 
 @pytest.fixture(autouse=True)
-def _no_database_reads_kept():
+def _no_database_reads_kept(monkeypatch):
+    # The earlier Create, which discovers the lines in a task of its own (PREPARE_CREATES=0, the rollback); the one
+    # that records the job at once and reads them in its preparation is prepare_task_test's.
+    monkeypatch.setattr(main, "PREPARE_CREATES", False)
     main._database_reads.clear()
     yield
     main._database_reads.clear()

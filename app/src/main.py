@@ -64,8 +64,9 @@ async def _lifespan(_app: FastAPI):
     instance runs one, and only the one holding the poller's lock polls; RUN_POLLER=0 turns it off on this instance),
     the re-discovery scheduler (REDISCOVERY_TICK_S; 0 leaves it off), the background reader, which keeps the reads
     through the SQL warehouse going whether a page is open or not (background_reads; BACKGROUND_READS=0 turns it off on
-    this instance, and the pages' steps take the reads instead), and the schema upgrade check, once, which starts the
-    setup job when the state database is behind (schema_upgrade; SCHEMA_UPGRADE=0 turns it off)."""
+    this instance, and the pages' steps take the reads instead), the schema upgrade check, once, which starts the
+    setup job when the state database is behind (schema_upgrade; SCHEMA_UPGRADE=0 turns it off), and the look for jobs
+    whose preparation no thread holds, which starts it again (_prepare_resumer; PREPARE_RESUME_S=0 turns it off)."""
     if os.environ.get("RUN_POLLER", "1") != "0":
         run_poller.POLLER.start(on_change=_forget_shared_reads)
     if os.environ.get("BACKGROUND_READS", "1") != "0" and warehouse.configured():
@@ -75,6 +76,8 @@ async def _lifespan(_app: FastAPI):
                              lambda job_id: jobs.run_now(job_id, {}))
     if REDISCOVERY_TICK_S > 0:
         threading.Thread(target=_rediscovery_scheduler, daemon=True, name="lakefed-app-rediscovery").start()
+    if PREPARE_RESUME_S > 0:
+        threading.Thread(target=_prepare_resumer, daemon=True, name="lakefed-app-prepare-resume").start()
     yield
 
 
@@ -4630,6 +4633,9 @@ class ChunkJob:
     log_members: bool = True
     # The JDBC connection the job reads through (its rows are held to it), or None (a row read by host is a manager's).
     connection: Optional[dict] = None
+    # The checks of the rows each transaction writes, check(cur, rows), in place of _refuse_job_rows: a prepare task's
+    # (_prepare_checks), which reads the job's maker and its connection again as they are then.
+    check: Optional[object] = None
 
 
 def _schedule_create_line(job: ChunkJob, group: str) -> tuple:
@@ -4658,7 +4664,10 @@ def _write_chunk(cur, plans: List[dict], job: ChunkJob, state: dict) -> None:
             if (str(row.get("src_database") or "").lower(), line["sink"], str(row.get("client_id") or ""),
                 row["task_collection"]) not in have]
     if todo:
-        _refuse_job_rows(todo, job.connection, job.user, cur=cur)
+        if job.check is not None:
+            job.check(cur, todo)
+        else:
+            _refuse_job_rows(todo, job.connection, job.user, cur=cur)
         _insert_controls(cur, todo, job.user, job.batch, log_per_statement=by_database.TABLES_PER_TRANSACTION)
         _refuse_mixed_sinks(cur, todo)
         _refuse_split_databases(cur, todo)
@@ -4974,17 +4983,25 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
 
 @app.post("/api/ingestion-jobs")
 def create_ingestion_job(body: NewJobRequest, request: Request):
-    """Preview (dry_run, the default) or create an ingestion job in one go, as New ingestion job does: its tables from
-    a CSV of where each one is (new_job.plan), written with the job's settings into groups per server, and the job
-    (a schedule with those groups). Creating is one transaction: the schedule, every table (all or nothing: a target
-    another table writes refuses the lot), the groups' members; then its Databricks jobs are synced. The tables come
-    as CSV lines (csv) or by reference to an upload or discovery (source), which is kept with the job. A source of more
-    than BACKGROUND_ROWS tables is written database by database in a background task (_create_by_database).
+    """Preview (dry_run, the default) or create an ingestion job, as New ingestion job does: its tables from a CSV of
+    where each one is (new_job.plan), written with the job's settings into groups per server, and the job (a schedule
+    with those groups). The tables come as CSV lines (csv) or by reference to an upload or discovery (source), which is
+    kept with the job.
 
-    Chosen from a draft whose read hasn't ended (the tables are read as they are chosen), a preview counts what is read
-    so far and says how far the read is (reading), and a Create waits for the read in a background task, with its
-    progress, then writes (_create_after_reading). A database that couldn't be read stops it by name first."""
-    reading = _draft_reading(body.source) if body.source is not None and not _has_database_lines(body.source) else None
+    A Create from CSV lines, or from a source whose tables are all read, of BACKGROUND_ROWS tables or fewer, is one
+    transaction: the schedule, every table (all or nothing: a target another table writes refuses the lot), the groups'
+    members; then its Databricks jobs are synced, and the job is Ready when Create answers. Any other Create (its
+    tables still read, a database that couldn't be read, more than BACKGROUND_ROWS tables, or a file with database-only
+    lines) records the job at once and answers with its id (_create_preparing); its prepare task reads, writes and
+    syncs it, setting aside a database it can't take. A preview of a draft whose read hasn't ended counts what is read
+    so far and says how far the read is (reading)."""
+    database_lines = body.source is not None and _has_database_lines(body.source)
+    reading = _draft_reading(body.source) if body.source is not None and not database_lines else None
+    if not body.dry_run and PREPARE_CREATES and body.source is not None:
+        if reading and reading["discarded"]:
+            raise HTTPException(422, {"errors": _draft_problems({**reading, "failed": 0, "failed_databases": []})})
+        if database_lines or reading or _selected_tables(body.source) > BACKGROUND_ROWS:
+            return _create_preparing(body, request, database_lines=database_lines)
     if not body.dry_run and reading:
         problems = _draft_problems(reading)
         if problems:
@@ -4995,6 +5012,13 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     if body.dry_run and reading and isinstance(result, dict):
         result["reading"] = reading
     return result
+
+
+def _selected_tables(selection: Selection) -> int:
+    """How many tables a selection takes from its source, counted in Lakebase."""
+    kind, param, _, rest = _selection_params(selection)
+    counted = db.query(q.selected_count_sql(kind), (param, *rest))
+    return int(counted[0]["n"]) if counted else 0
 
 
 def _create_now(body: NewJobRequest, request: Request, inline=None):
@@ -5218,11 +5242,12 @@ def _create_after_discovery(body: NewJobRequest, request: Request, progress, tas
 
 
 # ---- a new job's preparation (preparing.py): its state, what Create was asked for, its set-aside databases ----------
-# Today's Create writes every table before it answers, so the job it makes is Ready at once; its record keeps what it
-# was asked for and by whom. Stage B's prepare task, which records the job at once and writes it later, plugs in here:
-# it moves the record with _move_prepare (stage and progress), sets aside what it can't take with _set_aside (and takes
-# a database off the list with _clear_set_aside once it is read or planned again), runs _prepare_checks before its
-# write and inside each of its transactions, and ends with _make_ready once the job's Databricks jobs are made.
+# A Create whose tables are all read, of BACKGROUND_ROWS tables or fewer, or from CSV lines in the request, writes every
+# table before it answers, so the job it makes is Ready at once; its record keeps what it was asked for and by whom.
+# Any other Create records the job at once and its prepare task (_prepare_job, below) writes it later: it moves the
+# record with _move_prepare (stage and progress), records what it can't take (preparing.found), runs _prepare_checks
+# before its write and inside each of its transactions, and ends with _make_ready once the job's Databricks jobs are
+# made.
 
 # The change log's user for what the app does by itself as a job becomes Ready (its schedule turned on).
 PREPARE_USER = "preparing"
@@ -5268,7 +5293,7 @@ def _update_prepare(sid: int, change, cur=None) -> tuple:
 
 def _move_prepare(sid: int, state: Optional[str] = None, stage: Optional[str] = None, progress: Optional[dict] = None,
                   cur=None) -> dict:
-    """For stage B's prepare task: move the job's record to a state and stage (preparing.moved), with its progress
+    """For the prepare task: move the job's record to a state and stage (preparing.moved), with its progress
     merged over the last. Nothing prepares a deleted job, so its record is left as it is. Returns the record."""
     def change(record, job):
         if job.get("deleted_at") is not None:
@@ -5278,19 +5303,19 @@ def _move_prepare(sid: int, state: Optional[str] = None, stage: Optional[str] = 
 
 
 def _set_aside(sid: int, entries: List[dict], cur=None) -> dict:
-    """For stage B's prepare task: set these databases aside (preparing.entry each, with why), in the transaction that
+    """Set these databases aside (preparing.entry each, with why), in the transaction that
     found them when given one; the job Needs you while one waits for a choice. Returns the record."""
     return _update_prepare(sid, lambda record, job: (preparing.with_set_aside(record, entries), None), cur)[0]
 
 
 def _clear_set_aside(sid: int, keys: Iterable[str], cur=None) -> dict:
-    """For stage B's prepare task: these databases (preparing.database_key) were read or planned again and taken, so
-    they leave the set-aside list. Returns the record."""
+    """These databases (preparing.database_key) were read or planned again and taken, so they leave the set-aside list.
+    Returns the record."""
     return _update_prepare(sid, lambda record, job: (preparing.cleared(record, list(keys)), None), cur)[0]
 
 
 def _make_ready(sid: int) -> dict:
-    """For stage B's prepare task, last: the job is Ready. A schedule that was to turn on does when whoever asked for it
+    """The prepare task's last step: the job is Ready. A schedule that was to turn on does when whoever asked for it
     (at Create, its maker) may still run what it starts, read now, with no request behind it; otherwise it stays
     paused and the record says why. The wrapper jobs are synced after. Returns the record."""
     job = _load_schedule(sid)[0]
@@ -5330,8 +5355,8 @@ class PreparedSource:
 
 
 def _prepare_checks(sid: int, rows: Optional[List[dict]] = None, cur=None) -> PreparedSource:
-    """The write-time checks of a job's preparation (N1, N4 and N6), from its record, with its maker, read now. Stage B
-    calls it before its write (no rows) and again inside each transaction of the write, with that transaction's rows
+    """The write-time checks of a job's preparation (N1, N4 and N6), from its record, with its maker, read now. The
+    prepare task calls it before its write (no rows) and again inside each transaction of the write, with that transaction's rows
     and cursor, as _create_by_database runs _new_job_source and _refuse_job_rows. No request is behind it: the maker is
     the one Create stored, and their rights are read again (one who is no longer an app manager is refused a read by
     host and password, or a secret scope); the JDBC connection and its logins are read as they are now (a login typed
@@ -5399,15 +5424,19 @@ def _job_reads(job: dict) -> Optional[dict]:
 def job_preparation(job_id: int, request: Request):
     """Where a job's preparation stands, for its page (preparing.view): its state and stage, the reading of its claimed
     drafts while it isn't Ready (of how many databases, how many are read, the tables so far, the minutes left), the
-    write's progress as the prepare task reports it, the set-aside and left-out databases, and why the user may not
-    take each action on them. Read only. A job made before the record is Ready."""
+    write's progress as the prepare task reports it, the set-aside and left-out databases (their counts, every clash and
+    the first LISTED of the rest; GET .../prepare/set-aside pages them all), whether it stopped, and why the user may
+    not take each action. Read only. A job made before the record is Ready."""
     job = _load_schedule(job_id)[0]
     options = sch.options_of(job)
     reads = None if preparing.is_ready(options) else _job_reads(job)
     refusals = _permission_refusals(job, _user(request))
     acting = refusals["change"] or (NOTHING_SET_ASIDE if preparing.is_ready(options) else None)
+    stopped = preparing.stopped_of(options)
     return {"id": int(job_id), **preparing.view(options, reads),
-            "actions": {"read_again": acting, "leave_out": acting, "targets": acting, "delete": refusals["delete"]}}
+            "actions": {"read_again": acting, "leave_out": acting, "targets": acting, "delete": refusals["delete"],
+                        "stop": acting or ("the job's preparation is stopped already" if stopped else None),
+                        "again": acting}}
 
 
 class SetAsideRequest(BaseModel):
@@ -5417,6 +5446,14 @@ class SetAsideRequest(BaseModel):
 
 def _set_aside_keys(body: SetAsideRequest) -> Optional[List[str]]:
     return None if body.databases is None else [preparing.database_key(d.server, d.database) for d in body.databases]
+
+
+def _named_reads(body: SetAsideRequest) -> tuple:
+    """The params prepare_read_again_sql and prepare_leave_out_reads_sql take for the databases named: (all, servers,
+    databases), each server without its port, all in lower case."""
+    named = body.databases or []
+    return (body.databases is None, [rediscovery.server_key(d.server) for d in named],
+            [d.database.lower() for d in named])
 
 
 def _refuse_set_aside_action(job: dict, request: Request) -> None:
@@ -5429,42 +5466,85 @@ def _refuse_set_aside_action(job: dict, request: Request) -> None:
 
 def _set_aside_action(job_id: int, request: Request, action: str, change) -> tuple:
     """One set-aside action: checked (_refuse_set_aside_action), then the record changed under the job's lock (still not
-    Ready, still not deleted), with a change log line naming how many databases it took. change(record, user) gives
+    Ready, still not deleted), with a change log line naming how many databases it took, all in one transaction; then
+    the prepare task asked to go on (_start_prepare) when the record has work for it. change(record, user, cur) gives
     back (the record, how many)."""
     user = _user(request)
     job = _load_schedule(job_id)[0]
     _refuse_set_aside_action(job, request)
 
-    def apply(record, job_now):
-        if job_now.get("deleted_at") is not None:
-            raise HTTPException(409, DELETED_JOB)
-        if preparing.is_ready({preparing.OPTION: record}):
-            raise HTTPException(409, NOTHING_SET_ASIDE)
-        return change(record, user)
-
     with _write() as cur:
+        def apply(record, job_now):
+            if job_now.get("deleted_at") is not None:
+                raise HTTPException(409, DELETED_JOB)
+            if preparing.is_ready({preparing.OPTION: record}):
+                raise HTTPException(409, NOTHING_SET_ASIDE)
+            return change(record, user, cur)
+
         record, count = _update_prepare(int(job_id), apply, cur)
         if count:
             _log(cur, user, action, None, None, job["name"], None, f"{count} {'database' if count == 1 else 'databases'}")
             _touch(cur, user, [int(job_id)])
+    if preparing.has_work(record):
+        _start_prepare(int(job_id))
     return record, count
 
 
 @app.post("/api/ingestion-jobs/{job_id}/prepare/read-again")
 def read_set_aside_again(job_id: int, body: SetAsideRequest, request: Request):
-    """Read them again: the databases that couldn't be read (those named, or all of them) are marked to be read again,
-    and the job is Preparing again once none waits for a choice. The read itself is the prepare task's."""
-    record, marked = _set_aside_action(job_id, request, "prepare_read_again",
-                                       lambda record, user: preparing.read_again(record, _set_aside_keys(body), user))
+    """Read them again: the databases that couldn't be read (those named, or all of them) are read again: their rows
+    are reset in the same transaction, so the background reader takes them (a file's database-only lines are read by a
+    new discovery run), and the job is Preparing again once none waits for a choice."""
+    job = _load_schedule(job_id)[0]
+    ids = _job_discovery_ids(job)
+
+    def change(record, user, cur):
+        if (record.get("source") or {}).get("kind") == "discovery":
+            reset = len(db.fetch(cur, q.prepare_read_again_sql(), (ids, str(int(job_id)), *_named_reads(body)))) \
+                if ids else 0
+        else:
+            keys = _set_aside_keys(body)
+            reset = sum(1 for k, e in (record.get("set_aside") or {}).items()
+                        if e.get("kind") == preparing.UNREADABLE and (keys is None or k in keys))
+            if reset and record.get("database_read"):
+                with _database_reads_lock:
+                    for key in [k for k, read in _database_reads.items()
+                                if read.get("run_id") == record["database_read"].get("run_id")]:
+                        del _database_reads[key]
+                record = dict(record, database_read=None)
+        return preparing.read_again(record, _set_aside_keys(body), user, reset)
+
+    record, marked = _set_aside_action(job_id, request, "prepare_read_again", change)
     return {"id": int(job_id), "marked": marked, **preparing.summary({preparing.OPTION: record})}
+
+
+def _left_out_entries(job_id: int, record: dict, body: SetAsideRequest, cur) -> List[dict]:
+    """The set-aside databases Leave out takes (those named, or every one that waits for a choice): the clashes from
+    the record, which keeps them all, and, for a job chosen from discoveries, the databases of its claimed drafts that
+    couldn't be read, from their rows, marked left out in the same transaction (a whole-server read's closed ones are
+    left out already)."""
+    keys = _set_aside_keys(body)
+    entries = [e for k, e in (record.get("set_aside") or {}).items()
+               if e.get("kind") in preparing.NEEDS_ACTION and (keys is None or k in keys)]
+    if (record.get("source") or {}).get("kind") != "discovery":
+        return entries
+    job = _load_schedule(job_id, cur)[0]
+    ids = _job_discovery_ids(job)
+    failed = [e for e in (_failed_reads(job) if ids else []) if e["kind"] == preparing.UNREADABLE
+              and (keys is None or preparing.database_key(e["server"], e["database"]) in keys)]
+    if failed:
+        db.fetch(cur, q.prepare_leave_out_reads_sql(), (ids, str(int(job_id)), False,
+                                                        [rediscovery.server_key(e["server"]) for e in failed],
+                                                        [e["database"].lower() for e in failed]))
+    return [e for e in entries if e["kind"] == preparing.CLASH] + failed
 
 
 @app.post("/api/ingestion-jobs/{job_id}/prepare/leave-out")
 def leave_set_aside_out(job_id: int, body: SetAsideRequest, request: Request):
     """Leave them out: the set-aside databases (those named, or all that wait for a choice) come out of the job's choice,
-    which its write and a later re-discovery leave out, and the job goes on."""
-    record, left = _set_aside_action(job_id, request, "prepare_leave_out",
-                                     lambda record, user: preparing.leave_out(record, _set_aside_keys(body), user))
+    which its write and a later re-discovery leave out, and the job goes on (Ready, when nothing else is left)."""
+    record, left = _set_aside_action(job_id, request, "prepare_leave_out", lambda record, user, cur: preparing.leave_out(
+        record, _left_out_entries(job_id, record, body, cur), user))
     return {"id": int(job_id), "left_out": left, **preparing.summary({preparing.OPTION: record})}
 
 
@@ -5488,19 +5568,20 @@ def _target_names(job: dict, record: dict, body: TargetNamesRequest) -> dict:
 
 @app.post("/api/ingestion-jobs/{job_id}/prepare/targets")
 def change_set_aside_targets(job_id: int, body: TargetNamesRequest, request: Request):
-    """Change the job's target names: preview (dry_run, the default) or store new target templates in the job's record,
-    and mark the databases set aside for a clash to be planned again with them. The new plan is the prepare task's."""
+    """Change the job's target names: preview (dry_run, the default) or store new target templates in the job's record;
+    the databases set aside for a clash come off the list, and the prepare task plans them again with the new names
+    (with the rest not written yet)."""
     job = _load_schedule(job_id)[0]
     record = preparing.record_of(sch.options_of(job))
     if record is None or preparing.is_ready(sch.options_of(job)):
         raise HTTPException(409, NOTHING_SET_ASIDE)
     given = _target_names(job, record, body)
-    clashes = sum(1 for e in (record.get("set_aside") or {}).values() if e.get("kind") == preparing.CLASH)
+    clashes = preparing.counts_of(record)[preparing.CLASH]
     if body.dry_run:
         return {"id": int(job_id), "targets": given, "replan": clashes, "applied": False}
     record, marked = _set_aside_action(
         job_id, request, "prepare_targets",
-        lambda record, user: preparing.change_targets(record, _target_names(job, record, body), user))
+        lambda record, user, cur: preparing.change_targets(record, _target_names(job, record, body), user))
     return {"id": int(job_id), "targets": given, "replan": marked, "applied": True,
             **preparing.summary({preparing.OPTION: record})}
 
@@ -5605,6 +5686,656 @@ def _regroup_stored(job: dict, body: "JobGroupsRequest", request: Request) -> di
              else f"{body.groups_per_server} groups per server" if body.groups_per_server else "the default")
         _touch(cur, user, [int(job["id"])])
     return {"summary": {**summary, "applied": True}, "blocked": None}
+
+
+# ---- Create at once, then the prepare task ----------------------------------------------------------------------------
+# A Create whose tables aren't all read yet, or that takes more than BACKGROUND_ROWS tables, or whose file has
+# database-only lines, records the job at once (_create_preparing): every check that needs only names and settings,
+# then, in one transaction, the job paused with no groups and its record Preparing, what it was chosen from with its
+# drafts claimed, and its prepare task. It answers with the job's id. The prepare task (_prepare_job) then reads, writes
+# and syncs the job on a thread with no request behind it, held to the job's maker and its connection as they are at
+# each write. PREPARE_CREATES=0 keeps the earlier Create (the request waits in a task of its own until the job is
+# written), for a rollback.
+PREPARE_CREATES = os.environ.get("PREPARE_CREATES", "1") != "0"
+# How often the prepare task looks at the reads it waits for, and how often each app instance looks for a job whose
+# prepare task no thread holds (an app restarted while it prepared); 0 turns that look off on this instance.
+PREPARE_POLL_S = float(os.environ.get("PREPARE_POLL_S", "2"))
+PREPARE_RESUME_S = float(os.environ.get("PREPARE_RESUME_S", "30"))
+NOTHING_LEFT = ("nothing is left to ingest: every database of the job's choice was left out or takes no tables; "
+                "delete the job, or create it again")
+NOT_RECORDED = "this job was not recorded by Create, so it has no preparation to stop or go on with"
+STOPPED_WHY = "stopped by {user}"
+DELETED_WHY = "the job was deleted by {user}"
+TAKEN_GROUPS = ("the ingestion groups this job would make are taken already ({groups}): another job uses them, so give "
+                "the job another name")
+
+
+class PrepareStopped(Exception):
+    """The prepare task ends here and writes nothing more: the job was stopped or deleted, is Ready, or another
+    instance holds its task now."""
+
+
+class PrepareRefused(Exception):
+    """A check at the write refused the whole job (its maker, its connection or its plan as they are now): the
+    preparation stops, saying why, until Prepare again."""
+
+    def __init__(self, error: HTTPException):
+        super().__init__(_error_text(error))
+        self.error = error
+
+
+def _job_discovery_ids(job: dict) -> List[str]:
+    """The discoveries a job was chosen from (its record's source and its job_selection rows), whose claimed rows its
+    preparation reads."""
+    record = preparing.record_of(sch.options_of(job)) or {}
+    source = record.get("source") or {}
+    ids = set(str(source.get("source_id") or "").split(",")) if source.get("kind") == "discovery" else set()
+    ids |= {i for part in db.query(q.job_selection_sql(), (int(job["id"]),)) if part["source_kind"] == "discovery"
+            for i in str(part["source_id"] or "").split(",")}
+    ids.discard("")
+    return sorted(ids)
+
+
+def _discovery_key_row(row: dict) -> dict:
+    """A discovery row (selection_discoveries_sql) as the fields a control row read from it takes (as
+    queries.source_rows_sql builds them), for its database key."""
+    if row.get("src_connection"):
+        return {"src_type": row.get("src_type"), "src_connection": row["src_connection"],
+                "src_database": row["src_database"]}
+    return {"src_type": row.get("src_type"), "src_host": row.get("src_host"), "src_port": row.get("src_port"),
+            "secret_key": row.get("secret_key"), "src_database": row["src_database"]}
+
+
+def _chosen_databases(selection: Selection, kind: str, param) -> List[dict]:
+    """The databases a choice takes, one row each ({server, src_database} and the fields its database key reads), from
+    what is known before any table is read: a discovery's rows (not one its draft dropped), or an upload's lines."""
+    whole, keys = selection.whole_server, {q.selection_key(d.server, d.database) for d in selection.databases}
+    keys |= {q.selection_key(t.server, t.database) for t in selection.tables}
+    filter_ = (selection.filter or "").lower()
+    if kind == "discovery":
+        rows = [{**_discovery_key_row(r), "server": r["server"]} for r in db.query(q.selection_discoveries_sql(), (param,))
+                if not (r.get("listing") or {}).get("dropped") and r.get("src_database")]
+    else:
+        rows = [{**{k: (r.get("fields") or {}).get(k) for k in ("src_type", "src_connection", "src_host", "src_port",
+                                                                "secret_key")},
+                 "src_database": r["src_database"], "server": r["server"]}
+                for r in db.query(q.upload_database_sources_sql(), (param,))]
+    chosen, seen = [], set()
+    for row in rows:
+        key = q.selection_key(row["server"], row["src_database"])
+        if key in seen or not ((whole and filter_ in row["src_database"].lower()) or key in keys):
+            continue
+        seen.add(key)
+        chosen.append(row)
+    return chosen
+
+
+def _refuse_owned_databases(rows: List[dict]) -> None:
+    """Create's check, by database key alone, before any table is read: a database already in another job's groups,
+    live or deleted and not purged, refuses the Create, as the split and deleted-job checks would at the write."""
+    keys = sorted({q.database_key(row) for row in rows})
+    for at in range(0, len(keys), q.CONTROL_BATCH * 10):
+        found = db.query(q.database_owners_sql(), (keys[at:at + q.CONTROL_BATCH * 10],))
+        if not found:
+            continue
+        database, job, deleted = found[0]["database"], found[0]["job"], found[0]["deleted"]
+        if deleted:
+            raise HTTPException(409, f"database {database} is in the deleted ingestion job {job}, which is kept until "
+                                     f"it is purged: Restore {job}, or Delete now to purge it, then create this job")
+        raise HTTPException(409, f"database {database} is in the ingestion job {job} already: a database's tables stay "
+                                 "in one job, so leave it out of this one, or add tables to that job")
+
+
+def _taken_group_errors(name: str, servers: Iterable[str], taken: Iterable[str]) -> List[str]:
+    """The groups other jobs use that this job's would be named (the job's name, each server, c01 on): by name alone,
+    as the number of groups waits for the tables."""
+    prefixes = [f"{q.identifier(name)}_{q.identifier(server)}_c" for server in sorted(set(servers))]
+    clashing = sorted(g for g in taken if any(g.startswith(p) and g[len(p):].isdigit() for p in prefixes))
+    return [TAKEN_GROUPS.format(groups=", ".join(clashing[:3]))] if clashing else []
+
+
+def _prepared_already(body: NewJobRequest) -> tuple:
+    """(the answer to a Create sent again with the request id of one that recorded its job: that job, recorded once;
+    whether the request id names a task already, of any kind)."""
+    if not body.request_id:
+        return None, False
+    made = db.query(q.task_of_request_sql(), (body.request_id,))
+    task = db.query(q.task_sql(), (made[0]["id"],))[0] if made else None
+    if not task or task["kind"] != q.PREPARE_KIND or task.get("job_id") is None:
+        return None, task is not None
+    job = _load_schedule(int(task["job_id"]))[0]
+    return {"id": int(task["job_id"]), "created": True, "prepare": preparing.summary(sch.options_of(job))}, True
+
+
+def _create_preparing(body: NewJobRequest, request: Request, database_lines: bool = False) -> dict:
+    """Create at once (decision B): the checks that need only names and settings (the job's name, its targets, its
+    group names free, no database already in another job, live or deleted, the source and scope rules, the right to run
+    what it starts when its schedule is to be on, and the right to run discovery when the file has database-only lines,
+    which a discovery run reads), then in one transaction the job (paused, no groups, its record Preparing), what it
+    was chosen from with its drafts claimed, and its prepare task, which is started after the commit. Answers with the
+    job's id; the job's page follows its preparation."""
+    import psycopg
+    made, named = _prepared_already(body)
+    if made is not None:
+        return made
+    name = body.name.strip()
+    run = body.run.model_copy()
+    run.stagger = run.stagger and run.job_variant != sch.CHECK_VARIANT
+    user = _user(request)
+    selection = body.source
+    connection = _new_job_source(run, selection, user, applying=True)
+    settings = nj.settings_of(body.settings, new_job=True)
+    errors = nj.given_errors(body.settings) + nj.setting_errors(settings, require_target=True)
+    if not name:
+        errors.insert(0, "name the job")
+    timezone_ = sch.timezone_for(run.cadence_minutes, run.timezone)
+    kind, param, source_id, _ = _selection_params(selection)
+    chosen = _chosen_databases(selection, kind, param)
+    if not chosen and not database_lines:
+        errors.append(_no_tables_refusal(kind, param, selection))
+    if name and not errors:
+        errors += [e for e in sch.validate({**run.model_dump(), "name": name, "members": [], "timezone": timezone_}, [],
+                                           jobs.schedule_variants()) if not e.startswith("members:")]
+        errors += _taken_group_errors(name, [row["server"] for row in chosen],
+                                      [r["task_collection"] for r in db.query(q.collections_sql())])
+    if errors:
+        raise HTTPException(422, {"errors": errors})
+    if not run.paused:     # anyone may set up a job, but one that runs needs the right to run what it starts
+        _refuse(_permission_refusals({"job_variant": run.job_variant}, user)["run"])
+    if database_lines:     # a discovery run reads them later, started by the app for this user
+        _refuse_run_of(_require(jobs.DISCOVER_JOB_ID, "discovery"), request)
+    options = _create_options(body)
+    _refuse_unknown_node_types(sch.own_cluster({"options": options}))
+    _refuse_owned_databases(chosen)
+    if database_lines:
+        selected = _selected(selection)
+    else:
+        whole = sorted({row["server"] for row in chosen}) if selection.whole_server else []
+        selected = {"parts": _selection_parts(selection, whole), "kind": kind, "source_id": source_id}
+    record = preparing.moved(_create_record(body, run, user, settings), state=preparing.PREPARING,
+                             stage=preparing.READING)
+    stored = {**options, preparing.OPTION: record}
+    try:
+        with _write() as cur:
+            cur.execute(q.insert_schedule_sql(), (name, run.cadence_minutes, timezone_, json.dumps(run.parameters),
+                                                  run.job_variant or "default", run.stagger, True,
+                                                  run.notify_emails or None, json.dumps(stored), user or None))
+            sid = cur.fetchone()[0]
+            _keep_selection(cur, sid, selected, user)
+            request_id = body.request_id if body.request_id and not named else uuid.uuid4().hex
+            cur.execute(q.insert_task_sql(), (q.PREPARE_KIND, request_id, sid, 0, None, user or None))
+            _log(cur, user, "schedule_create", None, None, "schedule", None, f"{name} (preparing)")
+            _touch(cur, user, [sid])
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(409, f"an ingestion job named '{name}' already exists")
+    _start_prepare(sid)
+    return {"id": sid, "created": True, "settings": settings, "summary": None,
+            "prepare": preparing.summary(stored)}
+
+
+def _start_prepare(sid: int, backoff_s: float = 0.0) -> Optional[int]:
+    """Claim the job's prepare task (claim_prepare_sql: one thread across every instance) and start its thread. Returns
+    the task's id, or None when another thread holds it, or it ended less than backoff_s ago."""
+    owner = uuid.uuid4().hex
+    claimed = db.query(q.claim_prepare_sql(), (owner, int(sid), TASK_STALE_S, float(backoff_s)))
+    if not claimed:
+        return None
+    task_id = int(claimed[0]["id"])
+    _start_background(lambda: _prepare_job(int(sid), task_id, owner))
+    return task_id
+
+
+def _resume_preparing() -> List[int]:
+    """Start the prepare task of every job still Preparing whose task no thread holds (its app restarted while it
+    prepared, or it failed a while ago): what each instance looks for every PREPARE_RESUME_S. Returns those started."""
+    started = []
+    for row in db.query(q.preparing_jobs_sql(), (TASK_STALE_S, TASK_STALE_S)):
+        if _start_prepare(int(row["id"]), backoff_s=TASK_STALE_S) is not None:
+            started.append(int(row["id"]))
+    return started
+
+
+def _prepare_resumer() -> None:
+    while True:
+        try:
+            _resume_preparing()
+        except Exception:
+            logging.getLogger(__name__).exception("the look for jobs to prepare again failed")
+        time.sleep(PREPARE_RESUME_S)
+
+
+def _prepare_job(sid: int, task_id: int, owner: str) -> None:
+    """The prepare task's thread: passes (_prepare_pass) until the job needs nothing more, then the task ends. A beat
+    keeps its heartbeat fresh while it holds the task; once another instance holds it (or it was ended), the next
+    write sees so and stops. A check that refuses the whole job stops its preparation, saying why."""
+    held, stop = threading.Event(), threading.Event()
+    held.set()
+
+    def beat():
+        while not stop.wait(TASK_BEAT_S):
+            try:
+                if not db.query(q.prepare_beat_sql(), (task_id, owner)):
+                    held.clear()
+                    return
+            except Exception:
+                pass     # a missed beat is caught up by the next; TASK_STALE_S allows for many
+
+    threading.Thread(target=beat, daemon=True, name="lakefed-app-prepare-beat").start()
+    status, error = "succeeded", None
+    try:
+        while True:
+            asks = _prepare_pass(sid, task_id, owner, held)
+            record = preparing.record_of(sch.options_of(_load_schedule(sid)[0]))
+            if not preparing.has_work(record) or int((record or {}).get("asks") or 0) == asks:
+                break
+    except PrepareStopped:
+        return
+    except PrepareRefused as e:
+        status, error = "failed", str(e)
+        _stop_prepare(sid, PREPARE_USER, error, task_ended=False)
+    except Exception as e:
+        status, error = "failed", _error_text(e)
+        logging.getLogger(__name__).warning("the preparation of job %s failed: %s", sid, error)
+    finally:
+        stop.set()
+    db.execute(q.finish_prepare_sql(), (status, error, int(sid), owner, owner))
+
+
+def _prepare_alive(sid: int, held: threading.Event) -> dict:
+    """The job, while its preparation goes on: PrepareStopped once it was stopped, deleted or made Ready, or another
+    instance holds the task."""
+    if not held.is_set():
+        raise PrepareStopped()
+    job = _load_schedule(sid)[0]
+    record = preparing.record_of(sch.options_of(job))
+    if job.get("deleted_at") is not None or not record or record.get("stopped") or preparing.is_ready(
+            {preparing.OPTION: record}):
+        raise PrepareStopped()
+    return job
+
+
+def _prepare_fence(cur, sid: int, task_id: int, owner: str) -> None:
+    """The first statements of each transaction of a prepare write: the job's schedule lock (Delete, Stop preparing and
+    the job's edits take it too, so they wait for this write, briefly, and it for them), the task row while this
+    thread still holds it, and the job still preparing."""
+    cur.execute(q.schedule_lock_sql(), (q.SCHEDULE_LOCK_CLASS, q.schedule_lock_key(sid)))
+    if not db.fetch(cur, q.prepare_fence_sql(), (task_id, owner)):
+        raise PrepareStopped()
+    job = _load_schedule(sid, cur)[0]
+    record = preparing.record_of(sch.options_of(job))
+    if job.get("deleted_at") is not None or not record or record.get("stopped") or preparing.is_ready(
+            {preparing.OPTION: record}):
+        raise PrepareStopped()
+
+
+def _prepare_pass(sid: int, task_id: int, owner: str, held: threading.Event) -> int:
+    """One pass of a job's preparation, from its record and what it was chosen from: the reads waited for (each
+    database the reader takes; nothing read is read again), every database not written yet planned and written by
+    database (_prepare_write), what can't be taken set aside (preparing.found), then, with nothing waiting, its
+    Databricks jobs synced and the job Ready. Returns the record's asks when the pass began: an action taken during it
+    asks for one more."""
+    job = _prepare_alive(sid, held)
+    record = preparing.record_of(sch.options_of(job)) or {}
+    asks = int(record.get("asks") or 0)
+    try:
+        source = _prepare_checks(sid)
+    except HTTPException as e:
+        raise PrepareRefused(e)
+    if source.selection is None:
+        raise PrepareRefused(HTTPException(409, NO_RECORD))
+    kind, param, _, rest = _selection_params(source.selection)
+    if kind == "upload" and _has_database_lines(source.selection):
+        entries, counts, checked = _prepare_file(sid, held, job, source)
+    else:
+        if kind == "discovery":
+            _prepare_reads(sid, held, job)
+        entries, counts, checked = _prepare_databases(sid, held, job, source, kind, param, rest)
+    _move_prepare(sid, stage=preparing.WRITING)
+    entries += _prepare_write(sid, task_id, owner, held, job, source, checked)
+    counts = {**counts, preparing.CLASH: sum(1 for e in entries if e["kind"] == preparing.CLASH)}
+    record = _update_prepare(sid, lambda r, j: (preparing.found(r, entries, counts), None))[0]
+    if preparing.waiting_count(record):
+        return asks
+    _prepare_alive(sid, held)
+    if not _job_groups(sid):
+        raise PrepareRefused(HTTPException(409, NOTHING_LEFT))
+    _move_prepare(sid, stage=preparing.SYNCING)
+    cluster = _apply_cluster(sid) if sch.own_cluster(job) else None
+    _synced(_sync(sid, PREPARE_USER))
+    if cluster:
+        raise NotSynced(500, f"{TASK_WRITTEN_NOT_SYNCED} {cluster}"[:4000])
+    _make_ready(sid)
+    return asks
+
+
+def _step_reads(ids: List[str]) -> int:
+    """One look at the reads of these discoveries: the background reader woken while any is left (with it off, one
+    step of each taken, as the page would). Returns how many databases are left to read."""
+    left = 0
+    for r in db.query(q.draft_reads_sql(), (list(ids),)):
+        pending = int(r["pending"] or 0)
+        left += pending
+        if pending and r.get("src_connection"):
+            if READER.running():
+                READER.wake()
+            else:
+                warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, r["discovery_id"],
+                                        r["src_connection"])
+    return left
+
+
+def _prepare_reads(sid: int, held: threading.Event, job: dict) -> None:
+    """Reading: wait for the job's claimed drafts to be read (the background reader reads them, whatever page is open),
+    the record's progress moved on as they go."""
+    ids = _job_discovery_ids(job)
+    _move_prepare(sid, stage=preparing.READING)
+    while ids:
+        _prepare_alive(sid, held)
+        if not _step_reads(ids):
+            return
+        reading = preparing.reading_view(_job_reads(job)) or {}
+        _move_prepare(sid, progress={"percent": reading.get("percent"), "minutes_left": reading.get("minutes_left"),
+                                     "databases": reading.get("databases"), "read": reading.get("read")})
+        time.sleep(PREPARE_POLL_S)
+
+
+def _failed_reads(job: dict) -> List[dict]:
+    """Every database of the job's claimed drafts that couldn't be read (job_failed_reads_sql), each as a set-aside
+    entry: one a whole-server read couldn't open is closed (left out, as the whole-server read always has), any other
+    couldn't be read."""
+    ids = _job_discovery_ids(job)
+    if not ids:
+        return []
+    rows = db.query(q.job_failed_reads_sql(), (ids, str(int(job["id"])), 1_000_000, 0))
+    return [preparing.entry(r["server"], r["src_database"],
+                            preparing.CLOSED if r["whole_server"] and warehouse_reads.no_access(r.get("error"))
+                            else preparing.UNREADABLE, warehouse_reads.first_line(r.get("error")) or "it couldn't be read")
+            for r in rows]
+
+
+def _written_databases(sid: int) -> set:
+    """The databases the job has written already, by server (without its port) and name in lower case: a later pass
+    and a resumed one leave them as they are."""
+    groups = _job_groups(sid)
+    if not groups:
+        return set()
+    return {(rediscovery.server_key(r["server"]), str(r["src_database"] or "").lower())
+            for r in db.query(q.job_database_groups_sql(), (groups,))}
+
+
+def _unit_key(server: str, database: str) -> tuple:
+    return rediscovery.server_key(server), str(database or "").lower()
+
+
+def _prepare_databases(sid: int, held: threading.Event, job: dict, source: PreparedSource, kind, param, rest):
+    """Plan every database of the choice not written yet, not left out and read: (set-aside entries, counts by kind,
+    the databases to write as by_database.Checked with their plans). The groups are placed with the real table counts
+    of the whole choice, as Create placed them before. A database whose plan has a line that can't be taken is set
+    aside whole, with why. A plan that fails as a whole (the job's settings) stops the preparation."""
+    selection = source.selection
+    unreadable = _failed_reads(job) if kind == "discovery" else []
+    counts = {k: sum(1 for e in unreadable if e["kind"] == k) for k in preparing.KINDS}
+    record = preparing.record_of(sch.options_of(job)) or {}
+    skip = {_unit_key(e["server"], e["database"]) for e in unreadable}
+    skip |= {_unit_key(e["server"], e["database"]) for e in (record.get("left_out") or {}).values()}
+    written = _written_databases(sid)
+    servers = db.query(q.selected_servers_sql(kind), (param, *rest))
+    groups_of = by_database.groups_by_server(servers, source.sizing)
+    sizes = db.query(q.selected_databases_sql(kind), (param, *rest))
+    group_of = by_database.group_of_placement(job["name"], placement.server_placements(
+        ((r["server"], r["src_database"], r["tables"]) for r in sizes), groups_of))
+    own = set(_job_groups(sid))
+    taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+    columns = _source_columns(kind, param)
+    keep = by_database.keeps_plans(sum(int(s["tables"]) for s in servers))
+    skip |= written
+    units = [u for u in _units_of(kind, param, selection) if _unit_key(u.server, u.database) not in skip]
+    entries, checked = list(unreadable), []
+    for read_batch in by_database.read_batches(units):
+        _prepare_alive(sid, held)
+        for unit, rows in _rows_of_units(kind, param, read_batch):
+            if not rows:
+                continue
+            plan = by_database.plan_database(job["name"], source.settings, rows, columns, groups_of, taken, own,
+                                             group_of=group_of, new_job=True, unity_catalog=_unity_catalog(job))
+            if plan["errors"]:
+                raise PrepareRefused(HTTPException(422, {"errors": plan["errors"][:20]}))
+            invalid = [line for line in plan["lines"] if line["status"] == "invalid"]
+            if invalid:
+                entries.append(preparing.entry(unit.server, unit.database, preparing.CLASH,
+                                               f"{invalid[0]['table']}: {'; '.join(invalid[0]['errors'])}"))
+                continue
+            checked.append(by_database.Checked(unit, len(rows), plan if keep else None))
+    return entries, counts, (checked, keep, lambda units: [
+        (unit, by_database.plan_database(job["name"], source.settings, rows, columns, groups_of, taken, own,
+                                         group_of=group_of, new_job=True, unity_catalog=_unity_catalog(job)))
+        for unit, rows in _rows_of_units(kind, param, units) if rows])
+
+
+def _prepare_database_lines(sid: int, held: threading.Event, selected: dict) -> Optional[dict]:
+    """Reading a file's database-only lines: one discovery run reads them by name through the connection, as Create's
+    background half did. The run is kept on the record, so a resumed preparation waits for the same run rather than
+    reading them again."""
+    lines = selected["database_lines"]
+    if not lines:
+        return None
+    names = {}
+    for line in lines:
+        names.setdefault(line["database"].lower(), line)
+    key = (lines[0]["connection"].lower(), tuple(sorted(names)))
+    stored = (preparing.record_of(sch.options_of(_load_schedule(sid)[0])) or {}).get("database_read")
+    if stored and _database_read(key) is None:
+        with _database_reads_lock:
+            _database_reads[key] = {"run_id": stored["run_id"], "discovery_id": stored["discovery_id"], "ended": None,
+                                    "started": time.monotonic()}
+    _move_prepare(sid, stage=preparing.READING)
+    while True:
+        _prepare_alive(sid, held)
+        resolved = _resolve_databases(selected, wait=False, request=None)
+        read = _database_read(key)
+        if read is not None and not stored:
+            stored = {"run_id": read["run_id"], "discovery_id": read["discovery_id"]}
+            _update_prepare(sid, lambda r, j: (dict(r, database_read=stored), None))
+        if not resolved["discovering"]:
+            return resolved
+        time.sleep(PREPARE_POLL_S)
+
+
+def _prepare_file(sid: int, held: threading.Event, job: dict, source: PreparedSource):
+    """An upload with database-only lines: those are read first (_prepare_database_lines), then the file is planned as
+    Create planned it and split by database, each written in a transaction of its own (set aside whole when it can't be
+    taken). A database-only line whose database couldn't be read is set aside, with why."""
+    selected = _selected(source.selection)
+    resolved = _prepare_database_lines(sid, held, selected)
+    selected = _with_databases(selected, resolved)
+    connection = (selected["database_lines"][0]["connection"] if selected["database_lines"] else "")
+    record = preparing.record_of(sch.options_of(job)) or {}
+    left_out = {_unit_key(e["server"], e["database"]) for e in (record.get("left_out") or {}).values()}
+    entries = [preparing.entry(connection, u["database"], preparing.UNREADABLE, u["error"])
+               for u in (resolved or {}).get("unreadable") or [] if _unit_key(connection, u["database"]) not in left_out]
+    counts = {k: sum(1 for e in entries if e["kind"] == k) for k in preparing.KINDS}
+    skip = left_out | {_unit_key(e["server"], e["database"]) for e in entries} | _written_databases(sid)
+    own = set(_job_groups(sid))
+    taken = {r["task_collection"] for r in db.query(q.collections_sql())}
+    plan = _file_lines(nj.plan(job["name"], selected["text"], source.settings, source.sizing, taken - own,
+                               require_target=True, new_job=True), selected)
+    if plan["errors"]:
+        raise PrepareRefused(HTTPException(422, {"errors": plan["errors"][:20]}))
+    by_unit: Dict[tuple, list] = {}
+    for line in plan["lines"]:
+        by_unit.setdefault((line["server"], str(line["row"].get("src_database") or "")), []).append(line)
+    checked = []
+    for (server, database), lines in by_unit.items():
+        if _unit_key(server, database) in skip:
+            continue
+        invalid = [line for line in lines if line["status"] == "invalid"]
+        if invalid:
+            entries.append(preparing.entry(server, database, preparing.CLASH,
+                                           f"{invalid[0]['table']}: {'; '.join(invalid[0]['errors'])}"))
+            continue
+        groups = sorted({line["row"]["task_collection"] for line in lines if line["status"] == "valid"})
+        checked.append(by_database.Checked(by_database.Unit(server, database, True), len(lines),
+                                           {"groups": groups, "lines": lines}))
+    return entries, counts, (checked, True, None)
+
+
+def _prepare_write(sid: int, task_id: int, owner: str, held: threading.Event, job: dict, source: PreparedSource,
+                   planned) -> List[dict]:
+    """Writing: the planned databases packed into transactions (by_database.transactions_of), each written by
+    _write_chunk with the job's maker as stored and its write-time checks run again in it (_prepare_checks, N1, N4 and
+    N6), behind _prepare_fence. A transaction one database refuses (a target another table already writes, two of the
+    job's tables writing one target, a sink both dedicated and shared, a database another job or a deleted job holds)
+    is written again one database at a time, and the database that refuses is set aside with why; the rest are
+    written. Returns the databases set aside."""
+    checked, keep, replan = planned
+    if not checked:
+        return []
+    stages = by_database.Stages()
+    stages.begin_write()
+    groups = sorted(set(_job_groups(sid)) | {g for c in checked if c.plan for g in c.plan["groups"]})
+    offsets = sch.offsets(groups, int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
+    total = sum(c.tables for c in checked)
+    state = {"owner": owner, "stage": "writing", "databases_total": len(checked), "databases_written": 0,
+             "tables_written": 0, "seconds": stages.seconds()}
+
+    def check(cur, rows):
+        try:
+            _prepare_checks(sid, rows, cur)
+        except HTTPException as e:
+            raise PrepareRefused(e)
+
+    chunk_job = ChunkJob(sid=sid, name=job["name"], user=source.maker, batch=uuid.uuid4().hex[:12],
+                         cadence_minutes=int(job["cadence_minutes"]), timezone=job["timezone"], offsets=offsets,
+                         task_id=task_id, stages=stages, connection=source.connection, check=check)
+
+    def write(pairs) -> List[dict]:
+        before = dict(state)
+        try:
+            with _write() as cur:
+                _prepare_fence(cur, sid, task_id, owner)
+                _write_chunk(cur, [plan for _, plan in pairs], chunk_job, state)
+                _move_prepare(sid, progress={"tables_written": state["tables_written"], "tables_total": total,
+                                             "percent": preparing.percent(state["tables_written"], total)}, cur=cur)
+            return []
+        except (PrepareStopped, PrepareRefused):
+            raise
+        except HTTPException as e:
+            state.clear()
+            state.update(before)
+            if _refused_while_running(e):
+                raise
+            if len(pairs) > 1:
+                return [found for pair in pairs for found in write([pair])]
+            unit = pairs[0][0]
+            return [preparing.entry(unit.server, unit.database, preparing.CLASH, _error_text(e))]
+        except BaseException:
+            state.clear()
+            state.update(before)
+            raise
+
+    entries = []
+    for chunk in by_database.transactions_of(checked):
+        _prepare_alive(sid, held)
+        pairs = [(c.unit, c.plan) for c in chunk] if keep else replan([c.unit for c in chunk])
+        if pairs:
+            entries += write(pairs)
+    return entries
+
+
+def _stop_prepare(sid: int, user: str, why: str, task_ended: bool = True) -> int:
+    """Stop a job's preparation: its record stopped (why, by whom), its prepare task ended (task_ended: the caller is not
+    the task itself), and the reads of its claimed drafts still to go discarded, so the reader takes none, all in one
+    transaction under the job's schedule lock (a write of the task in progress commits first). The statements going
+    are cancelled after, as discarding a draft does. Returns how many were cancelled."""
+    job = _load_schedule(sid)[0]
+    ids = _job_discovery_ids(job)
+    with _write() as cur:
+        _update_prepare(int(sid), lambda record, job_now: (preparing.stopped(record, user, why), None), cur)
+        if task_ended:
+            cur.execute(q.finish_prepare_sql(), ("failed", why, int(sid), None, None))
+        going = [r["statement_id"] for r in (db.fetch(cur, q.prepare_stop_reads_sql(), (ids, str(int(sid))))
+                                             if ids else []) if r.get("statement_id")]
+    for statement_id in going:
+        try:
+            warehouse.cancel(statement_id)
+        except Exception as e:     # it may have ended meanwhile; the read is discarded either way
+            logging.getLogger(__name__).info("could not cancel statement %s of job %s: %s", statement_id, sid,
+                                             str(e)[:200])
+    return len(going)
+
+
+def _refuse_prepare_action(job: dict, request: Request) -> dict:
+    """Stop preparing and Prepare again change the job: Edit's check, read now; only for a job Create recorded that
+    isn't Ready. Returns its record."""
+    _refuse_job(job, request, "change")
+    record = preparing.record_of(sch.options_of(job))
+    if record is None:
+        raise HTTPException(409, NOT_RECORDED)
+    if preparing.is_ready(sch.options_of(job)):
+        raise HTTPException(409, NOTHING_SET_ASIDE)
+    return record
+
+
+@app.post("/api/ingestion-jobs/{job_id}/prepare/stop")
+def stop_preparing(job_id: int, request: Request):
+    """Stop preparing: the reads stop (the statements going cancelled) and the prepare task ends, writing nothing more;
+    the job stays paused with its choice and what was read, until Prepare again."""
+    job = _load_schedule(job_id)[0]
+    if job.get("deleted_at") is not None:
+        raise HTTPException(409, DELETED_JOB)
+    _refuse_prepare_action(job, request)
+    user = _user(request)
+    cancelled = _stop_prepare(int(job_id), user, STOPPED_WHY.format(user=user))
+    with _write() as cur:
+        _log(cur, user, "prepare_stop", None, None, job["name"], None, None)
+        _touch(cur, user, [int(job_id)])
+    return {"id": int(job_id), "cancelled": cancelled, **preparing.summary(sch.options_of(_load_schedule(job_id)[0]))}
+
+
+@app.post("/api/ingestion-jobs/{job_id}/prepare/again")
+def prepare_again(job_id: int, request: Request):
+    """Prepare again: the job's preparation goes on from where it stopped (Stop preparing, a check that refused it, or a
+    failure): the reads its Stop left are read, and nothing read or written already is again. Held to the job's maker,
+    as before."""
+    job = _load_schedule(job_id)[0]
+    if job.get("deleted_at") is not None:
+        raise HTTPException(409, DELETED_JOB)
+    _refuse_prepare_action(job, request)
+    user = _user(request)
+    ids = _job_discovery_ids(job)
+    with _write() as cur:
+        record, _ = _update_prepare(int(job_id), lambda record, job_now: (preparing.restarted(record), None), cur)
+        if ids:
+            db.fetch(cur, q.prepare_resume_reads_sql(), (ids, str(int(job_id))))
+        _log(cur, user, "prepare_again", None, None, job["name"], None, None)
+        _touch(cur, user, [int(job_id)])
+    task_id = _start_prepare(int(job_id)) if preparing.has_work(record) else None
+    return {"id": int(job_id), "started": task_id is not None, **preparing.summary({preparing.OPTION: record})}
+
+
+@app.get("/api/ingestion-jobs/{job_id}/prepare/set-aside")
+def job_set_aside(job_id: int, kind: str = "reads", offset: int = 0, limit: int = 100):
+    """Every set-aside database of a job, a page at a time, read only: the record keeps their counts, every clash and
+    only the first LISTED of the rest. kind reads: the databases of its claimed drafts that couldn't be read, from
+    their rows (each unreadable, or closed: a whole-server read couldn't open it); kind clash: the clashes it keeps."""
+    job = _load_schedule(job_id)[0]
+    record = preparing.record_of(sch.options_of(job)) or {}
+    limit, offset = max(1, min(int(limit), 500)), max(0, int(offset))
+    if kind == "clash" or (record.get("source") or {}).get("kind") != "discovery":
+        entries = sorted((e for e in (record.get("set_aside") or {}).values()
+                          if kind != "clash" or e.get("kind") == preparing.CLASH),
+                         key=lambda e: (str(e.get("server") or "").lower(), str(e.get("database") or "").lower()))
+        return {"id": int(job_id), "kind": kind, "offset": offset, "limit": limit, "total": len(entries),
+                "databases": entries[offset:offset + limit]}
+    if kind != "reads":
+        raise HTTPException(422, "kind is reads or clash")
+    ids = _job_discovery_ids(job)
+    rows = db.query(q.job_failed_reads_sql(), (ids, str(int(job_id)), limit, offset)) if ids else []
+    return {"id": int(job_id), "kind": kind, "offset": offset, "limit": limit,
+            "total": int(rows[0]["total"]) if rows else 0,
+            "databases": [{"server": r["server"], "database": r["src_database"],
+                           "kind": preparing.CLOSED if r["whole_server"] and warehouse_reads.no_access(r.get("error"))
+                           else preparing.UNREADABLE, "why": warehouse_reads.first_line(r.get("error"))} for r in rows]}
 
 
 @app.post("/api/schedules/{sid}")
@@ -5751,10 +6482,18 @@ def delete_schedule(sid: int, request: Request, body: Optional[DeleteJobBody] = 
     blocker = _delete_blocker(s, active, plan["groups"])
     if blocker:
         raise HTTPException(409, blocker)
+    record = preparing.record_of(sch.options_of(s))
+    if record and not preparing.is_ready(sch.options_of(s)) and not record.get("stopped"):
+        # Its preparation stops first, as Stop preparing stops it; a write of it in progress commits first.
+        _stop_prepare(int(sid), user, DELETED_WHY.format(user=user))
+        s, members = _load_schedule(sid)
+        active = [m for m in members if m["removed_at"] is None]
+        plan = _delete_plan(sid)
     if plan["tables"] and not jobs.DELETE_JOB_ID:
         raise HTTPException(409, NO_DELETE_JOB)
     drop = bool(body and body.drop_targets)
     with _write() as cur:
+        cur.execute(q.schedule_lock_sql(), (q.SCHEDULE_LOCK_CLASS, q.schedule_lock_key(sid)))
         cur.execute(q.delete_schedule_sql(), (int(sid),))
         if active:
             # Their wrapper jobs go in the sync below.
