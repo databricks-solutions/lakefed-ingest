@@ -37,4 +37,5 @@ def test_the_settings_answer_says_whether_a_table_is_read_by_host(monkeypatch, j
 
 def test_a_job_with_no_groups_reads_no_table_by_host(monkeypatch):
     monkeypatch.setattr(main, "_job_groups", lambda job_id: [])
+    monkeypatch.setattr(main, "_load_schedule", lambda job_id: [{}])
     assert main.ingestion_job_settings(7)["reads_by_host"] is False

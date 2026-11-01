@@ -45,6 +45,7 @@ import jdbc_logins as jl
 import lakebase as db
 import new_job as nj
 import placement
+import preparing
 import queries as q
 import rediscovery
 import rollup
@@ -1573,6 +1574,8 @@ def ingestion_job(job_id: int, request: Request):
                         "groups": len(mine), "check": job.get("job_variant") == sch.CHECK_VARIANT,
                         **_run_phase_of(job, mine, now)},
             "delete_blocked": refusals["delete"], "change_blocked": refusals["change"],
+            # Where the job stands until it can run (preparing.summary); its page reads the rest from /prepare.
+            "prepare": preparing.summary(sch.options_of(job)),
             "delete": job.get("delete"),
             "delete_refusal": (_delete_refusal(job, _delete_plan(job["id"])["groups"], _user(request))
                                if job.get("delete") else None),
@@ -1713,6 +1716,32 @@ def _groups_refusal(groups: Iterable[str], user: str) -> Optional[str]:
 
 def _refuse_groups(groups: Iterable[str], request: Request) -> None:
     _refuse(_groups_refusal(groups, _user(request)))
+    _refuse_unready_groups(groups, preparing.tables_refusal)
+
+
+def _refuse_unready(job: dict, refusal_of) -> None:
+    """Refuse (409) what a job may not do until it is Ready, saying where it stands: refusal_of is one of preparing's
+    refusals (run_refusal, turn_on_refusal, tables_refusal, settings_refusal). The detail carries the reason
+    preparing.NOT_READY_REASON, and the job's state and stage."""
+    options = sch.options_of(job)
+    why = refusal_of(options)
+    if why:
+        raise HTTPException(409, {"message": why, "reason": preparing.NOT_READY_REASON,
+                                  "state": preparing.state_of(options), "stage": preparing.stage_of(options)})
+
+
+def _refuse_unready_groups(groups: Iterable[Optional[str]], refusal_of) -> None:
+    """_refuse_unready for every job holding one of these groups: a table route that names groups, not a job, never
+    reaches a job that isn't Ready (its prepare task writes them). Read fresh, not shared."""
+    wanted = {g for g in groups if g}
+    if not wanted:
+        return
+    schedules = db.query(q.schedules_sql())
+    members = db.query(q.schedule_members_sql(), ([s["id"] for s in schedules],)) if schedules else []
+    holding = {m["schedule_id"] for m in members if m["removed_at"] is None and m["task_collection"] in wanted}
+    for s in schedules:
+        if s["id"] in holding:
+            _refuse_unready(s, refusal_of)
 
 
 def _refuse_rows_groups(ids: List[int], request: Request, also: Iterable[Optional[str]] = ()) -> set:
@@ -1734,7 +1763,9 @@ def _recheck_locked_rows(rows: List[dict], checked: set, request: Request) -> No
 def _refuse_job_tables(job: dict, groups: Iterable[str], request: Request) -> None:
     """Refuse a change to a job's tables unless the user may change the job and every other job that runs one of
     the groups it touches: a group can be in more than one job, and its tables change for all of them. Checked
-    before any lock is taken, as the Permissions and SCIM calls can be slow."""
+    before any lock is taken, as the Permissions and SCIM calls can be slow. A job that isn't Ready refuses it: its
+    prepare task writes its tables."""
+    _refuse_unready(job, preparing.tables_refusal)
     _refuse_job(job, request, "change")
     _refuse_groups(groups, request)
 
@@ -1759,8 +1790,11 @@ def _refuse_groups_outside_jobs(groups: Iterable[str]) -> None:
 
 
 def _run_now_blocker(job: dict, members: List[dict]) -> Optional[str]:
-    """Why the job can't be started by hand right now (a run of it is going, or its wrapper jobs aren't synced). The
-    running runs are read after the app has closed those whose Databricks run ended (_running)."""
+    """Why the job can't be started by hand right now (it isn't Ready, a run of it is going, or its wrapper jobs aren't
+    synced). The running runs are read after the app has closed those whose Databricks run ended (_running)."""
+    waiting = preparing.run_refusal(sch.options_of(job))
+    if waiting:
+        return waiting
     if _recorded_running(members):
         return "a run of this job is already running: cancel it, or wait for it to end"
     if not members or any(not m.get("job_id") for m in members):
@@ -1780,6 +1814,7 @@ def run_ingestion_job(job_id: int, request: Request):
     schedule's one wrapper, which starts the check job over every group). Refused while a run of it is going."""
     job, members = _load_schedule(job_id)
     _refuse_job(job, request, "run")
+    _refuse_unready(job, preparing.run_refusal)
     members = [m for m in members if m.get("removed_at") is None]
     blocker = _run_now_blocker(job, members)
     if blocker:
@@ -2012,11 +2047,15 @@ class JobSettingsRequest(BaseModel):
 @app.get("/api/ingestion-jobs/{job_id}/settings")
 def ingestion_job_settings(job_id: int):
     """What all of a job's tables share (job_settings_sql.read: one scan, whatever the job's size), each setting
-    with its value or its most common values."""
+    with its value or its most common values. A job that isn't Ready answers with the settings its record keeps
+    (_stored_settings)."""
     groups = _job_groups(job_id)
+    job = _load_schedule(job_id)[0]
+    if not preparing.is_ready(sch.options_of(job)):
+        return _stored_settings(job, groups)
     if not groups:
         return {"job_id": int(job_id), "groups": groups, "tables": 0, "settings": js.read([]), "reads_by_host": False}
-    unity_catalog = _unity_catalog(_load_schedule(job_id)[0])
+    unity_catalog = _unity_catalog(job)
     with _snapshot() as fetch:
         tables, settings = fetch(q.groups_row_count_sql(), (groups,))[0]["n"], jss.read(fetch, groups, unity_catalog)
         reads_by_host = _reads_by_host(fetch, groups)
@@ -2030,12 +2069,15 @@ def edit_ingestion_job_settings(job_id: int, body: JobSettingsRequest, request: 
     """Preview (dry_run, the default) or apply a settings edit to every table of a job, in set-based SQL
     (job_settings_sql): templates filled per row, a reseed where a change-tracked or cursor table gets a new
     target or client_id, one change-log line per database. Anything it can't take is a 422 naming why. Applying
-    is one transaction under the job's lock and every group's run lock."""
+    is one transaction under the job's lock and every group's run lock. A job that isn't Ready changes the settings its
+    record keeps instead, while its tables are still read (_edit_stored_settings)."""
     import psycopg
     groups = _job_groups(job_id)
+    job = _load_schedule(job_id)[0]
+    if not preparing.is_ready(sch.options_of(job)):
+        return _edit_stored_settings(job, body.settings, body.dry_run, request)
     if not groups:
         return {"summary": {"rows": 0, "changed": 0, "reseed": 0, "errors": 0, "applied": False}, "errors": []}
-    job = _load_schedule(job_id)[0]
     unity_catalog = _unity_catalog(job)
 
     def checked(fetch, groups):
@@ -2180,6 +2222,7 @@ def retry_failing_database(job_id: int, body: RetryDatabaseRequest, request: Req
     Databricks would skip a second one."""
     job, members = _load_schedule(job_id)
     _refuse_job(job, request, "run")
+    _refuse_unready(job, preparing.run_refusal)
     mine = [m for m in _active(members) if m["task_collection"] == body.task_collection]
     if not mine:
         raise HTTPException(404, f"ingestion group {body.task_collection} is not in this job")
@@ -2216,6 +2259,7 @@ def remove_job_tables(job_id: int, body: RemoveTablesRequest, request: Request):
     user = _user(request)
     job, members = _load_schedule(job_id)
     _refuse_job(job, request, "delete")
+    _refuse_unready(job, preparing.tables_refusal)
     if not jobs.DELETE_JOB_ID:
         raise HTTPException(409, NO_TABLE_REMOVE_JOB)
     ids = sorted(set(body.control_ids))
@@ -2363,6 +2407,7 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
 
     if (made := _made_already(body, after)) is not None:
         return made
+    _refuse_unready(_load_schedule(job_id)[0], preparing.tables_refusal)
     if body.csv is not None:
         entries, errors = js.read_databases(body.csv, body.columns)
     else:
@@ -2505,6 +2550,8 @@ def regroup_job(job_id: int, body: JobGroupsRequest, request: Request):
     if (made := _made_already(body, after)) is not None:
         return made
     job, members = _load_schedule(job_id)
+    if not preparing.is_ready(sch.options_of(job)):
+        return _regroup_stored(job, body, request)
     groups = _job_groups(job_id)
     plan = _regroup_plan(job["name"], db.query(q.groups_control_rows_sql(), (groups,)) if groups else [],
                          _sizing(body))
@@ -2515,6 +2562,7 @@ def regroup_job(job_id: int, body: JobGroupsRequest, request: Request):
         raise HTTPException(409, blocker)
     if plan["summary"]["unchanged"]:
         if body.tables_per_group:      # nothing moves, but the job keeps its new size for what's added later
+            _refuse_job_tables(job, groups, request)
             db.execute(q.set_schedule_option_sql(), ([TABLES_PER_GROUP_OPTION], int(body.tables_per_group), job_id))
         return {"summary": {**plan["summary"], "applied": True}, "blocked": None}
     _refuse_job_tables(job, groups + plan["new"], request)
@@ -2633,6 +2681,7 @@ def add_job_tables(job_id: int, body: JobTablesRequest, request: Request):
     if _jdbc_source(body.source) is not None:
         raise HTTPException(422, {"errors": ["these tables come from a JDBC connection, whose scope and trust belong to "
                                               "a job of their own: make a new ingestion job from them"]})
+    _refuse_unready(_load_schedule(job_id)[0], preparing.tables_refusal)
     return _add_job_tables(job_id, body, request)
 
 
@@ -3134,6 +3183,7 @@ class RunRequest(BaseModel):
 @app.post("/api/jobs/ingest/run")
 def run_ingest(body: RunRequest, request: Request):
     _refuse_run_of(_require(jobs.INGEST_JOB_ID, "ingestion"), request)
+    _refuse_unready_groups([body.task_collection], preparing.run_refusal)
     rid = jobs.run_now(_require(jobs.INGEST_JOB_ID, "ingestion"),
                        {"task_collection": body.task_collection, "parallelism": str(body.parallelism)})
     return {"run_id": rid}
@@ -4230,7 +4280,8 @@ class ScheduleBody(BaseModel):
     paused: bool = False
     notify_emails: Optional[str] = None
     options: dict = {}
-    members: List[str] = Field(min_length=1)
+    # At least one, checked by schedules.validate; a job that isn't Ready keeps its own (update_schedule).
+    members: List[str] = []
 
     @field_validator("timezone")
     @classmethod
@@ -4278,9 +4329,13 @@ def _load_schedule(sid: int, cur=None):
     return rows[0], members
 
 
-def _validate_schedule(body: ScheduleBody):
+def _validate_schedule(body: ScheduleBody, members_kept: bool = False):
+    """The schedule's checks (schedules.validate). members_kept: the job keeps its members as they are (it isn't Ready,
+    and its prepare task makes its groups, which may have no tables yet), so they aren't checked."""
     known = [r["task_collection"] for r in db.query(q.collections_sql())]
     errs = sch.validate(body.model_dump(), known, jobs.schedule_variants())
+    if members_kept:
+        errs = [e for e in errs if not e.startswith("members:")]
     if errs:
         raise HTTPException(422, {"errors": errs})
 
@@ -4290,10 +4345,11 @@ def _validate_schedule(body: ScheduleBody):
 # A job's tables per group, set at Create or by a regroup that names one.
 TABLES_PER_GROUP_OPTION = "tables_per_group"
 # A job made by Create stores its target names' rule here (job_settings.UNITY_CATALOG_NAMES); a job without it keeps the
-# older rule, so its names are as they were.
+# older rule, so its names are as they were. Its preparation record (preparing.OPTION) holds its state, what Create was
+# asked for and by whom, and its set-aside databases: no edit reaches it, so none changes them behind the checks.
 MANAGED_OPTIONS = ("updated_by", sch.COPY_OPTION, "cluster_copy_run_id", "delete_run_id", "delete_drop_targets",
                    "delete_start_error", "delete_finished", rediscovery.RECORD, TABLES_PER_GROUP_OPTION,
-                   js.TARGET_NAMES_OPTION, table_removal.OPTION, table_removal.EXCLUDED)
+                   js.TARGET_NAMES_OPTION, table_removal.OPTION, table_removal.EXCLUDED, preparing.OPTION)
 
 
 def _requested_options(body: "ScheduleBody") -> dict:
@@ -4719,12 +4775,12 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
         stages.begin_write()
         state["stage"] = "writing"
         if sid is None:
+            stored = {**options, preparing.OPTION: _create_record(body, run, user, settings)}
             try:
                 with _write() as cur:
                     cur.execute(q.insert_schedule_sql(), (name, run.cadence_minutes, timezone_, json.dumps(run.parameters),
                                                           run.job_variant or "default", run.stagger, run.paused,
-                                                          run.notify_emails or None, json.dumps(options) if options else None,
-                                                          user or None))
+                                                          run.notify_emails or None, json.dumps(stored), user or None))
                     sid = cur.fetchone()[0]
                     _keep_selection(cur, sid, {"parts": selection_parts, "kind": kind, "source_id": source_id}, user)
                     _touch(cur, user, [sid])
@@ -5061,6 +5117,7 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
     offs = sch.offsets(plan["groups"], run.cadence_minutes, run.stagger, sch.start_minute({"options": options, "cadence_minutes": run.cadence_minutes}))
     batch = uuid.uuid4().hex[:12]
     rows = [line["row"] for line in plan["lines"]]
+    stored = {**options, preparing.OPTION: _create_record(body, run, user, plan["settings"])}
 
     def write(progress, task_id):
         try:
@@ -5068,8 +5125,7 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
                 _lock_collections(cur, plan["groups"])
                 cur.execute(q.insert_schedule_sql(), (name, run.cadence_minutes, timezone_, json.dumps(run.parameters),
                                                       run.job_variant or "default", run.stagger, run.paused,
-                                                      run.notify_emails or None, json.dumps(options) if options else None,
-                                                      user or None))
+                                                      run.notify_emails or None, json.dumps(stored), user or None))
                 sid = cur.fetchone()[0]
                 _insert_controls(cur, rows, user, batch, progress=progress)
                 _refuse_mixed_sinks(cur, rows)
@@ -5144,6 +5200,396 @@ def _create_after_discovery(body: NewJobRequest, request: Request, progress, tas
     return result
 
 
+# ---- a new job's preparation (preparing.py): its state, what Create was asked for, its set-aside databases ----------
+# Today's Create writes every table before it answers, so the job it makes is Ready at once; its record keeps what it
+# was asked for and by whom. Stage B's prepare task, which records the job at once and writes it later, plugs in here:
+# it moves the record with _move_prepare (stage and progress), sets aside what it can't take with _set_aside (and takes
+# a database off the list with _clear_set_aside once it is read or planned again), runs _prepare_checks before its
+# write and inside each of its transactions, and ends with _make_ready once the job's Databricks jobs are made.
+
+# The change log's user for what the app does by itself as a job becomes Ready (its schedule turned on).
+PREPARE_USER = "preparing"
+NO_RECORD = ("this job keeps no record of what Create was asked for (it was made before the app kept one), so it has "
+             "nothing to prepare")
+NOTHING_SET_ASIDE = "the job is ready: nothing is set aside to act on"
+
+
+def _create_record(body: "NewJobRequest", run: "NewJobRun", user: str, settings: dict) -> dict:
+    """A new job's preparation record (preparing.new_record), written with the job: its settings as asked, its sizing,
+    its run parameters as checked (run.parameters, after _new_job_source), what it was chosen from, whether its
+    schedule is to be on, and its maker, the user making it. A Create from CSV lines in the request has no source to
+    read again (kind csv)."""
+    source = {"kind": "csv", "source_id": None}
+    if body.source is not None:
+        kind, _, source_id = body.source.source()
+        source = {"kind": kind, "source_id": source_id}
+    return preparing.new_record(user, settings, {"tables_per_group": body.tables_per_group,
+                                                 "groups_per_server": body.groups_per_server},
+                                run.parameters, source, turn_on=not run.paused)
+
+
+def _update_prepare(sid: int, change, cur=None) -> tuple:
+    """Change a job's preparation record in one transaction (the caller's, or one of its own) under the job's schedule
+    lock, which its edits and syncs take too: the record and the job read fresh, change(record, job) gives back
+    (the new record, anything else), and the record is written whole. Returns what change gave. 409 without a record."""
+    def apply(cur):
+        cur.execute(q.schedule_lock_sql(), (q.SCHEDULE_LOCK_CLASS, q.schedule_lock_key(sid)))
+        job = _load_schedule(sid, cur)[0]
+        record = preparing.record_of(sch.options_of(job))
+        if record is None:
+            raise HTTPException(409, NO_RECORD)
+        new, extra = change(record, job)
+        if new != record:
+            cur.execute(q.set_prepare_sql(), (json.dumps(new, default=str), int(sid)))
+        return new, extra
+
+    if cur is not None:
+        return apply(cur)
+    with _write() as cur:
+        return apply(cur)
+
+
+def _move_prepare(sid: int, state: Optional[str] = None, stage: Optional[str] = None, progress: Optional[dict] = None,
+                  cur=None) -> dict:
+    """For stage B's prepare task: move the job's record to a state and stage (preparing.moved), with its progress
+    merged over the last. Nothing prepares a deleted job, so its record is left as it is. Returns the record."""
+    def change(record, job):
+        if job.get("deleted_at") is not None:
+            return record, None
+        return preparing.moved(record, state, stage, progress), None
+    return _update_prepare(sid, change, cur)[0]
+
+
+def _set_aside(sid: int, entries: List[dict], cur=None) -> dict:
+    """For stage B's prepare task: set these databases aside (preparing.entry each, with why), in the transaction that
+    found them when given one; the job Needs you while one waits for a choice. Returns the record."""
+    return _update_prepare(sid, lambda record, job: (preparing.with_set_aside(record, entries), None), cur)[0]
+
+
+def _clear_set_aside(sid: int, keys: Iterable[str], cur=None) -> dict:
+    """For stage B's prepare task: these databases (preparing.database_key) were read or planned again and taken, so
+    they leave the set-aside list. Returns the record."""
+    return _update_prepare(sid, lambda record, job: (preparing.cleared(record, list(keys)), None), cur)[0]
+
+
+def _make_ready(sid: int) -> dict:
+    """For stage B's prepare task, last: the job is Ready. A schedule that was to turn on does when whoever asked for it
+    (at Create, its maker) may still run what it starts, read now, with no request behind it; otherwise it stays
+    paused and the record says why. The wrapper jobs are synced after. Returns the record."""
+    job = _load_schedule(sid)[0]
+    record = preparing.record_of(sch.options_of(job))
+    if record is None:
+        raise HTTPException(409, NO_RECORD)
+    asked_by = record.get("turn_on_by") or record.get("maker") or ""
+    refusal = _permission_refusals(job, asked_by)["run"] if record.get("turn_on") else None
+
+    def change(record, job):
+        if preparing.is_ready({preparing.OPTION: record}):
+            return record, False
+        wanted = bool(record.get("turn_on")) and job.get("deleted_at") is None
+        kept = refusal if wanted else None
+        return preparing.ready(record, kept_paused=kept), wanted and kept is None and bool(job["paused"])
+
+    with _write() as cur:
+        record, turn_on = _update_prepare(int(sid), change, cur)
+        if turn_on:
+            cur.execute(q.update_schedule_sql(["paused"]), (False, int(sid)))
+            _log(cur, PREPARE_USER, "schedule_resume", None, None, f"{job['name']}.paused", True, False)
+    _sync(int(sid), PREPARE_USER)
+    return record
+
+
+@dataclass(slots=True, kw_only=True)
+class PreparedSource:
+    """What a prepared job's write takes, checked again from its record (_prepare_checks): who made the job, the JDBC
+    connection it reads through as stored now (None for none), its run parameters with that connection's scope and
+    trust, what it was chosen from (None for CSV lines in the request), its settings as asked and its sizing."""
+    maker: str
+    connection: Optional[dict]
+    parameters: dict
+    selection: Optional[Selection]
+    settings: dict
+    sizing: placement.Groups
+
+
+def _prepare_checks(sid: int, rows: Optional[List[dict]] = None, cur=None) -> PreparedSource:
+    """The write-time checks of a job's preparation (N1, N4 and N6), from its record, with its maker, read now. Stage B
+    calls it before its write (no rows) and again inside each transaction of the write, with that transaction's rows
+    and cursor, as _create_by_database runs _new_job_source and _refuse_job_rows. No request is behind it: the maker is
+    the one Create stored, and their rights are read again (one who is no longer an app manager is refused a read by
+    host and password, or a secret scope); the JDBC connection and its logins are read as they are now (a login typed
+    again under one of its keys for another connection refuses the rows that key reads). Refusals raise as they do on
+    Create's own path."""
+    job = (_load_schedule(sid, cur) if cur is not None else _load_schedule(sid))[0]
+    options = sch.options_of(job)
+    record = preparing.record_of(options)
+    if record is None:
+        raise HTTPException(409, NO_RECORD)
+    maker = record.get("maker") or ""
+    selection = _stored_selection(int(sid), record, cur)
+    kept = {k: v for k, v in _parameters_of(job).items() if k not in preparing.SCOPE_PARAMETERS}
+    run = NewJobRun(parameters={**kept, **(record.get("scope") or {})})
+    connection = _new_job_source(run, selection, maker, applying=True)
+    if rows:
+        _refuse_job_rows(rows, connection, maker, cur=cur)
+    sizing = record.get("sizing") or {}
+    return PreparedSource(maker=maker, connection=connection, parameters=run.parameters, selection=selection,
+                          settings=dict(record.get("settings") or {}),
+                          sizing=placement.sizing(sizing.get("groups_per_server"), sizing.get("tables_per_group"),
+                                                  options.get(TABLES_PER_GROUP_OPTION)))
+
+
+def _stored_selection(sid: int, record: dict, cur=None) -> Optional[Selection]:
+    """What a job was chosen from, as a selection again: its job_selection rows (only the app writes them, and while the
+    job isn't Ready only its Create has), and the source its record names. None for a Create from CSV lines in the
+    request, which has no source to read again."""
+    parts = (db.fetch(cur, q.job_selection_sql(), (int(sid),)) if cur is not None
+             else db.query(q.job_selection_sql(), (int(sid),)))
+    source = record.get("source") or {}
+    kind = source.get("kind") or next((p["source_kind"] for p in parts), None)
+    source_id = source.get("source_id") or next((p["source_id"] for p in parts), None)
+    if kind not in SOURCE_KINDS or not source_id:
+        return None
+    whole = [p for p in parts if p["scope"] == "server"]
+    chosen = {"whole_server": bool(whole), "filter": (whole[0].get("filter") or "") if whole else "",
+              "databases": [SelectedDatabase(server=p["server"], database=p["src_database"])
+                            for p in parts if p["scope"] == "database"],
+              "tables": [SelectedTables(server=p["server"], database=p["src_database"], tables=list(p["tables"] or []))
+                         for p in parts if p["scope"] == "tables" and p.get("tables")]}
+    try:
+        if kind == "upload":
+            return Selection(upload_id=str(source_id), **chosen)
+        return Selection(discovery_ids=str(source_id).split(","), **chosen)
+    except ValueError:
+        raise HTTPException(409, "what this job was chosen from can't be read back from its selection")
+
+
+def _job_reads(job: dict) -> Optional[dict]:
+    """Where the reads of a job's claimed drafts stand (queries.job_reads_sql), or None when it was chosen from no
+    discovery."""
+    selection = db.query(q.job_selection_sql(), (int(job["id"]),))
+    source = (preparing.record_of(sch.options_of(job)) or {}).get("source") or {}
+    ids = {i for part in selection if part["source_kind"] == "discovery" for i in str(part["source_id"] or "").split(",")}
+    if source.get("kind") == "discovery":
+        ids |= set(str(source.get("source_id") or "").split(","))
+    ids.discard("")
+    if not ids:
+        return None
+    return db.query(q.job_reads_sql(), (preparing.RATE_WINDOW_S, sorted(ids), str(int(job["id"]))))[0]
+
+
+@app.get("/api/ingestion-jobs/{job_id}/prepare")
+def job_preparation(job_id: int, request: Request):
+    """Where a job's preparation stands, for its page (preparing.view): its state and stage, the reading of its claimed
+    drafts while it isn't Ready (of how many databases, how many are read, the tables so far, the minutes left), the
+    write's progress as the prepare task reports it, the set-aside and left-out databases, and why the user may not
+    take each action on them. Read only. A job made before the record is Ready."""
+    job = _load_schedule(job_id)[0]
+    options = sch.options_of(job)
+    reads = None if preparing.is_ready(options) else _job_reads(job)
+    refusals = _permission_refusals(job, _user(request))
+    acting = refusals["change"] or (NOTHING_SET_ASIDE if preparing.is_ready(options) else None)
+    return {"id": int(job_id), **preparing.view(options, reads),
+            "actions": {"read_again": acting, "leave_out": acting, "targets": acting, "delete": refusals["delete"]}}
+
+
+class SetAsideRequest(BaseModel):
+    """The set-aside databases an action takes: those named, or, with none named, every one it applies to."""
+    databases: Optional[List[SelectedDatabase]] = Field(None, max_length=5000)
+
+
+def _set_aside_keys(body: SetAsideRequest) -> Optional[List[str]]:
+    return None if body.databases is None else [preparing.database_key(d.server, d.database) for d in body.databases]
+
+
+def _refuse_set_aside_action(job: dict, request: Request) -> None:
+    """The set-aside actions change the job, so they follow Edit's check: the user's Can Manage on the job's Databricks
+    job (or ownership, or a workspace admin), read now; a deleted job refuses them. Only while the job isn't Ready."""
+    _refuse_job(job, request, "change")
+    if preparing.is_ready(sch.options_of(job)):
+        raise HTTPException(409, NOTHING_SET_ASIDE)
+
+
+def _set_aside_action(job_id: int, request: Request, action: str, change) -> tuple:
+    """One set-aside action: checked (_refuse_set_aside_action), then the record changed under the job's lock (still not
+    Ready, still not deleted), with a change log line naming how many databases it took. change(record, user) gives
+    back (the record, how many)."""
+    user = _user(request)
+    job = _load_schedule(job_id)[0]
+    _refuse_set_aside_action(job, request)
+
+    def apply(record, job_now):
+        if job_now.get("deleted_at") is not None:
+            raise HTTPException(409, DELETED_JOB)
+        if preparing.is_ready({preparing.OPTION: record}):
+            raise HTTPException(409, NOTHING_SET_ASIDE)
+        return change(record, user)
+
+    with _write() as cur:
+        record, count = _update_prepare(int(job_id), apply, cur)
+        if count:
+            _log(cur, user, action, None, None, job["name"], None, f"{count} {'database' if count == 1 else 'databases'}")
+            _touch(cur, user, [int(job_id)])
+    return record, count
+
+
+@app.post("/api/ingestion-jobs/{job_id}/prepare/read-again")
+def read_set_aside_again(job_id: int, body: SetAsideRequest, request: Request):
+    """Read them again: the databases that couldn't be read (those named, or all of them) are marked to be read again,
+    and the job is Preparing again once none waits for a choice. The read itself is the prepare task's."""
+    record, marked = _set_aside_action(job_id, request, "prepare_read_again",
+                                       lambda record, user: preparing.read_again(record, _set_aside_keys(body), user))
+    return {"id": int(job_id), "marked": marked, **preparing.summary({preparing.OPTION: record})}
+
+
+@app.post("/api/ingestion-jobs/{job_id}/prepare/leave-out")
+def leave_set_aside_out(job_id: int, body: SetAsideRequest, request: Request):
+    """Leave them out: the set-aside databases (those named, or all that wait for a choice) come out of the job's choice,
+    which its write and a later re-discovery leave out, and the job goes on."""
+    record, left = _set_aside_action(job_id, request, "prepare_leave_out",
+                                     lambda record, user: preparing.leave_out(record, _set_aside_keys(body), user))
+    return {"id": int(job_id), "left_out": left, **preparing.summary({preparing.OPTION: record})}
+
+
+class TargetNamesRequest(BaseModel):
+    """The job's target name templates, any of the three; the others keep what Create was asked for."""
+    sink_catalog: Optional[str] = Field(None, max_length=255)
+    sink_schema: Optional[str] = Field(None, max_length=255)
+    sink_table: Optional[str] = Field(None, max_length=255)
+    dry_run: bool = True
+
+
+def _target_names(job: dict, record: dict, body: TargetNamesRequest) -> dict:
+    """The record's settings with the request's target templates, checked as Create checks them (422 naming why)."""
+    given = {k: getattr(body, k) for k in preparing.TARGET_FIELDS if getattr(body, k) is not None}
+    settings = nj.settings_of({**(record.get("settings") or {}), **given}, new_job=True)
+    errors = nj.setting_errors(settings, require_target=True, unity_catalog=_unity_catalog(job))
+    if errors:
+        raise HTTPException(422, {"errors": errors})
+    return given
+
+
+@app.post("/api/ingestion-jobs/{job_id}/prepare/targets")
+def change_set_aside_targets(job_id: int, body: TargetNamesRequest, request: Request):
+    """Change the job's target names: preview (dry_run, the default) or store new target templates in the job's record,
+    and mark the databases set aside for a clash to be planned again with them. The new plan is the prepare task's."""
+    job = _load_schedule(job_id)[0]
+    record = preparing.record_of(sch.options_of(job))
+    if record is None or preparing.is_ready(sch.options_of(job)):
+        raise HTTPException(409, NOTHING_SET_ASIDE)
+    given = _target_names(job, record, body)
+    clashes = sum(1 for e in (record.get("set_aside") or {}).values() if e.get("kind") == preparing.CLASH)
+    if body.dry_run:
+        return {"id": int(job_id), "targets": given, "replan": clashes, "applied": False}
+    record, marked = _set_aside_action(
+        job_id, request, "prepare_targets",
+        lambda record, user: preparing.change_targets(record, _target_names(job, record, body), user))
+    return {"id": int(job_id), "targets": given, "replan": marked, "applied": True,
+            **preparing.summary({preparing.OPTION: record})}
+
+
+def _keep_paused_when_ready(job: dict, user: str) -> dict:
+    """Pause on a job that isn't Ready: it is paused already, so Pause keeps its schedule off once it is Ready too (its
+    record's turn_on), logged as a pause."""
+    def change(record, job_now):
+        return preparing.with_turn_on(record, False, user), bool(record.get("turn_on"))
+
+    with _write() as cur:
+        _, was_on = _update_prepare(int(job["id"]), change, cur)
+        if was_on:
+            _log(cur, user, "schedule_pause", None, None, f"{job['name']}.turn_on_when_ready", True, False)
+            _touch(cur, user, [int(job["id"])])
+    return {"id": int(job["id"]), "paused": True, "turn_on": False, "sync": []}
+
+
+# The settings Edit shows (job_settings.read's keys), read from a record for a job that isn't Ready.
+STORED_SETTINGS_SHOWN = ("fan_in", "write_mode_changes", "write_mode_full", "freshness_sla_minutes", "sink_catalog",
+                         "sink_schema", "sink_table")
+
+
+def _stored_settings(job: dict, groups: List[str]) -> dict:
+    """A job that isn't Ready has no tables yet, or not all of them: its settings are those its record keeps (what
+    Create was asked for), in the shape job_settings.read gives them (each a value), with why they can't be changed now
+    (settings_locked), if they can't."""
+    options = sch.options_of(job)
+    stored = nj.settings_of((preparing.record_of(options) or {}).get("settings") or {}, new_job=True)
+    shown = {k: {"value": stored.get(k)} for k in STORED_SETTINGS_SHOWN}
+    shown["client_id"] = {"value": stored["client_id"] if stored["fan_in"] else None}
+    shown["identity"] = {"value": dict(stored.get("identity") or {})}
+    shown["unity_catalog"] = {"value": _unity_catalog(job)}
+    tables = db.query(q.groups_row_count_sql(), (groups,))[0]["n"] if groups else 0
+    return {"job_id": int(job["id"]), "groups": groups, "tables": tables, "settings": shown, "identity_differs": [],
+            "reads_by_host": _job_jdbc(int(job["id"])) is not None, "stored": True,
+            "settings_locked": preparing.settings_refusal(options)}
+
+
+def _edit_stored_settings(job: dict, edits: dict, dry_run: bool, request: Request) -> dict:
+    """A settings edit of a job that isn't Ready: while its tables are still read, it changes the settings its record
+    keeps, which its write takes, checked as Create checks them; once the write has begun it waits for Ready
+    (preparing.settings_refusal). Applying needs the change permission, and is one transaction under the job's lock."""
+    _refuse_unready(job, preparing.settings_refusal)
+
+    def checked(record):
+        before = record.get("settings") or {}
+        settings = nj.settings_of({**before, **(edits or {})}, new_job=True)
+        errors = nj.given_errors(edits or {}) + nj.setting_errors(settings, require_target=True,
+                                                                  unity_catalog=_unity_catalog(job))
+        changed = sorted(k for k in settings if settings[k] != before.get(k))
+        summary = {"rows": 0, "changed": len(changed), "reseed": 0, "errors": len(errors), "applied": False,
+                   "stored": True, "settings_changed": changed}
+        if errors:
+            raise HTTPException(422, {"errors": errors, "summary": summary})
+        return settings, summary
+
+    if dry_run:
+        return {"summary": checked(preparing.record_of(sch.options_of(job)) or {})[1], "errors": []}
+    _refuse_job(job, request, "change")
+    user = _user(request)
+
+    def change(record, job_now):
+        _refuse_unready(job_now, preparing.settings_refusal)
+        settings, summary = checked(record)
+        summary["applied"] = True
+        return dict(record, settings=settings, updated_at=datetime.now(timezone.utc).isoformat()), summary
+
+    with _write() as cur:
+        _, summary = _update_prepare(int(job["id"]), change, cur)
+        for name in summary["settings_changed"]:
+            _log(cur, user, "schedule_edit", None, None, f"{job['name']}.settings.{name}", None, None)
+        if summary["changed"]:
+            _touch(cur, user, [int(job["id"])])
+    return {"summary": summary, "errors": []}
+
+
+def _regroup_stored(job: dict, body: "JobGroupsRequest", request: Request) -> dict:
+    """Groups of a job that isn't Ready: while its tables are still read, a new tables per group or groups per server is
+    kept on its record (and tables per group in its options, as a regroup keeps it), and its write places its databases
+    so; once the write has begun it waits for Ready. Nothing moves, as there are no tables to move yet."""
+    _refuse_unready(job, preparing.settings_refusal)
+    summary = {"servers": [], "databases_moving": 0, "tables_moving": 0, "new_groups": [], "emptied_groups": [],
+               "unchanged": True, "applied": False, "stored": True}
+    if body.dry_run:
+        return {"summary": summary, "blocked": None}
+    _refuse_job(job, request, "change")
+    user = _user(request)
+
+    def change(record, job_now):
+        _refuse_unready(job_now, preparing.settings_refusal)
+        sizing = {"tables_per_group": body.tables_per_group, "groups_per_server": body.groups_per_server}
+        return dict(record, sizing=sizing, updated_at=datetime.now(timezone.utc).isoformat()), None
+
+    with _write() as cur:
+        _update_prepare(int(job["id"]), change, cur)
+        if body.tables_per_group:
+            cur.execute(q.set_schedule_option_sql(), ([TABLES_PER_GROUP_OPTION], int(body.tables_per_group),
+                                                      int(job["id"])))
+        _log(cur, user, "schedule_edit", None, None, f"{job['name']}.sizing", None,
+             f"{body.tables_per_group} tables per group" if body.tables_per_group
+             else f"{body.groups_per_server} groups per server" if body.groups_per_server else "the default")
+        _touch(cur, user, [int(job["id"])])
+    return {"summary": {**summary, "applied": True}, "blocked": None}
+
+
 @app.post("/api/schedules/{sid}")
 def update_schedule(sid: int, body: ScheduleBody, request: Request):
     """Edit a schedule: fields, and members added or removed. Offsets are recomputed; jobs are synced. A change to its
@@ -5151,13 +5597,20 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     import psycopg
     sent_options = "options" in body.model_fields_set   # read first: assigning body.options marks it as sent
     body.options = _requested_options(body)
-    _validate_schedule(body)
+    s, members = _load_schedule(sid)
+    # A job that isn't Ready keeps the groups its prepare task makes, whatever the request names; its name, schedule,
+    # e-mails and advanced settings change as for any job, and its schedule turns on only once it is Ready.
+    prepared = preparing.is_ready(sch.options_of(s))
+    if not prepared:
+        body.members = sorted({m["task_collection"] for m in members if m["removed_at"] is None})
+    _validate_schedule(body, members_kept=not prepared)
     _refuse_unknown_node_types(sch.own_cluster(body.model_dump()))
     user = _user(request)
-    s, members = _load_schedule(sid)
     if s["deleted_at"] is not None:
         raise HTTPException(409, "schedule was deleted")
     _refuse_job(s, request, "change")
+    if not body.paused:
+        _refuse_unready(s, preparing.turn_on_refusal)
     if (body.job_variant or "default") != (s["job_variant"] or "default") and not body.paused:
         _refuse(_permission_refusals({"job_variant": body.job_variant}, user)["run"])
     body.stagger = body.stagger and body.job_variant != sch.CHECK_VARIANT
@@ -5169,6 +5622,9 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
     _refuse_login_scope(new.get("parameters"), job_connection)
     if job_connection is None:
         _refuse_scope_parameter(new.get("parameters"), user, _parameters_of(s))
+    if not prepared:
+        changed_scope = preparing.scope_changed(_parameters_of(s), new.get("parameters"))
+        _refuse_unready(s, lambda options: preparing.scope_refusal(options, changed_scope))
     new["notify_emails"] = new["notify_emails"] or None
     new["job_variant"] = new["job_variant"] or "default"
     stored = sch.options_of(s)
@@ -5194,6 +5650,12 @@ def update_schedule(sid: int, body: ScheduleBody, request: Request):
         with _write() as cur:
             # Serialized with job-wide edits (_lock_job) and syncs, which read the members under this lock.
             cur.execute(q.schedule_lock_sql(), (q.SCHEDULE_LOCK_CLASS, q.schedule_lock_key(sid)))
+            if "options" in changed:
+                # The app's own options as they are now, under the lock: a prepare task or a re-discovery may have
+                # moved its record on since the request read them.
+                fresh = sch.options_of(_load_schedule(sid, cur)[0])
+                new["options"] = {**{k: v for k, v in (new["options"] or {}).items() if k not in MANAGED_OPTIONS},
+                                  **{k: fresh[k] for k in MANAGED_OPTIONS if k in fresh}} or None
             if changed:
                 vals = [(json.dumps(new[f]) if new[f] is not None else None) if f in q.JSON_SCHEDULE_FIELDS else new[f]
                         for f in changed]
@@ -5226,6 +5688,10 @@ def _set_paused(sid: int, paused: bool, request: Request):
     if s["deleted_at"] is not None:
         raise HTTPException(409, "schedule was deleted")
     _refuse_job(s, request, "change")
+    if not paused:
+        _refuse_unready(s, preparing.turn_on_refusal)
+    elif not preparing.is_ready(sch.options_of(s)):
+        return _keep_paused_when_ready(s, user)
     if bool(s["paused"]) != paused:
         with _write() as cur:
             cur.execute(q.update_schedule_sql(["paused"]), (paused, int(sid)))
@@ -5761,7 +6227,8 @@ def _rediscovery_tick(now: Optional[datetime] = None) -> List[int]:
     now = now or datetime.now(timezone.utc)
     started = []
     for job in db.query(q.schedules_sql()):
-        if not rediscovery.is_due(sch.options_of(job), now, bool(job["paused"])):
+        options = sch.options_of(job)
+        if not preparing.is_ready(options) or not rediscovery.is_due(options, now, bool(job["paused"])):
             continue
         claimed = db.query(q.claim_rediscovery_sql(),
                            (json.dumps(rediscovery.running_record(now)), job["id"], rediscovery.STALE_S))
@@ -5777,6 +6244,7 @@ def rediscover_now(job_id: int, request: Request):
     so a run already going (not yet stale) refuses it: the job page's Run now stays off until that run has ended."""
     s = _load_schedule(job_id)[0]
     _refuse(_job_permission_refusals(s, _user(request))["change"])
+    _refuse_unready(s, preparing.tables_refusal)
     now = datetime.now(timezone.utc)
     claimed = db.query(q.claim_rediscovery_sql(),
                        (json.dumps(rediscovery.running_record(now)), int(job_id), rediscovery.STALE_S))
@@ -5883,8 +6351,10 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
         with _write() as cur:
             groups = _lock_job(cur, sid)
             job_rows = db.fetch(cur, q.groups_control_rows_sql(for_update=True), (groups,)) if groups else []
-            excluded = table_removal.exclusions_of(sch.options_of(_load_schedule(sid, cur)[0]))
-            picked = rediscovery.wanted(discovery_parts, found, statuses, job_rows, excluded)
+            options = sch.options_of(_load_schedule(sid, cur)[0])
+            excluded = table_removal.exclusions_of(options)
+            picked = rediscovery.wanted(discovery_parts, preparing.without_left_out(found, options), statuses, job_rows,
+                                        excluded)
             limit = rediscovery.REPORT_LIMIT
             outcome = {"found": len(picked["add"]), "added": 0, "skipped": 0,
                        "new_databases": picked["new_databases"][:limit],

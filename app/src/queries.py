@@ -2763,6 +2763,29 @@ def set_rediscovery_sql() -> str:
             f"%s::jsonb) where id = %s")
 
 
+def set_prepare_sql() -> str:
+    """Write a job's preparation record (options.prepare, preparing.py), whole. Params: the record as JSON, id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), '{{prepare}}', "
+            f"%s::jsonb) where id = %s")
+
+
+def job_reads_sql() -> str:
+    """Where the reads of a job's claimed drafts stand, for its Preparing bar: its databases, those still to read, read,
+    failed and their tables, how many finished within the last window, and how long ago the first was started. Only
+    the rows its Create claimed (listing.job_id) of the discoveries it was chosen from, so the primary key finds them;
+    a database its draft dropped counts nowhere, as in draft_reads_sql. Params: the window in seconds, discovery ids
+    (text[]), job id (as text)."""
+    return (f"select count(*) as databases, "
+            f"count(*) filter (where status = 'running' and not listing ? 'discarded') as pending, "
+            f"count(*) filter (where status = 'ok') as done, count(*) filter (where status = 'failed') as failed, "
+            f"coalesce(sum(tables) filter (where status = 'ok'), 0) as tables, "
+            f"count(*) filter (where status in ('ok', 'failed') "
+            f"and finished_at >= now() - make_interval(secs => %s)) as recent, "
+            f"coalesce(extract(epoch from now() - min(started_at)), 0)::float as elapsed_s "
+            f"from {SCHEMA}.discovery where discovery_id = any(%s::text[]) and listing ->> 'job_id' = %s "
+            f"and status <> 'listed' and not ({DROPPED})")
+
+
 def selection_discoveries_sql() -> str:
     """The discovery rows a selection was made from (one per database read): the server's connection or host and port,
     its secrets, its listing and when each was read. Param: list of discovery ids."""
