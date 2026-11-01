@@ -202,9 +202,9 @@ are the read's own `discovery` and `discovered_table` rows, marked `draft` in `l
   Ticked again, it comes back; one read already isn't read again. A whole-server read's databases aren't dropped one
   by one: changing its filter discards that draft and starts another. Create takes the dropped rows with the rest of
   the draft, so the purge never takes a part of a job's discovery.
-- **Create** is enabled throughout. Pressed early, it waits for the rest of the read in a background task (its
-  progress shows "reading the chosen databases' tables first"), then writes. A database that couldn't be read stops it
-  by name before anything is written; one the whole server's read couldn't open is left out and counted.
+- **Create** is enabled throughout. Pressed early, it records the job at once and the job's prepare task waits for
+  the rest of the read, then writes (see A new job's preparation). A database that couldn't be read is set aside on
+  the job, with why; one the whole server's read couldn't open is left out and counted.
 - Create's transaction takes the draft: the mark comes off and the job is named on its rows.
 - **Cancel**, leaving the page, or choosing the tables again before Create discards the draft
   (`POST /api/discoveries/{id}/discard`, by `sendBeacon` as the page closes): nothing more is read and its statements
@@ -363,8 +363,32 @@ no schema change):
 | **Needs you** | some of its databases are set aside, each with why, until someone chooses what happens to them |
 | **Ready** | it runs as any job does |
 
-A job with no record, every job made before it, is Ready. Create writes every table before it answers, so a job it
-makes now is Ready at once; the other two states are for a job recorded first and written in the background.
+A job with no record, every job made before it, is Ready.
+
+**Create at once.** A Create from CSV lines in the request, or from a source whose tables are all read, of 5,000 tables
+or fewer, writes every table before it answers, as before, and the job is Ready at once. Any other Create (its tables
+still being read, a database that couldn't be read, more than 5,000 tables, or a file with database-only lines)
+records the job at once and answers with its id; the page opens the job. Before it answers it checks what needs only
+names and settings: the job's name, the target templates, that the group names it would make are free, that no chosen
+database is already in another job, live or deleted, by its key, the source and scope rules, the right to run what it
+starts when the schedule is to be on, and, for database-only lines, the right to run discovery. Then one transaction
+writes the job (paused, no groups yet), its record (Preparing), what it was chosen from with its drafts claimed, and its
+prepare task. `PREPARE_CREATES=0` keeps the earlier Create, which waits for the read and the write in a task of its own.
+
+**The prepare task** (an `app_task` of kind `prepare`, one per job) waits for the reads through the background reader,
+then writes the tables database by database, each database whole in its own transaction, then syncs the job's
+Databricks jobs and makes it Ready. Each transaction takes the job's schedule lock and checks that the task is still its
+thread's (an owner token, with a fresh heartbeat) and the job still preparing, so two app instances never write one job:
+a task is claimed (`FOR UPDATE SKIP LOCKED`) only when no thread holds it. Every instance looks every
+`PREPARE_RESUME_S` (30 s; 0 turns it off) for a preparing job whose task no thread holds (its heartbeat stale after
+`TASK_STALE_S`, or failed more than that ago) and starts it again: a database written is skipped whole, a read done is
+not sent again, and a file's discovery run is kept on the record, so nothing is read or written twice. A job left with
+nothing to write (every database left out) is stopped, never made Ready empty.
+
+**Stop preparing** cancels the statements going, discards the reads still to do and ends the task; the job stays paused
+with its choice and what was read, and **Prepare again** goes on from there. Delete stops the prepare the same way
+first, then deletes as before; only a write of the task in progress (the job's lock) holds it up, never the task's
+heartbeat. Both need Can Manage on the job, as Edit does.
 
 **What Create was asked for is kept.** The record holds the job's settings (targets, load type, fan-in, write modes,
 identity columns), its tables per group or groups per server, its secret scope and trust as Create checked them, the
@@ -383,14 +407,23 @@ run what it starts. How it writes and its group size can be changed while its ta
 record's settings, checked as Create checks them. Once the write has begun they wait for Ready, so one job never has
 two rules. Delete is as for any job.
 
-**A database set aside** is listed on the job page with why: it couldn't be read (the server's message), or its tables
-clash with another job's or with each other (the target, and the other job). In a whole-server choice a database the
-login can't open is only left out, and listed. The job page offers, each needing Can Manage on the job, as Edit does:
-- **Read them again**: the unreadable ones are marked to be read again;
-- **Leave them out**: they come out of the job's choice, which a later re-discovery leaves out too, and the job goes on;
-- **Change the job's target names**: new target templates, checked first, and the clashing databases are planned again
-  with them;
+**A database set aside** is set aside whole, never part of it, and listed on the job page with why: it couldn't be read
+(the server's message), or its tables are refused at the write (a target another table already writes, two of the
+job's tables writing one target, a sink both dedicated and shared, a database a deleted job keeps). The rest are
+written. In a whole-server choice a database the login can't open is only left out, and listed. While any waits the job
+Needs you and isn't Ready. The job page offers, each needing Can Manage on the job, as Edit does:
+- **Read them again**: the unreadable ones' rows are reset in the same transaction, so the background reader reads them
+  (a file's database-only lines get a new discovery run);
+- **Leave them out**: they come out of the job's choice, which a later re-discovery leaves out too, and the job goes on,
+  Ready when nothing else is left;
+- **Change the job's target names**: new target templates, checked first; the clashing databases come off the list and
+  are planned again with them;
 - **Delete the job**.
+
+The record stays small, as every page of jobs reads it: the counts of each kind, every clash, and the first 200 of the
+rest. `GET /api/ingestion-jobs/{id}/prepare/set-aside` pages them all, read only: `kind=reads` from the job's claimed
+draft rows (those that couldn't be read), `kind=clash` from the record. A database un-ticked before Create counts
+nowhere.
 
 **The job page** shows "Preparing: reading tables, 1,240 of 3,000 databases (58,280 tables so far), about 12 min left"
 with a progress bar, read every 3 seconds from `GET /api/ingestion-jobs/{id}/prepare`, which counts the job's claimed
