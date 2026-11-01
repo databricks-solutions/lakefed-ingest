@@ -20,9 +20,25 @@ def test_the_variable_exists_and_is_blank_by_default():
 
 def test_the_app_is_told_the_variable_and_keeps_the_bundles_own_warehouse_from_its_resource():
     text = RESOURCES.read_text()
-    assert "          - name: APP_WAREHOUSE_ID\n            value: ${var.app_warehouse_id}\n" in text
+    assert "          - name: APP_WAREHOUSE_ID\n            value: id:${var.app_warehouse_id}\n" in text
     assert "          - name: WAREHOUSE_ID\n            value_from: discovery-warehouse\n" in text
     assert "            id: ${resources.sql_warehouses.lakefed_ingest_discovery.id}\n" in text
+
+
+def test_no_app_env_entry_renders_blank_with_the_variables_at_their_defaults():
+    # Databricks Apps refuses an env entry whose value renders blank ("Must specify environment variable source using
+    # either value or valueFrom"; the 1 Nov deploy with app_warehouse_id blank). Render each entry with every variable
+    # whose default is blank set to blank, and check it still carries a value.
+    import re
+    blank = set(re.findall(r'\n  ([a-z_]+):\n(?:    .*\n)*?    default: ""\n', VARIABLES.read_text()))
+    assert "app_warehouse_id" in blank
+    env = RESOURCES.read_text().split("        env:\n", 1)[1].split("      resources:\n", 1)[0]
+    entries = re.findall(r"- name: (\S+)\n\s+(value|value_from): ?(.*)\n", env)
+    assert len(entries) == env.count("- name: ") and entries
+    for name, kind, raw in entries:
+        rendered = re.sub(r"\$\{var\.([a-z_]+)\}", lambda m: "" if m.group(1) in blank else "x",
+                          raw.strip().strip('"'))
+        assert kind == "value_from" or rendered, f"{name} renders blank when its variable is at its blank default"
 
 
 def test_the_grants_job_is_passed_the_variable():

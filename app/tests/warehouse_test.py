@@ -145,6 +145,15 @@ def test_the_bundles_own_warehouse_is_used_when_app_warehouse_id_is_unset_or_bla
     assert warehouse.chosen_warehouse({}) == ("", "the bundle's own")
 
 
+def test_the_bundles_id_prefix_is_read_as_the_setting_and_a_bare_prefix_as_unset():
+    # The bundle always sends "id:<app_warehouse_id>", since Databricks Apps refuses a blank env value (1 Nov deploy).
+    assert warehouse.chosen_warehouse({"APP_WAREHOUSE_ID": "id:", "WAREHOUSE_ID": "own"}) == ("own", "the bundle's own")
+    assert warehouse.chosen_warehouse({"APP_WAREHOUSE_ID": "id:  ", "WAREHOUSE_ID": "own"}) == (
+        "own", "the bundle's own")
+    assert warehouse.chosen_warehouse({"APP_WAREHOUSE_ID": "id:4a07038bb7c29b51", "WAREHOUSE_ID": "own"}) == (
+        "4a07038bb7c29b51", "app_warehouse_id")
+
+
 def test_every_statement_goes_to_the_chosen_warehouse(workspace, monkeypatch):
     client = workspace(_Statements([_answer(StatementState.PENDING)]))
     monkeypatch.setattr(warehouse, "WAREHOUSE_ID", warehouse.chosen_warehouse(

@@ -50,8 +50,10 @@ resources:
             value: ${var.deleted_job_retention_days}
           - name: WAREHOUSE_ID
             value_from: discovery-warehouse
+          # Always a value: Databricks Apps refuses an env entry whose value is blank ("Must specify environment
+          # variable source"), so a blank app_warehouse_id arrives as "id:" and warehouse.py reads it as unset.
           - name: APP_WAREHOUSE_ID
-            value: ${var.app_warehouse_id}
+            value: id:${var.app_warehouse_id}
           - name: APP_VERSION
             value: ${var.app_version}
           - name: APP_MANAGERS

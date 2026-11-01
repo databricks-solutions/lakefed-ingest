@@ -25,8 +25,12 @@ APP_WAREHOUSE_SETTING = "app_warehouse_id"
 
 def chosen_warehouse(environ: Mapping[str, str]) -> Tuple[str, str]:
     """The warehouse the app's queries run on, and which setting chose it: APP_WAREHOUSE_ID (the bundle's
-    app_warehouse_id) when it is set, else WAREHOUSE_ID (the bundle's own warehouse). Blank counts as unset."""
+    app_warehouse_id) when it is set, else WAREHOUSE_ID (the bundle's own warehouse). The bundle sends it as
+    "id:<app_warehouse_id>", since Databricks Apps refuses a blank env value, so "id:" alone, blank or missing all
+    count as unset."""
     own = (environ.get("APP_WAREHOUSE_ID") or "").strip()
+    if own.startswith("id:"):
+        own = own[len("id:"):].strip()
     if own:
         return own, APP_WAREHOUSE_SETTING
     return (environ.get("WAREHOUSE_ID") or "").strip(), BUNDLES_OWN
