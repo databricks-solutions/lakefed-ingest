@@ -1,6 +1,7 @@
 """New job's drafts (Discover.tsx, NewJob.tsx, tasks.tsx): the tables of what is chosen whole are read as it is
 chosen, Add hands the reads over still going, New job keeps them going through its preview, Create waits for them,
-and leaving the page or choosing again before Create discards them. Edit's Add tables keeps waiting at Add."""
+leaving the page or choosing again before Create discards them, and a database un-ticked leaves its draft. Edit's Add
+tables keeps waiting at Add."""
 from pathlib import Path
 
 PAGES = Path(__file__).resolve().parents[1] / "src" / "frontend" / "src" / "pages"
@@ -45,3 +46,13 @@ def test_reading_tables_shows_only_after_add_while_the_reads_still_start_as_the_
     assert "{waiting && <Busy label={waiting.reading} since={waiting.asked} done={waiting.done} total={waiting.total} />}" in DISCOVER
     assert 'setWaiting({ asked, reading: "Reading tables" });' in DISCOVER[DISCOVER.index("const finish = async () => {"):]
     assert '{readProgress && <Busy label="Reading tables" {...readProgress} />}' in NEW_JOB
+
+
+def test_a_database_un_ticked_is_dropped_from_its_draft_and_comes_back_when_ticked_again():
+    sync = DISCOVER[DISCOVER.index("const syncDrafts = () => {"):DISCOVER.index("const wholeKey = whole.join")]
+    assert "const unticked = [...d.names].filter((name) => !wholeNow.includes(name));" in sync
+    assert "await api.post(`/discoveries/${encodeURIComponent(d.named)}/drop`, { databases: unticked });" in sync
+    assert "unticked.forEach((name) => d.names.delete(name));" in sync
+    # Dropped before the draft grows, so a database ticked again is named again (warehouse_named_rows_sql takes it back).
+    assert sync.index("/drop`") < sync.index("const fresh = wholeNow.filter((name) => !d.names.has(name) && !readNow[name]);")
+    assert sync.index("const fresh") < sync.index("draft_id: d.named")

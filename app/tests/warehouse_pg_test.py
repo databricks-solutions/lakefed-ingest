@@ -162,9 +162,9 @@ def test_a_read_of_named_databases_saves_each_ones_tables_once_and_finishes_once
     insert = q.insert_discovered_tables_sql(wr.TABLE_COLUMNS, len(found))
     pg.execute(insert, tuple(v for row in found for v in row))
     pg.execute(insert, tuple(v for row in found for v in row))
-    pg.execute(q.warehouse_read_done_sql(), ("ok", len(found), None, did, "eng_001", "s-1", "s-1"))
-    pg.execute(q.warehouse_read_done_sql(), ("failed", None, "late answer", did, "eng_001", "s-1", "s-1"))
-    pg.execute(q.warehouse_read_done_sql(), ("failed", None, "Login failed", did, "eng_002", "s-2", "s-2"))
+    pg.execute(q.warehouse_read_done_sql(), ("ok", len(found), None, did, "eng_001", "s-1", "s-1", "ok"))
+    pg.execute(q.warehouse_read_done_sql(), ("failed", None, "late answer", did, "eng_001", "s-1", "s-1", "failed"))
+    pg.execute(q.warehouse_read_done_sql(), ("failed", None, "Login failed", did, "eng_002", "s-2", "s-2", "failed"))
     tables = _rows(pg, "select src_table, load_type, primary_key, row_count from lakefed_ingest.discovered_table "
                        "where discovery_id = %s order by src_table", (did,))
     assert tables == [{"src_table": "lines", "load_type": "ct", "primary_key": "id", "row_count": 12},

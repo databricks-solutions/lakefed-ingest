@@ -91,8 +91,9 @@ export function discardDrafts(ids: string[], beacon = false) {
   }
 }
 
-/** Keep drafts' reads going while the page is open: each one's last step (/reads, which also does the next) until it
- *  has ended. ``generation`` starts the asking again when a draft takes more databases. */
+/** Ask how drafts' reads stand while the page is open (/reads: the app's background reader does the reads, or with it
+ *  off each ask takes a step of them) until each has ended. Asking keeps a draft wanted. ``generation`` starts the
+ *  asking again when a draft takes more databases. */
 export function useDraftReads(connection: string, ids: string[], generation = 0): Record<string, Row> {
   const [steps, setSteps] = useState<Record<string, Row>>({});
   const key = ids.join(",");
@@ -513,6 +514,13 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
     syncing.current = syncing.current.then(async () => {
       const d = draftState.current;
       const { whole: wholeNow, read: readNow, wholeServer: serverNow } = latest.current;
+      // A database un-ticked leaves the draft: it isn't read any more, and Create neither waits nor stops for it.
+      // Ticked again, it comes back (the draft grows by it), and one read already isn't read again.
+      const unticked = [...d.names].filter((name) => !wholeNow.includes(name));
+      if (d.named && unticked.length) {
+        await api.post(`/discoveries/${encodeURIComponent(d.named)}/drop`, { databases: unticked });
+        unticked.forEach((name) => d.names.delete(name));
+      }
       const fresh = wholeNow.filter((name) => !d.names.has(name) && !readNow[name]);
       if (fresh.length) {
         const got = await api.post<Row>("/discoveries/source", { src_connection: connection, kind: "tables", databases: fresh,

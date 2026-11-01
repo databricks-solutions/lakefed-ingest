@@ -218,6 +218,14 @@ def send(warehouse, kind: str, connection: str, databases: Sequence[str], wait_s
         return list(pool.map(one, databases))
 
 
+def cancel_quietly(warehouse, statement_id: str) -> None:
+    """Cancel a statement no one waits for any more; one that has ended meanwhile is left as it is."""
+    try:
+        warehouse.cancel(statement_id)
+    except Exception:
+        pass
+
+
 def standing(store, warehouse, kind: str, discovery_id: str) -> dict:
     """Where a discovery's checks or reads stand, with no step taken: what the page hears while the background reader
     does the reads."""
@@ -264,8 +272,8 @@ def advance(store, warehouse, kind: str, discovery_id: str, connection: str, fir
             error = error or first_line(str(answer))
         elif wait_s and answer["state"] in warehouse.ENDED:
             finish(store, kind, discovery_id, database, answer["statement_id"], answer)
-        else:
-            store.started(kind, discovery_id, database, answer["statement_id"])
+        elif not store.started(kind, discovery_id, database, answer["statement_id"]):
+            cancel_quietly(warehouse, answer["statement_id"])      # its draft dropped it while it was being sent
     if error:
         return {**store.progress(kind, discovery_id), "error": error, "warehouse": ""}
     return standing(store, warehouse, kind, discovery_id)

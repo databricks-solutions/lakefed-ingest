@@ -1,6 +1,6 @@
 """The background reader (background_reads.Reader) against the fake store and warehouse of warehouse_reads_test: each
 server's cap across discoveries and instances, answers in the call that sent them, a warehouse that is starting, a
-restart with statements saved, and the page's own steps beside it. Its workers are real threads;
+restart with statements saved, dropped databases, and the page's own steps beside it. Its workers are real threads;
 the looks (step) are taken by the test."""
 import time
 
@@ -12,6 +12,7 @@ from warehouse_reads_test import SUMMARY_ROW, _Store, _Warehouse, _ok
 
 PENDING = {"state": "PENDING", "rows": None, "error": None}
 RUNNING = {"state": "RUNNING", "rows": None, "error": None}
+CANCELED = {"state": "CANCELED", "rows": None, "error": "the statement was cancelled"}
 
 
 def _fixed_caps(start=8):
@@ -127,6 +128,44 @@ def test_after_a_restart_a_saved_statement_is_read_again_not_sent_again_and_a_cl
     _drain(store, reader)
     assert fake.started_for == ["eng_003", "eng_002"] and fake.read_ids == ["s-eng_001"]
     assert all(r["status"] == "ok" for r in store.rows.values())
+
+
+def test_a_dropped_database_isnt_started_and_one_dropped_while_going_is_cancelled_not_failed_then_read_when_ticked_again():
+    store = _Store(["eng_001", "eng_002", "eng_003"])
+    store.drop("d1", "eng_002")
+    fake = _Warehouse({"eng_001": [_ok([SUMMARY_ROW])], "eng_002": [_ok([SUMMARY_ROW])],
+                       "eng_003": [PENDING, RUNNING]}, in_call=True)
+    reader = _reader(store, fake)
+    reader.step()
+    _until(lambda: store.row("d1", "eng_003")["statement"] == "s-eng_003")
+    going = store.drop("d1", "eng_003")
+    fake.cancel(going)
+    fake.answers["eng_003"] = [CANCELED]
+    _drain(store, reader)
+    assert fake.cancelled == ["s-eng_003"] and "eng_002" not in fake.started_for
+    dropped = store.row("d1", "eng_003")
+    assert (dropped["status"], dropped["error"], dropped["statement"]) == ("running", None, None)
+    assert store.progress(wr.READ, "d1") == {"databases": 1, "pending": 0, "done": 1, "failed": 0, "tables": 1}
+    store.row("d1", "eng_003")["dropped"] = False                                # ticked again
+    fake.answers["eng_003"] = [_ok([SUMMARY_ROW])]
+    _drain(store, reader)
+    assert fake.started_for.count("eng_003") == 2 and store.row("d1", "eng_003")["status"] == "ok"
+
+
+def test_a_database_dropped_while_its_statement_is_being_sent_has_it_cancelled_not_saved():
+    store = _Store(["eng_001"])
+
+    class DroppedMeanwhile(_Warehouse):
+        def start(self, statement, parameters, wait_s=None):
+            answer = super().start(statement, parameters, wait_s)
+            store.drop("d1", "eng_001")
+            return answer
+    fake = DroppedMeanwhile({"eng_001": [PENDING, RUNNING]}, in_call=True)
+    reader = _reader(store, fake)
+    reader.step()
+    _until(lambda: not reader.held())
+    assert fake.cancelled == ["s-eng_001"] and fake.read_ids == []
+    assert store.row("d1", "eng_001")["statement"] is None and store.row("d1", "eng_001")["status"] == "running"
 
 
 def test_the_pages_steps_beside_the_reader_never_pass_the_cap_or_start_a_database_twice():

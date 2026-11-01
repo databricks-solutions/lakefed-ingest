@@ -26,7 +26,7 @@ class _Store:
         for n in names:
             self.rows[(discovery_id, n)] = {"status": status, "statement": None, "claimed_at": None, "open": None,
                                             "tables": None, "error": None, "why": None, "found": None,
-                                            "connection": connection}
+                                            "connection": connection, "dropped": False}
 
     def row(self, discovery_id, database):
         return self.rows[(discovery_id, database)]
@@ -37,7 +37,7 @@ class _Store:
     def _work(self, kind, row):
         if kind == wr.CHECK:
             return row["open"] is None and row["status"] == "listed"
-        return row["status"] == "running"
+        return row["status"] == "running" and not row["dropped"]
 
     def _live(self, row, claim_s=wr.CLAIM_S):
         return row["claimed_at"] is not None and self.now - row["claimed_at"] < claim_s
@@ -98,7 +98,10 @@ class _Store:
 
     def started(self, kind, discovery_id, database, statement_id):
         with self.lock:
+            if self.row(discovery_id, database)["dropped"]:
+                return False
             self.row(discovery_id, database).update(statement=statement_id, claimed_at=self.now)
+            return True
 
     def clear(self, kind, discovery_id, database):
         with self.lock:
@@ -113,13 +116,23 @@ class _Store:
             row = self.row(discovery_id, database)
             if row["status"] != "running" or (row["statement"] or statement_id) != statement_id:
                 return
+            if rows is None and row["dropped"]:
+                return
             self.finished.append((discovery_id, database))
             row.update(status="ok" if rows is not None else "failed", found=rows, error=error, statement=None,
                        claimed_at=None, tables=len(rows) if rows is not None else None)
 
+    def drop(self, discovery_id, database):
+        """As the drop route does: marked dropped, its statement (returned, to cancel) and claim forgotten."""
+        with self.lock:
+            row = self.row(discovery_id, database)
+            statement = row["statement"]
+            row.update(dropped=True, statement=None, claimed_at=None)
+            return statement
+
     def progress(self, kind, discovery_id):
         with self.lock:
-            rows = [r for _, r in self._mine(discovery_id)]
+            rows = [r for _, r in self._mine(discovery_id) if not r["dropped"]]
             pending = sum(self._work(kind, r) for r in rows)
             if kind == wr.CHECK:
                 return {"databases": len(rows), "pending": pending, "open": sum(r["open"] is True for r in rows),
@@ -312,6 +325,16 @@ def test_a_statement_that_fails_to_start_frees_its_database_and_says_why():
     step = wr.advance(store, Broken({}), wr.READ, "d9", "sql_a")
     assert step["error"] == "the warehouse was deleted" and step["pending"] == 1
     assert store.row("d9", "eng_001")["claimed_at"] is None
+
+
+def test_a_dropped_database_is_neither_started_nor_counted():
+    store = _Store(["eng_001", "eng_002"], wr.READ, discovery_id="d9")
+    store.drop("d9", "eng_002")
+    fake = _Warehouse({"eng_001": [_ok([SUMMARY_ROW])], "eng_002": [_ok([SUMMARY_ROW])]})
+    wr.advance(store, fake, wr.READ, "d9", "sql_a")
+    done = wr.advance(store, fake, wr.READ, "d9", "sql_a")
+    assert fake.started_for == ["eng_001"]
+    assert done["state"] == "SUCCEEDED" and done["databases"] == 1 and done["done"] == 1
 
 
 # ---- the cap rule ----------------------------------------------------------------------------------------------------

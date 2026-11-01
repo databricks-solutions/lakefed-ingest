@@ -1,6 +1,6 @@
 """A draft: the tables of the databases chosen are read through the warehouse as they are chosen, before the job
 exists, and Create takes them (main._draft_reading, create_ingestion_job, _create_after_reading, discard_draft,
-_keep_selection). Lakebase, the warehouse and the write are faked; the statements themselves run against Postgres as
+drop_from_draft, _keep_selection). Lakebase, the warehouse and the write are faked; the statements themselves run against Postgres as
 the app's own role in app_role_pg_test.py."""
 import pytest
 
@@ -156,3 +156,53 @@ def test_with_the_background_reader_running_a_wait_only_keeps_the_draft_wanted_a
     reading = main._draft_reading(SELECTION)
     assert advanced == [] and woken == [True] and written == [(q.draft_touch_sql(), ("d1", "d1"))]
     assert reading["pending"] == 3
+
+
+# ---- dropping un-ticked databases from a draft -----------------------------------------------------------------------
+
+@pytest.fixture
+def client(monkeypatch):
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+    calls = {"queries": [], "cancelled": []}
+    answers = {q.draft_of_sql(): [{"src_connection": "sql_a", "draft_by": "op@example.com"}],
+               q.draft_drop_sql(): [{"src_database": "eng_002", "statement_id": "s-2"},
+                                    {"src_database": "eng_003", "statement_id": None}]}
+
+    def query(sql, params=()):
+        calls["queries"].append((sql, params))
+        return answers[sql]
+
+    def cancel(statement_id):
+        calls["cancelled"].append(statement_id)
+        raise RuntimeError("it ended meanwhile")
+    monkeypatch.setattr(main.db, "query", query)
+    monkeypatch.setattr(main.warehouse, "cancel", cancel)
+    c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
+    c.calls, c.answers = calls, answers
+    return c
+
+
+def test_dropping_un_ticked_databases_marks_them_and_cancels_their_statements_going(client):
+    body = client.post("/api/discoveries/d1/drop", json={"databases": ["eng_002", " eng_003 ", "eng_002", " "]}).json()
+    assert body == {"discovery_id": "d1", "dropped": 2, "cancelled": 1}
+    assert client.calls["queries"][1] == (q.draft_drop_sql(), ("d1", ["eng_002", "eng_003"], "d1"))
+    assert client.calls["cancelled"] == ["s-2"]
+
+
+def test_only_the_person_who_started_an_open_draft_drops_from_it(client):
+    other = client.post("/api/discoveries/d1/drop", json={"databases": ["eng_002"]},
+                        headers={"X-Forwarded-Email": "someone@example.com"})
+    assert other.status_code == 403 and "op@example.com" in other.json()["detail"]
+    client.answers[q.draft_of_sql()] = []
+    closed = client.post("/api/discoveries/d1/drop", json={"databases": ["eng_002"]})
+    assert closed.status_code == 409 and "not an open draft" in closed.json()["detail"]
+    assert client.post("/api/discoveries/d1/drop", json={"databases": []}).status_code == 422
+    assert [sql for sql, _ in client.calls["queries"]] == [q.draft_of_sql(), q.draft_of_sql()]
+    assert client.calls["cancelled"] == []
+
+
+def test_a_drop_needs_a_signed_in_user(client):
+    from fastapi.testclient import TestClient
+    assert TestClient(main.app).post("/api/discoveries/d1/drop", json={"databases": ["eng_002"]}).status_code == 403
+    assert client.calls["queries"] == []

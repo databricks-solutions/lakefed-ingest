@@ -1,7 +1,8 @@
 """The reads through the warehouse against a real Postgres with the Lakebase schema, through main.WarehouseReadStore
 and the Lakebase pool itself: each server's cap counted across discoveries and concurrent claimers under its
-transaction lock, the background reader and a page's step at once (SKIP LOCKED), and a restart reading saved
-statements again. The warehouse is faked (warehouse_reads_test._Warehouse).
+transaction lock, the background reader and a page's step at once (SKIP LOCKED), dropped databases left out of the
+claim, the progress and Create's wait (and the drafts' purge), and a restart reading saved statements again. The
+warehouse is faked (warehouse_reads_test._Warehouse).
 
 Skipped unless LAKEFED_APP_TEST_PG names a Postgres server (see monitoring_pg_test.py)."""
 import json
@@ -154,6 +155,57 @@ def test_the_background_reader_and_a_pages_step_at_once_never_start_one_database
     assert sorted(fake.started_for) == names, "each database sent once"
     assert _rows(owner, q.warehouse_progress_sql(wr.READ), (did,)) == \
         [{"databases": 40, "pending": 0, "done": 40, "failed": 0, "tables": 40}]
+
+
+def test_a_dropped_database_is_left_out_of_the_claim_the_progress_and_creates_wait_and_taken_back_when_ticked(owner):
+    store = main.WarehouseReadStore()
+    did = _draft(owner, ["eng_001", "eng_002", "eng_003", "eng_004"])
+    store.started(wr.READ, did, "eng_002", "s-2")
+    store.finish_read(did, "eng_003", [], None, "s-3")                       # read already: kept when dropped
+    store.finish_read(did, "eng_004", None, "Login failed", "s-4")            # failed: no longer blocks Create
+    dropped = _rows(owner, q.draft_drop_sql(), (did, ["eng_002", "eng_003", "eng_004"], did))
+    assert sorted((r["src_database"], r["statement_id"]) for r in dropped) == \
+        [("eng_002", "s-2"), ("eng_003", None), ("eng_004", None)]
+    assert "statement_id" not in _row(owner, did, "eng_002")["listing"]
+    assert _rows(owner, q.draft_drop_sql(), (did, ["eng_002"], did)) == [], "dropped once"
+    got, _ = store.claim_reads("sql_a", [did], 8, 8, wr.CLAIM_S)
+    assert got == [(did, "eng_001")]
+    assert _rows(owner, q.warehouse_progress_sql(wr.READ), (did,)) == \
+        [{"databases": 1, "pending": 1, "done": 0, "failed": 0, "tables": 0}]
+    reads = _rows(owner, q.draft_reads_sql(), ([did],))[0]
+    assert (reads["databases"], reads["pending"], reads["done"], reads["failed"]) == (1, 1, 0, 0)
+    assert _rows(owner, q.draft_failed_sql(), ([did],)) == []
+    # The cancelled statement's answer neither fails the dropped database nor ends it.
+    store.finish_read(did, "eng_002", None, "the read ended CANCELED", "s-2")
+    assert _row(owner, did, "eng_002")["status"] == "running"
+    work = _rows(owner, q.warehouse_read_work_sql(), (wr.CLAIM_S, br.MAX_AGE_S, 7200))
+    assert [(w["discovery_id"], w["waiting"]) for w in work] == [], "eng_001 is claimed and the rest dropped"
+    # Ticked again: the draft grows by them again, and only the one never read is read.
+    owner.execute(q.warehouse_named_rows_sql(2), (did, "sql_a", "eng_002", "op", "{}", did, "sql_a", "eng_003", "op", "{}"))
+    assert "dropped" not in _row(owner, did, "eng_002")["listing"] and _row(owner, did, "eng_003")["status"] == "ok"
+    got, _ = store.claim_reads("sql_a", [did], 8, 8, wr.CLAIM_S)
+    assert got == [(did, "eng_002")]
+
+
+def test_a_draft_with_dropped_databases_is_purged_whole_and_a_job_takes_them_with_the_rest(owner):
+    import delete_job
+    store = main.WarehouseReadStore()
+    left = _draft(owner, ["eng_001", "eng_002"])
+    taken = _draft(owner, ["eng_001", "eng_002"])
+    for did in (left, taken):
+        found = wr.table_rows(did, "eng_002", [SUMMARY_ROW])
+        store.finish_read(did, "eng_002", found, None, "s-2")
+        owner.execute(q.draft_drop_sql(), (did, ["eng_002"], did))
+    owner.execute(q.draft_claim_sql(), (7, [taken]))
+    owner.execute(q.draft_discard_sql(), (left,))
+    with owner.cursor() as cur, cur.connection.transaction():
+        purged = delete_job.purge_drafts(cur, 7200)
+    assert purged == {"drafts": 1, "databases": 2, "tables": 1}
+    kept = _rows(owner, "select src_database, listing from lakefed_ingest.discovery where discovery_id = %s "
+                        "order by src_database", (taken,))
+    assert [r["listing"].get("job_id") for r in kept] == [7, 7] and "draft" not in kept[1]["listing"]
+    assert _rows(owner, "select count(*) as n from lakefed_ingest.discovered_table where discovery_id = %s",
+                 (taken,)) == [{"n": 1}]
 
 
 def test_after_a_restart_the_reader_reads_a_saved_statement_again_and_sends_a_lapsed_claim_once(owner):

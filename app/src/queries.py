@@ -1583,8 +1583,10 @@ def insert_discovery_rows_sql(count: int) -> str:
 # A discovery's checks and reads through the SQL warehouse (warehouse_reads.py) keep their place on the discovery row:
 # a check works on the listed databases not checked yet, a read on the databases still running. listing holds the
 # statement going (statement_id), when a request claimed the database (claimed_at), and a check's answer (open, why).
+# A database a draft no longer wants (un-ticked) is marked dropped: it isn't read, and it counts nowhere.
+DROPPED = "coalesce(listing, '{}'::jsonb) ? 'dropped'"
 WAREHOUSE_WORK = {"check": "status = 'listed' and (listing -> 'open') is null",
-                  "read": "status = 'running' and not (coalesce(listing, '{}'::jsonb) ? 'discarded')"}
+                  "read": f"status = 'running' and not (coalesce(listing, '{{}}'::jsonb) ? 'discarded') and not ({DROPPED})"}
 
 
 def warehouse_in_flight_sql(kind: str) -> str:
@@ -1713,11 +1715,12 @@ def warehouse_unchecked_sql() -> str:
 
 
 def warehouse_started_sql() -> str:
-    """Record the statement started for a database, its claim renewed with it. Params: statement_id, discovery_id,
-    src_database."""
+    """Record the statement started for a database, its claim renewed with it; returns the database when it did. Not
+    on a database its draft dropped while the statement was being sent: that statement is cancelled instead. Params:
+    statement_id, discovery_id, src_database."""
     return (f"update {SCHEMA}.discovery set listing = coalesce(listing, '{{}}'::jsonb) "
             f"|| jsonb_build_object('statement_id', %s::text, 'claimed_at', now()::text) "
-            f"where discovery_id = %s and src_database = %s")
+            f"where discovery_id = %s and src_database = %s and not ({DROPPED}) returning src_database")
 
 
 def warehouse_clear_sql() -> str:
@@ -1736,13 +1739,16 @@ def warehouse_check_done_sql() -> str:
 
 def warehouse_read_done_sql() -> str:
     """A read's end on a database: ok with its table count, or failed with why; returns the database when it changed.
-    Params: status, tables, error, discovery_id, src_database, statement_id, statement_id. Only a database still
-    running is changed, so a second answer writes nothing; and only by the statement saved for it (or before one is
-    saved), so a statement it no longer waits on never ends it."""
+    Params: status, tables, error, discovery_id, src_database, statement_id, statement_id, status. Only a database
+    still running is changed, so a second answer writes nothing; and only by the statement saved for it (or before
+    one is saved), so a statement it no longer waits on never ends it. A database dropped meanwhile keeps a read that
+    succeeded (ticked again, it costs nothing) and is never failed: its statement was cancelled because it was
+    dropped, and ticked again, it is read again."""
     return (f"update {SCHEMA}.discovery set status = %s, tables = %s, error = %s, finished_at = now(), "
             f"listing = coalesce(listing, '{{}}'::jsonb) - 'statement_id' - 'claimed_at' "
             f"where discovery_id = %s and src_database = %s and status = 'running' "
-            f"and coalesce(listing ->> 'statement_id', %s::text) = %s::text returning src_database")
+            f"and coalesce(listing ->> 'statement_id', %s::text) = %s::text "
+            f"and (%s::text = 'ok' or not ({DROPPED})) returning src_database")
 
 
 def insert_discovered_tables_sql(columns, count: int) -> str:
@@ -1754,8 +1760,8 @@ def insert_discovered_tables_sql(columns, count: int) -> str:
 
 def warehouse_progress_sql(kind: str) -> str:
     """Where a discovery's checks or reads stand: its databases, those still to do (pending), and by outcome. A check
-    counts the databases open, closed and their tables; a read those read (done), failed, and their tables. Param:
-    discovery_id."""
+    counts the databases open, closed and their tables; a read those read (done), failed, and their tables, leaving
+    out a database its draft dropped. Param: discovery_id."""
     if kind == "check":
         return (f"select count(*) as databases, count(*) filter (where (listing -> 'open') is null) as pending, "
                 f"count(*) filter (where (listing ->> 'open')::boolean) as open, "
@@ -1765,7 +1771,7 @@ def warehouse_progress_sql(kind: str) -> str:
     return (f"select count(*) as databases, count(*) filter (where {WAREHOUSE_WORK['read']}) as pending, "
             f"count(*) filter (where status = 'ok') as done, count(*) filter (where status = 'failed') as failed, "
             f"coalesce(sum(tables) filter (where status = 'ok'), 0) as tables "
-            f"from {SCHEMA}.discovery where discovery_id = %s")
+            f"from {SCHEMA}.discovery where discovery_id = %s and not ({DROPPED})")
 
 
 def warehouse_read_rows_sql() -> str:
@@ -1780,11 +1786,15 @@ def warehouse_read_rows_sql() -> str:
 
 
 def warehouse_named_rows_sql(count: int) -> str:
-    """Start a read of named databases: one running row each. Params per row: discovery_id, src_connection,
-    src_database, requested_by, the draft's marks (JSON text, {} for none)."""
+    """Start a read of named databases: one running row each. A database its draft dropped is taken back instead (its
+    mark comes off): read already, it is kept as it was, so ticking it again costs nothing; not read yet, it is read.
+    Params per row: discovery_id, src_connection, src_database, requested_by, the draft's marks (JSON text, {} for
+    none)."""
     one_row = "(%s, 'sqlserver', %s, %s, 'running', %s, jsonb_build_object('via', 'warehouse') || %s::jsonb)"
     return (f"insert into {SCHEMA}.discovery (discovery_id, src_type, src_connection, src_database, status, requested_by, "
-            f"listing) values {', '.join([one_row] * count)} on conflict (discovery_id, src_database) do nothing")
+            f"listing) values {', '.join([one_row] * count)} on conflict (discovery_id, src_database) do update "
+            f"set listing = {SCHEMA}.discovery.listing - 'dropped' - 'claimed_at' "
+            f"where {SCHEMA}.discovery.listing ? 'dropped'")
 
 
 # A draft: a read through the warehouse started as the databases are chosen, before the job exists. Its rows are the
@@ -1803,9 +1813,9 @@ def drafts_to_purge_sql() -> str:
 
 
 def draft_of_sql() -> str:
-    """A draft's connection, if it is one still open (marked, not discarded). Param: discovery_id."""
-    return (f"select src_connection from {SCHEMA}.discovery where discovery_id = %s and listing ? 'draft' "
-            f"and not listing ? 'discarded' limit 1")
+    """A draft's connection and who started it, if it is one still open (marked, not discarded). Param: discovery_id."""
+    return (f"select src_connection, listing ->> 'draft_by' as draft_by from {SCHEMA}.discovery where discovery_id = %s "
+            f"and listing ? 'draft' and not listing ? 'discarded' limit 1")
 
 
 def draft_touch_sql() -> str:
@@ -1825,9 +1835,24 @@ def draft_discard_sql() -> str:
             f"returning listing ->> 'statement_id' as statement_id")
 
 
+def draft_drop_sql() -> str:
+    """Drop databases from an open draft (un-ticked): each one marked dropped, its claim and statement forgotten; the
+    statements going, to cancel. Never a whole-server read's database: that draft is discarded and started again when
+    its filter changes. Params: discovery_id, the names (text[]), discovery_id."""
+    return (f"with old as (select src_database, listing ->> 'statement_id' as statement_id from {SCHEMA}.discovery "
+            f"             where discovery_id = %s and src_database = any(%s::text[]) and listing ? 'draft' "
+            f"             and not listing ? 'discarded' and not listing ? 'dropped' "
+            f"             and not coalesce((listing ->> 'whole_server')::boolean, false) for update) "
+            f"update {SCHEMA}.discovery d set listing = (d.listing - 'statement_id' - 'claimed_at') "
+            f"|| jsonb_build_object('dropped', now()::text) from old "
+            f"where d.discovery_id = %s and d.src_database = old.src_database "
+            f"returning old.src_database, old.statement_id")
+
+
 def draft_claim_sql() -> str:
     """In a Create's or an Add's transaction: the drafts it was chosen from become the job's, so no purge takes them.
-    Params: job id, discovery ids (text[])."""
+    The databases dropped from them go with them, so a purge never takes a part of a job's discovery. Params: job id,
+    discovery ids (text[])."""
     return (f"update {SCHEMA}.discovery set listing = (listing - 'draft' - 'draft_by' - 'touched_at') "
             f"|| jsonb_build_object('job_id', %s::bigint) "
             f"where discovery_id = any(%s::text[]) and listing ? 'draft' and not listing ? 'discarded'")
@@ -1835,20 +1860,24 @@ def draft_claim_sql() -> str:
 
 def draft_reads_sql() -> str:
     """Where the reads of a choice's discoveries stand: per discovery, its connection, its databases still to read,
-    read, failed, discarded and their tables. Param: discovery ids (text[])."""
+    read, failed, discarded and their tables. A database its draft dropped counts nowhere: Create neither waits for it
+    nor stops for it. Param: discovery ids (text[])."""
     return (f"select discovery_id, min(src_connection) as src_connection, count(*) as databases, "
             f"count(*) filter (where status = 'running' and not listing ? 'discarded') as pending, "
             f"count(*) filter (where status = 'ok') as done, count(*) filter (where status = 'failed') as failed, "
             f"count(*) filter (where listing ? 'discarded') as discarded, "
             f"coalesce(sum(tables) filter (where status = 'ok'), 0) as tables "
-            f"from {SCHEMA}.discovery where discovery_id = any(%s::text[]) and status <> 'listed' group by discovery_id")
+            f"from {SCHEMA}.discovery where discovery_id = any(%s::text[]) and status <> 'listed' and not ({DROPPED}) "
+            f"group by discovery_id")
 
 
 def draft_failed_sql() -> str:
     """The databases of a choice's discoveries that couldn't be read, with why and whether a whole-server read took
-    them (which leaves out one the login can't open, as the check would have). Param: discovery ids (text[])."""
+    them (which leaves out one the login can't open, as the check would have); not one its draft dropped. Param:
+    discovery ids (text[])."""
     return (f"select src_database, error, coalesce((listing ->> 'whole_server')::boolean, false) as whole_server "
-            f"from {SCHEMA}.discovery where discovery_id = any(%s::text[]) and status = 'failed' order by src_database")
+            f"from {SCHEMA}.discovery where discovery_id = any(%s::text[]) and status = 'failed' and not ({DROPPED}) "
+            f"order by src_database")
 
 
 def warehouse_left_out_sql() -> str:

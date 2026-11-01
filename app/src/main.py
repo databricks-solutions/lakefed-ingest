@@ -3753,8 +3753,9 @@ class WarehouseReadStore:
     def read_work(self, claim_s: float, max_age_s: float, draft_ttl_s: float) -> List[dict]:
         return db.query(q.warehouse_read_work_sql(), (claim_s, max_age_s, draft_ttl_s))
 
-    def started(self, kind: str, discovery_id: str, database: str, statement_id: str) -> None:
-        db.execute(q.warehouse_started_sql(), (statement_id, discovery_id, database))
+    def started(self, kind: str, discovery_id: str, database: str, statement_id: str) -> bool:
+        """Record the statement sent for a database: False when its draft dropped it meanwhile."""
+        return bool(db.query(q.warehouse_started_sql(), (statement_id, discovery_id, database)))
 
     def clear(self, kind: str, discovery_id: str, database: str) -> None:
         db.execute(q.warehouse_clear_sql(), (discovery_id, database))
@@ -3770,12 +3771,12 @@ class WarehouseReadStore:
         nothing to replace; a second answer for the same database inserts nothing (on conflict)."""
         if rows is None:
             db.execute(q.warehouse_read_done_sql(),
-                       ("failed", None, error, discovery_id, database, statement_id, statement_id))
+                       ("failed", None, error, discovery_id, database, statement_id, statement_id, "failed"))
             return
         columns = warehouse_reads.TABLE_COLUMNS
         with db.transaction() as cur:
             done = db.fetch(cur, q.warehouse_read_done_sql(),
-                            ("ok", len(rows), None, discovery_id, database, statement_id, statement_id))
+                            ("ok", len(rows), None, discovery_id, database, statement_id, statement_id, "ok"))
             if not done:
                 return
             for at in range(0, len(rows), q.CONTROL_BATCH):
@@ -3861,12 +3862,43 @@ def discard_draft(discovery_id: str):
     return {"discovery_id": discovery_id, "cancelled": len(going)}
 
 
+class DropRequest(BaseModel):
+    """Databases un-ticked: dropped from the draft that reads them."""
+    databases: List[str] = Field(min_length=1, max_length=5000)
+
+
+@app.post("/api/discoveries/{discovery_id}/drop")
+def drop_from_draft(discovery_id: str, body: DropRequest, request: Request):
+    """Drop databases from a draft (un-ticked before Create): each one is marked dropped on its row (the app has no
+    DELETE), its statement still going is cancelled, and it is left out of the read's progress, Create's wait and the
+    databases that couldn't be read. One read already is kept, so ticking it again, which grows the draft by it again
+    (warehouse_named_rows_sql), costs nothing. Only while the draft is open, and only by the person who started it.
+    A whole-server read's databases are never dropped: that draft is discarded and started again when its filter
+    changes."""
+    names = list(dict.fromkeys(d.strip() for d in body.databases if d.strip()))
+    drafts = db.query(q.draft_of_sql(), (discovery_id,))
+    if not drafts:
+        raise HTTPException(409, f"{discovery_id} is not an open draft, so nothing can be dropped from it")
+    owner = drafts[0].get("draft_by")
+    if owner and owner != _user(request):
+        raise HTTPException(403, f"draft {discovery_id} was started by {owner}: only they can drop from it")
+    dropped = db.query(q.draft_drop_sql(), (discovery_id, names, discovery_id)) if names else []
+    going = [r["statement_id"] for r in dropped if r.get("statement_id")]
+    for statement_id in going:
+        try:
+            warehouse.cancel(statement_id)
+        except Exception as e:     # it may have ended meanwhile; the database is dropped either way
+            logging.getLogger(__name__).info("could not cancel statement %s of draft %s: %s", statement_id, discovery_id,
+                                             str(e)[:200])
+    return {"discovery_id": discovery_id, "dropped": len(dropped), "cancelled": len(going)}
+
+
 def _draft_reading(selection: "Selection", advance: bool = True) -> Optional[dict]:
     """Where the reads of the discoveries a choice names stand, for a preview or a Create: None when every database is
     read. With ``advance`` it marks the drafts still wanted and keeps their reads going: the background reader is
     woken, or, with it off, a step of each read still going is taken (the page that started them may be gone). A
     database a whole-server read couldn't open is left out, as the check would have left it out; any other database
-    that couldn't be read is a failure, named."""
+    that couldn't be read is a failure, named. A database its draft dropped counts nowhere."""
     kind, ids, _ = selection.source()
     if kind != "discovery" or not ids:
         return None
@@ -3911,7 +3943,8 @@ def _draft_problems(reading: Optional[dict]) -> List[str]:
 
 def _start_warehouse_read(body: "SourceDiscoverRequest", names: List[str], user: Optional[str]) -> dict:
     """Start reading tables through the warehouse: the whole server (the databases of its listing that the filter keeps
-    and the login wasn't found unable to open) or the databases named, then where the reads stand (_reads_step)."""
+    and the login wasn't found unable to open) or the databases named, then where the reads stand (_reads_step). A
+    database a draft dropped and named again is taken back (warehouse_named_rows_sql)."""
     did = uuid.uuid4().hex[:12]
     if body.draft_id:
         drafts = db.query(q.draft_of_sql(), (body.draft_id,))

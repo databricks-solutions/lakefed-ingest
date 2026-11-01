@@ -14,14 +14,14 @@ def test_each_statement_takes_the_parameters_the_store_passes():
         assert _marks(q.warehouse_claim_sql(kind)) == 4
         assert _marks(q.warehouse_progress_sql(kind)) == 1
     assert _marks(q.warehouse_started_sql()) == 3 and _marks(q.warehouse_clear_sql()) == 2
-    assert _marks(q.warehouse_check_done_sql()) == 5 and _marks(q.warehouse_read_done_sql()) == 7
+    assert _marks(q.warehouse_check_done_sql()) == 5 and _marks(q.warehouse_read_done_sql()) == 8
     assert _marks(q.warehouse_read_rows_sql()) == 5 and _marks(q.warehouse_left_out_sql()) == 2
     assert _marks(q.warehouse_named_rows_sql(3)) == 15
     assert _marks(q.insert_discovered_tables_sql(wr.TABLE_COLUMNS, 2)) == 2 * len(wr.TABLE_COLUMNS)
     assert _marks(q.warehouse_reads_lock_sql()) == 1 and _marks(q.warehouse_reads_going_sql()) == 2
     assert _marks(q.warehouse_claim_reads_sql()) == 5 and _marks(q.warehouse_collect_sql()) == 3
     assert _marks(q.warehouse_hold_sql()) == 2 and _marks(q.warehouse_read_work_sql()) == 3
-    assert _marks(q.discovery_connection_sql()) == 1
+    assert _marks(q.discovery_connection_sql()) == 1 and _marks(q.draft_drop_sql()) == 3
 
 
 def test_a_servers_reads_are_counted_and_claimed_under_a_transaction_lock_of_its_own():
@@ -35,6 +35,22 @@ def test_a_servers_reads_are_counted_and_claimed_under_a_transaction_lock_of_its
     assert "(listing ->> 'claimed_at')::timestamptz >= now()" in going
     assert "for update skip locked" in claim and "order by array_position(%s::text[], discovery_id), src_database" in claim
     assert "for update skip locked" in q.warehouse_collect_sql() and "listing ? 'statement_id'" in q.warehouse_collect_sql()
+
+
+def test_a_dropped_database_is_no_read_and_counts_in_no_progress_wait_or_failure():
+    assert "? 'dropped'" in q.WAREHOUSE_WORK["read"] and "dropped" not in q.WAREHOUSE_WORK["check"]
+    assert f"not ({q.DROPPED})" in q.warehouse_progress_sql(wr.READ)
+    assert f"not ({q.DROPPED})" in q.draft_reads_sql() and f"not ({q.DROPPED})" in q.draft_failed_sql()
+    for sql in (q.warehouse_read_work_sql(), q.warehouse_claim_reads_sql(), q.warehouse_hold_sql(),
+                q.warehouse_collect_sql(), q.warehouse_in_flight_sql(wr.READ)):
+        assert q.WAREHOUSE_WORK["read"] in sql
+    drop = q.draft_drop_sql()
+    assert "jsonb_build_object('dropped', now()::text)" in drop and "- 'statement_id' - 'claimed_at'" in drop
+    assert "not coalesce((listing ->> 'whole_server')::boolean, false)" in drop
+    assert "returning old.src_database, old.statement_id" in drop
+    assert "do update set listing = lakefed_ingest.discovery.listing - 'dropped' - 'claimed_at' " \
+           "where lakefed_ingest.discovery.listing ? 'dropped'" in q.warehouse_named_rows_sql(1)
+    assert "listing ? 'draft' and not listing ? 'discarded'" in q.draft_claim_sql() and "dropped" not in q.draft_claim_sql()
 
 
 def test_a_check_works_on_listed_databases_not_checked_yet_and_a_read_on_running_ones():
@@ -109,7 +125,7 @@ def test_a_read_its_database_no_longer_waits_on_saves_no_tables(monkeypatch):
 
     monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cursor())))
     main.WarehouseReadStore().finish_read("d1", "eng_001", [tuple(None for _ in wr.TABLE_COLUMNS)], None, "s-old")
-    assert sent == [(q.warehouse_read_done_sql(), ("ok", 1, None, "d1", "eng_001", "s-old", "s-old"))]
+    assert sent == [(q.warehouse_read_done_sql(), ("ok", 1, None, "d1", "eng_001", "s-old", "s-old", "ok"))]
 
 
 def test_no_statement_of_the_app_deletes_rows():
@@ -178,7 +194,7 @@ def test_the_stores_other_read_calls_pass_each_parameter_to_its_place(monkeypatc
     store.collect("d1", 60, 5)
     store.hold([("d1", "eng_001"), ("d2", "eng_009")])
     store.read_work(60, 21600, 7200)
-    store.started("read", "d1", "eng_001", "s-1")
+    assert store.started("read", "d1", "eng_001", "s-1") is False
     store.finish_read("d1", "eng_002", None, "Login failed", "s-2")
     collect, hold, work, started, failed = sent
     assert "discovery_id = 'd1'" in collect and "make_interval(secs => 60)" in collect and "limit 5 for update" in collect
@@ -186,4 +202,4 @@ def test_the_stores_other_read_calls_pass_each_parameter_to_its_place(monkeypatc
     assert work.startswith("with p as (select 60::float as claim_s, 21600::float as max_age, 7200::float as draft_ttl)")
     assert "jsonb_build_object('statement_id', 's-1'::text" in started and "src_database = 'eng_001'" in started
     assert "set status = 'failed', tables = None, error = 'Login failed'" in failed
-    assert "coalesce(listing ->> 'statement_id', 's-2'::text) = 's-2'::text returning src_database" in failed
+    assert "coalesce(listing ->> 'statement_id', 's-2'::text) = 's-2'::text and ('failed'::text = 'ok'" in failed

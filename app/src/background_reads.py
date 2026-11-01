@@ -183,8 +183,10 @@ class Reader:
                     self._failed(e, pause=True, discovery_id=discovery_id)
                     return
                 statement_id = answer["statement_id"]
-                if answer["state"] not in self.warehouse.ENDED:
-                    self.store.started(wr.READ, discovery_id, database, statement_id)
+                if answer["state"] not in self.warehouse.ENDED and not self.store.started(wr.READ, discovery_id,
+                                                                                          database, statement_id):
+                    wr.cancel_quietly(self.warehouse, statement_id)      # its draft dropped it while it was being sent
+                    return
             errors = 0
             while answer is None or answer["state"] not in self.warehouse.ENDED:
                 if answer is not None or errors:
