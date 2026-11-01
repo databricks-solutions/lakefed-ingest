@@ -44,15 +44,17 @@ test("needs you says how many databases wait, and why", () => {
   assert.equal(preparingLine({ state: "ready" }), "Ready");
 });
 
-test("each set-aside database says why, and what happens to it next", () => {
+test("each set-aside database says why", () => {
   assert.equal(setAsideWhy({ server: "s", database: "d", kind: "unreadable", why: "Login failed" }), "couldn't be read: Login failed");
   assert.equal(setAsideWhy({ server: "s", database: "d", kind: "clash", why: "another table already writes main.b.t",
     job: "Sales" }), "not added: another table already writes main.b.t (the job Sales)");
   assert.equal(setAsideWhy({ server: "s", database: "d", kind: "closed", why: "no access" }), "left out: no access");
-  assert.equal(setAsideWhy({ server: "s", database: "d", kind: "unreadable", why: "x", again: { by: "a" } }),
-    "couldn't be read: x; to be read again");
-  assert.equal(setAsideWhy({ server: "s", database: "d", kind: "clash", why: "x", replan: { by: "a" } }),
-    "not added: x; to be planned again with the new target names");
+});
+
+test("a stopped preparation says why, whatever its stage", () => {
+  assert.equal(preparingLine({ state: "preparing", stage: "writing", stopped: { by: "a", why: "stopped by a" } }),
+    "Stopped: stopped by a");
+  assert.equal(preparingLine({ state: "needs_you", stopped: {} }), "Stopped: Prepare again goes on from where it stopped");
 });
 
 test("the schedule says whether it turns on once the job is ready", () => {

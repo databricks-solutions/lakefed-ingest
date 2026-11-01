@@ -200,11 +200,16 @@ function Preparation({ jobId, deleteRefusal, onDelete }: { jobId: string; delete
     body: <p>The {fmtInt(counts.waiting)} {plural(counts.waiting, "database")} set aside come out of what this job ingests, and it
       goes on without them. Add them later with Add tables once the job is ready.</p> })
     .then((ok) => ok && act.mutate({ action: "leave-out", body: {} }));
+  const stopPreparing = () => confirm.ask({ title: "Stop preparing?", action: "Stop preparing",
+    body: <p>The reads going are stopped and nothing more is written. The job stays paused with its choice and what was read;
+      Prepare again goes on from where it stopped.</p> })
+    .then((ok) => ok && act.mutate({ action: "stop", body: {} }));
+  const stopped = Boolean(p.stopped);
   return (
-    <Section title={p.state === "needs_you" ? "Needs you" : "Preparing"}
+    <Section title={stopped ? "Stopped" : p.state === "needs_you" ? "Needs you" : "Preparing"}
       note="Its tables are read, then written, then its Databricks jobs are made. It runs once it is ready.">
       {confirm.dialog}
-      {p.state === "preparing"
+      {p.state === "preparing" && !stopped
         ? <Busy label={line} done={bar?.done} total={bar?.total} />
         : <Notice tone="warn">{line}</Notice>}
       {p.state === "needs_you" && bar && <progress className="busy-progress" max={bar.total} value={Math.min(bar.done, bar.total)}
@@ -222,7 +227,15 @@ function Preparation({ jobId, deleteRefusal, onDelete }: { jobId: string; delete
           {fmtInt(counts.set_aside)} are listed.</p>}
       </>}
       {Number(counts.left_out) > 0 && <p className="muted small">Left out: {fmtInt(counts.left_out)} {plural(counts.left_out, "database")}.</p>}
-      {p.state === "needs_you" && <div className="toolbar">
+      {p.state === "preparing" && !stopped && <div className="toolbar">
+        <button disabled={busy || !!actions.stop} title={actions.stop ?? undefined} onClick={stopPreparing}>Stop preparing</button>
+      </div>}
+      {stopped && <div className="toolbar">
+        <button disabled={busy || !!actions.again} title={actions.again ?? undefined}
+          onClick={() => act.mutate({ action: "again", body: {} })}>Prepare again</button>
+        <button className="danger" disabled={!!deleteRefusal} title={deleteRefusal ?? undefined} onClick={onDelete}>Delete the job</button>
+      </div>}
+      {p.state === "needs_you" && !stopped && <div className="toolbar">
         {Number(counts.waiting_unreadable) > 0 && <button disabled={busy || !!actions.read_again} title={actions.read_again ?? undefined}
           onClick={() => act.mutate({ action: "read-again", body: {} })}>Read them again</button>}
         <button disabled={busy || !!actions.leave_out} title={actions.leave_out ?? undefined} onClick={leaveOut}>Leave them out</button>

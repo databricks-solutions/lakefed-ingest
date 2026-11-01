@@ -5,13 +5,13 @@
 
 export interface SetAside {
   server: string; database: string; kind: string; why?: string | null; target?: string | null; job?: string | null;
-  again?: unknown; replan?: unknown;
 }
 
 export interface PrepareView {
   state?: string; stage?: string | null; turn_on?: boolean; kept_paused?: string | null;
   reading?: { databases: number; read: number; tables: number; minutes_left?: number | null } | null;
   progress?: Record<string, unknown>; counts?: Record<string, number>; set_aside?: SetAside[];
+  stopped?: { by?: string | null; at?: string | null; why?: string | null } | null;
 }
 
 const count = (n: unknown) => Number(n || 0).toLocaleString("en-US");
@@ -26,9 +26,11 @@ export function minutesLeftText(minutes: number | null | undefined): string | nu
 }
 
 /** Where the job stands, in one line: "Preparing: reading tables, 1,240 of 3,000 databases (58,280 tables so far), about
- *  12 min left", then the write and the Databricks jobs, "Needs you: 3 of 3,000 databases couldn't be read", or Ready. */
+ *  12 min left", then the write and the Databricks jobs, "Needs you: 3 of 3,000 databases couldn't be read", "Stopped:
+ *  why", or Ready. */
 export function preparingLine(view: PrepareView | null | undefined): string {
   if (!view || view.state === "ready" || !view.state) return "Ready";
+  if (view.stopped) return `Stopped: ${view.stopped.why || "Prepare again goes on from where it stopped"}`;
   const progress = view.progress ?? {};
   if (view.state === "needs_you") {
     const counts = view.counts ?? {};
@@ -67,15 +69,12 @@ export function preparingBar(view: PrepareView | null | undefined): { done: numb
   return null;
 }
 
-/** Why one database was set aside, and what is to happen to it now. */
+/** Why one database was set aside. */
 export function setAsideWhy(entry: SetAside): string {
   const why = entry.why ? `: ${entry.why}` : "";
-  const reason = entry.kind === "unreadable" ? `couldn't be read${why}`
+  return entry.kind === "unreadable" ? `couldn't be read${why}`
     : entry.kind === "clash" ? `not added${why}${entry.job ? ` (the job ${entry.job})` : ""}`
     : `left out${why}`;
-  if (entry.again) return `${reason}; to be read again`;
-  if (entry.replan) return `${reason}; to be planned again with the new target names`;
-  return reason;
 }
 
 /** What the job's schedule does once it is Ready. */

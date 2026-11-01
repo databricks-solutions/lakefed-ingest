@@ -57,6 +57,17 @@ def test_needs_you_lists_the_set_aside_databases_and_offers_the_four_actions():
     assert 'actionDisabled={!check.data ? "Check the names first" : undefined}' in names
 
 
+def test_preparing_offers_stop_preparing_and_a_stopped_job_prepare_again_or_delete():
+    card = _function(JOB, "Preparation")
+    assert 'title: "Stop preparing?", action: "Stop preparing"' in card
+    assert 'act.mutate({ action: "stop", body: {} })' in card and 'act.mutate({ action: "again", body: {} })' in card
+    assert "onClick={stopPreparing}>Stop preparing</button>" in card and ">Prepare again</button>" in card
+    assert "title={actions.stop ?? undefined}" in card and "title={actions.again ?? undefined}" in card
+    assert '{p.state === "preparing" && !stopped && <div className="toolbar">' in card
+    assert '<Section title={stopped ? "Stopped" : p.state === "needs_you" ? "Needs you" : "Preparing"}' in card
+    assert "if (view.stopped) return `Stopped: ${view.stopped.why" in HELPERS
+
+
 def test_edit_keeps_what_waits_for_ready_locked_and_says_why():
     assert "const notReady = !!schedule?.options?.prepare?.state && schedule.options.prepare.state !== \"ready\";" in EDIT
     assert "<Tree jobId={id} locked={locked ?? tablesLocked} />" in EDIT
