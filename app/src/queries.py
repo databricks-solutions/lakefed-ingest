@@ -1596,7 +1596,8 @@ def warehouse_in_flight_sql(kind: str) -> str:
 def warehouse_claim_sql(kind: str) -> str:
     """Claim up to a number of a discovery's databases with no statement yet, skipping those another request holds or
     claimed less than a while ago. A check claims only the names asked for (the page shown): the login's access is
-    checked for what the page lists, never the whole server. A read claims the names asked for first, then by name.
+    checked for what the page lists, never the whole server. A read claims the names asked for first, then by name;
+    the app claims its reads through warehouse_claim_reads_sql instead, which keeps to the server's cap.
     Params: discovery_id, the age in seconds after which a claim with no statement is free again, the names (text[]),
     limit."""
     names = ("and src_database = any(%s::text[]) order by src_database" if kind == "check"
@@ -1611,6 +1612,99 @@ def warehouse_claim_sql(kind: str) -> str:
             f"where d.discovery_id = c.discovery_id and d.src_database = c.src_database returning d.src_database")
 
 
+# The reads through the warehouse are capped per server: the reads in flight on one connection, across every discovery
+# and app instance, are counted in the claim's own transaction, under a transaction lock of that server's
+# (warehouse_reads.CAPS sets each server's cap). A read is in flight while its claim is live: whoever watches its
+# statement (a worker of the background reader, or the page's step) renews the claim (warehouse_hold_sql), so one
+# nobody watches any more, after a restart say, stops counting once CLAIM_S has gone and is read again from its saved
+# statement (warehouse_collect_sql), never sent again.
+_LIVE_CLAIM = "(listing ->> 'claimed_at')::timestamptz >= now() - make_interval(secs => %s)"
+_LAPSED_CLAIM = ("(listing ->> 'claimed_at' is null "
+                 "or (listing ->> 'claimed_at')::timestamptz < now() - make_interval(secs => %s))")
+_THROUGH_WAREHOUSE = "listing ->> 'via' = 'warehouse'"
+
+
+def warehouse_reads_lock_sql() -> str:
+    """Wait for, and take, one server's reads lock for this transaction, so two claimers never both take its last free
+    places. A transaction lock, never a session one: the app's connections are pooled. Param:
+    warehouse_reads_lock_key."""
+    return "select pg_advisory_xact_lock(hashtextextended(%s, 0))"
+
+
+def warehouse_reads_lock_key(server: str) -> str:
+    """The reads lock key of one server (its connection's name, lower case), apart from every other lock's key: a
+    collection's run lock key starts with the schema and a colon (collection_lock_key), so this one doesn't."""
+    return f"{SCHEMA}/warehouse_reads/{server}"
+
+
+def warehouse_reads_going_sql() -> str:
+    """How many reads of one server are in flight: its databases still to read, through the warehouse, with a live
+    claim (a statement going and watched, or one about to be sent). Params: server (lower case), claim age in seconds."""
+    return (f"select count(*) as going from {SCHEMA}.discovery where lower(src_connection) = %s "
+            f"and {_THROUGH_WAREHOUSE} and {WAREHOUSE_WORK['read']} and {_LIVE_CLAIM}")
+
+
+def warehouse_claim_reads_sql() -> str:
+    """Claim up to a number of databases to read, of one server's discoveries, in the order the discoveries are given,
+    then by name: those with no statement and no live claim, skipping those another claimer holds. Params: server
+    (lower case), discovery ids (text[]), claim age in seconds, the same ids again (their order), limit."""
+    return (f"update {SCHEMA}.discovery d set listing = coalesce(d.listing, '{{}}'::jsonb) "
+            f"|| jsonb_build_object('claimed_at', now()::text) "
+            f"from (select discovery_id, src_database from {SCHEMA}.discovery "
+            f"      where lower(src_connection) = %s and discovery_id = any(%s::text[]) and {_THROUGH_WAREHOUSE} "
+            f"      and {WAREHOUSE_WORK['read']} and not (coalesce(listing, '{{}}'::jsonb) ? 'statement_id') "
+            f"      and {_LAPSED_CLAIM} "
+            f"      order by array_position(%s::text[], discovery_id), src_database limit %s for update skip locked) c "
+            f"where d.discovery_id = c.discovery_id and d.src_database = c.src_database "
+            f"returning d.discovery_id, d.src_database")
+
+
+def warehouse_collect_sql() -> str:
+    """Claim up to a number of a discovery's databases whose statement nobody watches (saved, its claim lapsed), to read
+    that statement again: their names and statements. Params: discovery_id, claim age in seconds, limit."""
+    return (f"update {SCHEMA}.discovery d set listing = d.listing || jsonb_build_object('claimed_at', now()::text) "
+            f"from (select discovery_id, src_database from {SCHEMA}.discovery "
+            f"      where discovery_id = %s and {WAREHOUSE_WORK['read']} and listing ? 'statement_id' and {_LAPSED_CLAIM} "
+            f"      order by src_database limit %s for update skip locked) c "
+            f"where d.discovery_id = c.discovery_id and d.src_database = c.src_database "
+            f"returning d.src_database, d.listing ->> 'statement_id' as statement_id")
+
+
+def warehouse_hold_sql() -> str:
+    """Renew the claims of reads still being watched, so no one else takes them and they keep counting under the cap.
+    Params: discovery ids (text[]) and databases (text[]), pair by pair."""
+    return (f"update {SCHEMA}.discovery set listing = listing || jsonb_build_object('claimed_at', now()::text) "
+            f"where (discovery_id, src_database) in (select * from unnest(%s::text[], %s::text[])) "
+            f"and {WAREHOUSE_WORK['read']}")
+
+
+def warehouse_read_work_sql() -> str:
+    """The discoveries with reads to do through the warehouse, oldest first, for the background reader: each one's
+    connection, its databases waiting for a statement (none saved, no live claim) and those whose statement nobody
+    watches (saved, its claim lapsed). A database whose read started more than a while ago is left alone, and so is a
+    draft discarded or not asked about for the drafts' time limit (the purge's rule: delete_job.purgeable_drafts_sql).
+    Params: claim age, the most a read's age may be, the drafts' time limit, all in seconds."""
+    work = f"{WAREHOUSE_WORK['read']} and started_at > now() - make_interval(secs => p.max_age)"
+    lapsed = _LAPSED_CLAIM.replace("%s", "p.claim_s")
+    return (f"with p as (select %s::float as claim_s, %s::float as max_age, %s::float as draft_ttl), "
+            f"live as (select distinct discovery_id from {SCHEMA}.discovery where status = 'running' "
+            f"         and {_THROUGH_WAREHOUSE} and src_connection is not null) "
+            f"select d.discovery_id, min(d.src_connection) as src_connection, "
+            f"count(*) filter (where {work} and not (listing ? 'statement_id') and {lapsed}) as waiting, "
+            f"count(*) filter (where {work} and listing ? 'statement_id' and {lapsed}) as orphaned "
+            f"from {SCHEMA}.discovery d cross join p where d.discovery_id in (select discovery_id from live) "
+            f"group by d.discovery_id, p.draft_ttl "
+            f"having count(*) filter (where {work} and {lapsed}) > 0 "
+            f"and not (bool_or(listing ? 'draft') and coalesce(max((listing ->> 'touched_at')::timestamptz), "
+            f"max(started_at)) < now() - make_interval(secs => p.draft_ttl)) "
+            f"order by min(d.started_at)")
+
+
+def discovery_connection_sql() -> str:
+    """The connection a discovery was started through, saved on its rows. Param: discovery_id."""
+    return f"select src_connection from {SCHEMA}.discovery where discovery_id = %s limit 1"
+
+
 def warehouse_unchecked_sql() -> str:
     """How many of the names asked for are listed and not checked yet: the page's checks still to come. Params:
     discovery_id, the names (text[])."""
@@ -1619,8 +1713,10 @@ def warehouse_unchecked_sql() -> str:
 
 
 def warehouse_started_sql() -> str:
-    """Record the statement started for a database. Params: statement_id, discovery_id, src_database."""
-    return (f"update {SCHEMA}.discovery set listing = coalesce(listing, '{{}}'::jsonb) || jsonb_build_object('statement_id', %s::text) "
+    """Record the statement started for a database, its claim renewed with it. Params: statement_id, discovery_id,
+    src_database."""
+    return (f"update {SCHEMA}.discovery set listing = coalesce(listing, '{{}}'::jsonb) "
+            f"|| jsonb_build_object('statement_id', %s::text, 'claimed_at', now()::text) "
             f"where discovery_id = %s and src_database = %s")
 
 
@@ -1639,11 +1735,14 @@ def warehouse_check_done_sql() -> str:
 
 
 def warehouse_read_done_sql() -> str:
-    """A read's end on a database: ok with its table count, or failed with why. Params: status, tables, error,
-    discovery_id, src_database. Only a database still running is changed, so a second answer writes nothing."""
+    """A read's end on a database: ok with its table count, or failed with why; returns the database when it changed.
+    Params: status, tables, error, discovery_id, src_database, statement_id, statement_id. Only a database still
+    running is changed, so a second answer writes nothing; and only by the statement saved for it (or before one is
+    saved), so a statement it no longer waits on never ends it."""
     return (f"update {SCHEMA}.discovery set status = %s, tables = %s, error = %s, finished_at = now(), "
             f"listing = coalesce(listing, '{{}}'::jsonb) - 'statement_id' - 'claimed_at' "
-            f"where discovery_id = %s and src_database = %s and status = 'running'")
+            f"where discovery_id = %s and src_database = %s and status = 'running' "
+            f"and coalesce(listing ->> 'statement_id', %s::text) = %s::text returning src_database")
 
 
 def insert_discovered_tables_sql(columns, count: int) -> str:
@@ -1663,7 +1762,7 @@ def warehouse_progress_sql(kind: str) -> str:
                 f"count(*) filter (where not (listing ->> 'open')::boolean) as closed, "
                 f"coalesce(sum(tables) filter (where (listing ->> 'open')::boolean), 0) as tables "
                 f"from {SCHEMA}.discovery where discovery_id = %s and status = 'listed'")
-    return (f"select count(*) as databases, count(*) filter (where status = 'running') as pending, "
+    return (f"select count(*) as databases, count(*) filter (where {WAREHOUSE_WORK['read']}) as pending, "
             f"count(*) filter (where status = 'ok') as done, count(*) filter (where status = 'failed') as failed, "
             f"coalesce(sum(tables) filter (where status = 'ok'), 0) as tables "
             f"from {SCHEMA}.discovery where discovery_id = %s")

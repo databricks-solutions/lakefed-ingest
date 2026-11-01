@@ -146,3 +146,13 @@ def test_the_drafts_statements_take_the_parameters_passed():
     assert marks(q.draft_of_sql()) == 1 and marks(q.draft_touch_sql()) == 2 and marks(q.draft_discard_sql()) == 1
     assert marks(q.draft_claim_sql()) == 2 and marks(q.draft_reads_sql()) == 1 and marks(q.draft_failed_sql()) == 1
     assert "not (coalesce(listing, '{}'::jsonb) ? 'discarded')" in q.warehouse_claim_sql("read")
+
+
+def test_with_the_background_reader_running_a_wait_only_keeps_the_draft_wanted_and_wakes_it(monkeypatch):
+    advanced, written = _lakebase(monkeypatch, [_reads(pending=3, done=1)])
+    woken = []
+    monkeypatch.setattr(main.READER, "running", lambda: True)
+    monkeypatch.setattr(main.READER, "wake", lambda: woken.append(True))
+    reading = main._draft_reading(SELECTION)
+    assert advanced == [] and woken == [True] and written == [(q.draft_touch_sql(), ("d1", "d1"))]
+    assert reading["pending"] == 3

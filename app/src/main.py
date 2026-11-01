@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 import action_states
+import background_reads
 import compute
 import config_import as ci
 import ingestion_jobs as ij
@@ -60,10 +61,14 @@ import warehouse_reads
 async def _lifespan(_app: FastAPI):
     """The app's background work while it runs: the run poller, which keeps the databricks_run table current (every
     instance runs one, and only the one holding the poller's lock polls; RUN_POLLER=0 turns it off on this instance),
-    the re-discovery scheduler (REDISCOVERY_TICK_S; 0 leaves it off), and the schema upgrade check, once, which starts
-    the setup job when the state database is behind (schema_upgrade; SCHEMA_UPGRADE=0 turns it off)."""
+    the re-discovery scheduler (REDISCOVERY_TICK_S; 0 leaves it off), the background reader, which keeps the reads
+    through the SQL warehouse going whether a page is open or not (background_reads; BACKGROUND_READS=0 turns it off on
+    this instance, and the pages' steps take the reads instead), and the schema upgrade check, once, which starts the
+    setup job when the state database is behind (schema_upgrade; SCHEMA_UPGRADE=0 turns it off)."""
     if os.environ.get("RUN_POLLER", "1") != "0":
         run_poller.POLLER.start(on_change=_forget_shared_reads)
+    if os.environ.get("BACKGROUND_READS", "1") != "0" and warehouse.configured():
+        READER.start()
     if os.environ.get("SCHEMA_UPGRADE", "1") != "0":
         schema_upgrade.start(db.connect, jobs.SETUP_JOB_ID, lambda job_id: jobs.runs(job_id, active_only=True, limit=1),
                              lambda job_id: jobs.run_now(job_id, {}))
@@ -3717,6 +3722,37 @@ class WarehouseReadStore:
         with db.transaction() as cur:
             return [r["src_database"] for r in db.fetch(cur, q.warehouse_claim_sql(kind), (discovery_id, claim_s, first, limit))]
 
+    def claim_reads(self, server: str, discovery_ids: List[str], cap: int, limit: int,
+                    claim_s: int) -> Tuple[List[tuple], bool]:
+        """Claim up to ``limit`` databases to read of these discoveries of one server, never more than its cap leaves
+        room for: the reads in flight on the server, of every discovery and app instance, are counted in this same
+        transaction under the server's lock (a transaction lock: the connection goes back to the pool). Returns the
+        (discovery, database) pairs claimed, and whether the server is now at its cap."""
+        if limit <= 0 or not discovery_ids:
+            return [], False
+        with db.transaction() as cur:
+            cur.execute(q.warehouse_reads_lock_sql(), (q.warehouse_reads_lock_key(server),))
+            going = int(db.fetch(cur, q.warehouse_reads_going_sql(), (server, claim_s))[0]["going"] or 0)
+            room = min(int(limit), int(cap) - going)
+            if room <= 0:
+                return [], True
+            ids = list(discovery_ids)
+            rows = db.fetch(cur, q.warehouse_claim_reads_sql(), (server, ids, claim_s, ids, room))
+        return [(r["discovery_id"], r["src_database"]) for r in rows], going + len(rows) >= int(cap)
+
+    def collect(self, discovery_id: str, claim_s: int, limit: int) -> List[tuple]:
+        if limit <= 0:
+            return []
+        return [(r["src_database"], r["statement_id"])
+                for r in db.query(q.warehouse_collect_sql(), (discovery_id, claim_s, limit))]
+
+    def hold(self, reads: List[tuple]) -> None:
+        if reads:
+            db.execute(q.warehouse_hold_sql(), ([d for d, _ in reads], [n for _, n in reads]))
+
+    def read_work(self, claim_s: float, max_age_s: float, draft_ttl_s: float) -> List[dict]:
+        return db.query(q.warehouse_read_work_sql(), (claim_s, max_age_s, draft_ttl_s))
+
     def started(self, kind: str, discovery_id: str, database: str, statement_id: str) -> None:
         db.execute(q.warehouse_started_sql(), (statement_id, discovery_id, database))
 
@@ -3726,23 +3762,57 @@ class WarehouseReadStore:
     def finish_check(self, discovery_id: str, database: str, ok: bool, tables: Optional[int], why: Optional[str]) -> None:
         db.execute(q.warehouse_check_done_sql(), (ok, why, tables, discovery_id, database))
 
-    def finish_read(self, discovery_id: str, database: str, rows: Optional[List[tuple]], error: Optional[str]) -> None:
-        """A database's tables saved and its row finished, in one transaction; or its row failed with why. No delete
-        first: the app has no DELETE on Lakebase (grant_app_access), and each read has a discovery id of its own, so
-        there is nothing to replace; a second answer for the same database inserts nothing (on conflict)."""
+    def finish_read(self, discovery_id: str, database: str, rows: Optional[List[tuple]], error: Optional[str],
+                    statement_id: str) -> None:
+        """A database's row finished and its tables saved, in one transaction; or its row failed with why. Only its
+        own statement ends it (warehouse_read_done_sql), and the tables are saved only when it did. No delete first:
+        the app has no DELETE on Lakebase (grant_app_access), and each read has a discovery id of its own, so there is
+        nothing to replace; a second answer for the same database inserts nothing (on conflict)."""
         if rows is None:
-            db.execute(q.warehouse_read_done_sql(), ("failed", None, error, discovery_id, database))
+            db.execute(q.warehouse_read_done_sql(),
+                       ("failed", None, error, discovery_id, database, statement_id, statement_id))
             return
         columns = warehouse_reads.TABLE_COLUMNS
         with db.transaction() as cur:
+            done = db.fetch(cur, q.warehouse_read_done_sql(),
+                            ("ok", len(rows), None, discovery_id, database, statement_id, statement_id))
+            if not done:
+                return
             for at in range(0, len(rows), q.CONTROL_BATCH):
                 chunk = rows[at:at + q.CONTROL_BATCH]
                 cur.execute(q.insert_discovered_tables_sql(columns, len(chunk)), tuple(v for row in chunk for v in row))
-            cur.execute(q.warehouse_read_done_sql(), ("ok", len(rows), None, discovery_id, database))
 
     def progress(self, kind: str, discovery_id: str) -> dict:
         row = db.query(q.warehouse_progress_sql(kind), (discovery_id,))[0]
         return {k: int(v or 0) for k, v in row.items()}
+
+
+# The background reader (background_reads.py), started in _lifespan: it reads the chosen databases' tables whatever
+# page is open. While it runs, the page's, Create's and re-discovery's waits only ask where the reads stand.
+READER = background_reads.Reader(WarehouseReadStore(), warehouse, draft_ttl_s=run_poller.DRAFT_TTL_S)
+
+
+def _reads_step(discovery_id: str, connection: str) -> dict:
+    """Where a discovery's reads stand: with the background reader running, as it has them (woken, so a read just
+    started starts at once), with why a statement couldn't be sent if one just couldn't; without it, after one step of
+    them (warehouse_reads.advance), which keeps to the server's cap as the reader does."""
+    store = WarehouseReadStore()
+    if READER.running():
+        READER.wake()
+        step = warehouse_reads.standing(store, warehouse, warehouse_reads.READ, discovery_id)
+        error = READER.recent_error(discovery_id)
+        return {**step, "error": error, "warehouse": ""} if error and step["pending"] else step
+    return warehouse_reads.advance(store, warehouse, warehouse_reads.READ, discovery_id, connection)
+
+
+def _own_connection(discovery_id: str, connection: str) -> None:
+    """Refuse a step of a discovery's statements through any connection but its own (the one it was started through
+    and saved on its rows), so its statements never go to another server."""
+    rows = db.query(q.discovery_connection_sql(), (discovery_id,))
+    if not rows:
+        raise HTTPException(404, f"no discovery {discovery_id}")
+    if rows[0]["src_connection"] != connection:
+        raise HTTPException(409, f"discovery {discovery_id} reads through another connection than {connection}")
 
 
 class AccessCheckRequest(BaseModel):
@@ -3754,8 +3824,10 @@ class AccessCheckRequest(BaseModel):
 def check_access(discovery_id: str, body: AccessCheckRequest, connection: str):
     """One step of checking whether the connection's login can open the databases the page shows
     (warehouse_reads.advance): only those, so a server of 22,000 databases is checked a page at a time as it is
-    looked at. The page asks while some of them aren't checked yet (pending_shown). The answers are on the listing."""
+    looked at. The page asks while some of them aren't checked yet (pending_shown). The answers are on the listing:
+    each check is sent with a short wait, so most are saved by the request that sent them."""
     _require_connection(connection)
+    _own_connection(discovery_id, connection)
     step = warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.CHECK, discovery_id, connection,
                                    body.first)
     unchecked = db.query(q.warehouse_unchecked_sql(), (discovery_id, list(body.first)))[0]["unchecked"]
@@ -3764,11 +3836,12 @@ def check_access(discovery_id: str, body: AccessCheckRequest, connection: str):
 
 @app.get("/api/discoveries/{discovery_id}/reads")
 def warehouse_reads_step(discovery_id: str, connection: str):
-    """One step of reading the chosen databases' tables through the warehouse: the page asks until it has ended."""
+    """Where the reading of the chosen databases' tables through the warehouse stands (_reads_step): the page asks
+    until it has ended. Asking keeps a draft wanted."""
     _require_connection(connection)
+    _own_connection(discovery_id, connection)
     db.execute(q.draft_touch_sql(), (discovery_id, discovery_id))
-    return {"discovery_id": discovery_id, "via": "warehouse",
-            **warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, discovery_id, connection)}
+    return {"discovery_id": discovery_id, "via": "warehouse", **_reads_step(discovery_id, connection)}
 
 
 @app.post("/api/discoveries/{discovery_id}/discard")
@@ -3790,20 +3863,26 @@ def discard_draft(discovery_id: str):
 
 def _draft_reading(selection: "Selection", advance: bool = True) -> Optional[dict]:
     """Where the reads of the discoveries a choice names stand, for a preview or a Create: None when every database is
-    read. With ``advance`` it first does a step of each read still going (the page that started them may be gone),
-    and marks the drafts still wanted. A database a whole-server read couldn't open is left out, as the check would
-    have left it out; any other database that couldn't be read is a failure, named."""
+    read. With ``advance`` it marks the drafts still wanted and keeps their reads going: the background reader is
+    woken, or, with it off, a step of each read still going is taken (the page that started them may be gone). A
+    database a whole-server read couldn't open is left out, as the check would have left it out; any other database
+    that couldn't be read is a failure, named."""
     kind, ids, _ = selection.source()
     if kind != "discovery" or not ids:
         return None
     reads = db.query(q.draft_reads_sql(), (ids,))
     if advance:
+        stepped = False
         for r in reads:
             if int(r["pending"] or 0) and r.get("src_connection"):
                 db.execute(q.draft_touch_sql(), (r["discovery_id"], r["discovery_id"]))
-                warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, r["discovery_id"],
-                                        r["src_connection"])
-        if any(int(r["pending"] or 0) for r in reads):
+                if READER.running():
+                    READER.wake()
+                else:
+                    warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, r["discovery_id"],
+                                            r["src_connection"])
+                    stepped = True
+        if stepped:
             reads = db.query(q.draft_reads_sql(), (ids,))
     total = {k: sum(int(r[k] or 0) for r in reads)
              for k in ("databases", "pending", "done", "failed", "discarded", "tables")}
@@ -3832,7 +3911,7 @@ def _draft_problems(reading: Optional[dict]) -> List[str]:
 
 def _start_warehouse_read(body: "SourceDiscoverRequest", names: List[str], user: Optional[str]) -> dict:
     """Start reading tables through the warehouse: the whole server (the databases of its listing that the filter keeps
-    and the login wasn't found unable to open) or the databases named, then the first step of the reads."""
+    and the login wasn't found unable to open) or the databases named, then where the reads stand (_reads_step)."""
     did = uuid.uuid4().hex[:12]
     if body.draft_id:
         drafts = db.query(q.draft_of_sql(), (body.draft_id,))
@@ -3853,8 +3932,7 @@ def _start_warehouse_read(body: "SourceDiscoverRequest", names: List[str], user:
         chunk = names[at:at + q.CONTROL_BATCH]
         db.execute(q.warehouse_named_rows_sql(len(chunk)),
                    tuple(v for name in chunk for v in (did, body.src_connection, name, user, marks)))
-    step = warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, did, body.src_connection)
-    return {"discovery_id": did, "via": "warehouse", "left_out": left_out, **step}
+    return {"discovery_id": did, "via": "warehouse", "left_out": left_out, **_reads_step(did, body.src_connection)}
 
 
 @app.post("/api/discoveries/source")
@@ -4984,7 +5062,8 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
     return _write_now_or_later("create", body.request_id, None, len(rows), user, write, after)
 
 
-# How often a Create waiting on a draft's read does a step of it.
+# How often a Create waiting on a draft's read asks where it stands (and takes a step of it, with the background reader
+# off).
 DRAFT_POLL_S = 1.5
 
 
@@ -5629,8 +5708,8 @@ def spa(path: str):
 REDISCOVERY_TICK_S = float(os.environ.get("REDISCOVERY_TICK_S", "300"))   # 0 turns the scheduler off
 REDISCOVERY_POLL_S = float(os.environ.get("REDISCOVERY_POLL_S", "30"))
 REDISCOVERY_MAX_WAIT_S = float(os.environ.get("REDISCOVERY_MAX_WAIT_S", str(6 * 3600)))
-# How often re-discovery takes a step of its warehouse reads: short, since each step starts only as many statements as
-# have ended (warehouse_reads.IN_FLIGHT going at once, by kind).
+# How often re-discovery asks where its warehouse reads stand: short, since the background reader saves each one as it
+# ends (and, with the reader off, each step starts only as many statements as the server's cap leaves room for).
 REDISCOVERY_WAREHOUSE_POLL_S = float(os.environ.get("REDISCOVERY_WAREHOUSE_POLL_S", "2"))
 REDISCOVERY_USER = "re-discovery"
 
@@ -5831,9 +5910,9 @@ def _discover_through_warehouse(spec: dict, discovery_id: str) -> Optional[str]:
     for at in range(0, len(names), q.CONTROL_BATCH):
         chunk = names[at:at + q.CONTROL_BATCH]
         db.execute(q.warehouse_named_rows_sql(len(chunk)),
-                   tuple(v for name in chunk for v in (discovery_id, connection, name, spec.get("requested_by"))))
+                   tuple(v for name in chunk for v in (discovery_id, connection, name, spec.get("requested_by"), "{}")))
     waited = 0.0
-    while warehouse_reads.advance(WarehouseReadStore(), warehouse, warehouse_reads.READ, discovery_id, connection)["pending"]:
+    while _reads_step(discovery_id, connection)["pending"]:
         if waited >= REDISCOVERY_MAX_WAIT_S:
             return f"its tables are still being read after {int(waited)} seconds"
         time.sleep(REDISCOVERY_WAREHOUSE_POLL_S)
