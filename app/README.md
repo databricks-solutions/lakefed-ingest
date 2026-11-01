@@ -352,6 +352,59 @@ parts are read once per secret.
 The job page's block shows the last run: its status (running, done, deferred or failed), when it started and
 finished, what it found and added, what was skipped, the new databases, the vanished tables, and any errors.
 
+## A new job's preparation
+
+A job is in one of three states, kept on its record in the schedule's options (`options.prepare`, `src/preparing.py`;
+no schema change):
+
+| State | What it means |
+|---|---|
+| **Preparing** | its chosen databases' tables are read (reading), then its tables are written (writing), then its Databricks jobs are made (syncing) |
+| **Needs you** | some of its databases are set aside, each with why, until someone chooses what happens to them |
+| **Ready** | it runs as any job does |
+
+A job with no record, every job made before it, is Ready. Create writes every table before it answers, so a job it
+makes now is Ready at once; the other two states are for a job recorded first and written in the background.
+
+**What Create was asked for is kept.** The record holds the job's settings (targets, load type, fan-in, write modes,
+identity columns), its tables per group or groups per server, its secret scope and trust as Create checked them, the
+upload or discoveries it was chosen from (the parts are its `job_selection` rows), whether its schedule is to be on, and
+who made it. Only the app writes it: a request's `prepare` option is dropped (New schedule), refused (Create) or
+replaced with the stored one (Edit's save, which takes the app's own options again under the job's lock before it
+writes).
+
+**While a job isn't Ready** the server refuses (409, with `reason` `not_ready`, the state and the stage) Run now, a run
+of one database or of one of its groups, re-discovery (its daily run skips the job too), turning its schedule on, and
+every change to what it ingests: Add tables, Add databases, a table's edit, enable or disable, a removal, and the table
+routes that name one of its groups. Its name, when it runs, the e-mails and its advanced configuration change as for
+any job; its groups stay as its preparation makes them, and its secret scope and trust as Create checked them. Pause
+keeps its schedule off once it is Ready; a schedule that was to be on turns on then, if whoever asked for it may still
+run what it starts. How it writes and its group size can be changed while its tables are read: Edit then changes the
+record's settings, checked as Create checks them. Once the write has begun they wait for Ready, so one job never has
+two rules. Delete is as for any job.
+
+**A database set aside** is listed on the job page with why: it couldn't be read (the server's message), or its tables
+clash with another job's or with each other (the target, and the other job). In a whole-server choice a database the
+login can't open is only left out, and listed. The job page offers, each needing Can Manage on the job, as Edit does:
+- **Read them again**: the unreadable ones are marked to be read again;
+- **Leave them out**: they come out of the job's choice, which a later re-discovery leaves out too, and the job goes on;
+- **Change the job's target names**: new target templates, checked first, and the clashing databases are planned again
+  with them;
+- **Delete the job**.
+
+**The job page** shows "Preparing: reading tables, 1,240 of 3,000 databases (58,280 tables so far), about 12 min left"
+with a progress bar, read every 3 seconds from `GET /api/ingestion-jobs/{id}/prepare`, which counts the job's claimed
+draft rows. The minutes left are the databases left over the recent rate (those finished in the last two minutes,
+weighed against the rate since the reading began), shown once 20 databases or 30 seconds are done, and rounded to the
+minute, then to 5 minutes from 15, and to 10 from an hour. Run now and the schedule say they are available when the job
+is ready. The Ingestion jobs list says Preparing or Needs you in its Status column, and a job that needs you counts
+under Needs attention.
+
+**The write is checked when it happens.** A write that runs later, on a thread with no request, is held to the job's
+maker and its connection as they are then (`main._prepare_checks`): the JDBC connection's scope and trust, each key's
+newest login typed under that connection, and the manager rule for reads by host and for a secret scope, all read
+again, before the write and in each of its transactions.
+
 ## Guard rails for edits
 
 Data integrity comes first, so edits go through the server's rules, not the browser's:
@@ -387,6 +440,7 @@ elsewhere, or whose sink table no longer exists, is reseeded instead of silently
 | Backend | `src/main.py` (FastAPI) | JSON API under `/api` (OpenAPI docs at `/api/docs`); serves the built frontend for every other path |
 | Data access | `src/lakebase.py`, `src/jobs.py` | Lakebase (psycopg, SDK-minted credential, a small pool of idle connections: `LAKEBASE_POOL_IDLE`, 0 = off) and the Jobs API, as the app's service principal |
 | Background reader | `src/background_reads.py`, `src/warehouse_reads.py` | Reads the chosen databases' tables through the SQL warehouse, in parallel, within each server's cap (see Discovery through the SQL warehouse). `BACKGROUND_READS=0` turns it off on an instance |
+| Preparation | `src/preparing.py` | A new job's state until it can run, what Create was asked for, its set-aside databases and the minutes left (see A new job's preparation); pure |
 | Run poller | `src/run_poller.py` | One poller (every 15 seconds, one instance at a time through an advisory lock) writes the `databricks_run` table; the pages read that table, and it closes the ingest runs whose Databricks run has ended. `RUN_POLLER=0` turns it off on an instance. Until the table exists, the app reads the Jobs API as before |
 | SQL and rules | `src/queries.py` | Every statement (parameterized), form validation, bulk-import review logic |
 | Frontend | `src/frontend/` (React, TypeScript, Vite) | Pages under `src/frontend/src/pages/`; React Router, TanStack Query, AG Grid Community for the grids |
@@ -443,7 +497,8 @@ The app runs as its own service principal (created with the app):
   permission on the job its runs execute as (the check job on a check schedule, else the ingestion job), as the
   Jobs UI does:
   - running it (Run now), cancelling its run (Cancel run), or a new job that isn't paused: `CAN_MANAGE_RUN`;
-  - changing it (Edit and Save, Pause, Resume, Sync jobs), its groups' tables (edit, enable, disable, reseed,
+  - changing it (Edit and Save, Pause, Resume, Sync jobs, and Read them again, Leave them out and Change the job's
+    target names on databases set aside while it is prepared), its groups' tables (edit, enable, disable, reseed,
     Add table, Import CSV, Bulk import's register), or deleting it: `CAN_MANAGE` or owner;
   - a change to tables needs `CAN_MANAGE` on every ingestion job that runs one of their groups, since a group
     can be in more than one job and its tables change for all of them;
