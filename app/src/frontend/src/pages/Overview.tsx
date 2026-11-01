@@ -113,8 +113,9 @@ export function RunningNow({ total, notInJob }: { total: number; notInJob: Row[]
 export function NeedsAttention({ jobs, total }: { jobs: Row[]; total: number }) {
   const attentionTo = total === 1 ? jobPath(jobs[0].id) : "/ingestion-jobs?filter=attention";
   return (
-    <Section title={<>Needs attention <Info>Jobs with tables failing now, or whose last ingestion run ended without finishing.
-      Late data is counted on each job instead.</Info></>}>
+    <Section title={<>Needs attention <Info>Jobs with tables failing now, whose last ingestion run ended without finishing, or
+      that need you to choose what happens to databases set aside while they were prepared. Late data is counted on each job
+      instead.</Info></>}>
       <div className="metric-value small-value">{total ? <Link to={attentionTo}>{fmtInt(total)} {plural(total, "job")}</Link>
         : <>0 jobs</>}</div>
       {!total && <p className="muted">No job needs attention.</p>}

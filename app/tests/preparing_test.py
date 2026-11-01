@@ -202,7 +202,9 @@ def test_the_page_view_counts_the_reads_and_lists_what_is_set_aside():
     assert shown["state"] == p.NEEDS_YOU and shown["turn_on"] is True and shown["recorded"] is True
     assert shown["reading"] == {"databases": 3000, "read": 1240, "done": 1238, "failed": 2, "pending": 1760,
                                 "tables": 58280, "percent": 41, "minutes_left": 15}
-    assert shown["counts"] == {"set_aside": 2, "waiting": 2, "unreadable": 2, "clash": 0, "closed": 0, "left_out": 0}
+    assert shown["counts"] == {"set_aside": 2, "waiting": 2, "waiting_unreadable": 2, "waiting_clash": 0,
+                               "unreadable": 2, "clash": 0, "closed": 0, "left_out": 0}
+    assert shown["targets"] == {"sink_catalog": "main", "sink_schema": "bronze", "sink_table": "{table}"}
     assert [e["database"] for e in shown["set_aside"]] == ["eng_1", "eng_2"]
     assert p.view({}, reads)["reading"] is None and p.view({})["recorded"] is False
 

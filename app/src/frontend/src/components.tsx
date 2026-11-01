@@ -214,8 +214,8 @@ export function statusName(value: unknown): string {
 export function Badge({ value }: { value: unknown }) {
   const v = String(value ?? "").toLowerCase();
   const tone = ["failed", "invalid", "internal_error", "timedout"].includes(v) ? "bad"
-    : ["running", "pending", "queued", "seeding"].includes(v) ? "run"
-    : ["skipped", "breached", "drifted"].includes(v) ? "warn"
+    : ["running", "pending", "queued", "seeding", "preparing"].includes(v) ? "run"
+    : ["skipped", "breached", "drifted", "needs you"].includes(v) ? "warn"
     : ["completed", "success", "succeeded", "registered", "valid", "incremental", "loaded", "synced", "in_sync"].includes(v) ? "ok" : "";
   return <span className={`badge ${tone}`}>{statusName(value)}</span>;
 }

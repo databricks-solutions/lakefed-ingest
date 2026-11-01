@@ -11,6 +11,7 @@ import { ImportCsvDialog } from "./NewJob";
 import { TaskProgress, finished, newRequestId, resumableWrite } from "./tasks";
 import { DiscoverDialog } from "./Discover";
 import { isUnconfirmed, requestWriteNotice, saveNotice, syncFailureLines } from "../pending";
+import { AVAILABLE_WHEN_READY } from "../preparing";
 
 // Edit an ingestion job: what it ingests (a tree from its servers), how it writes, its identity columns, when it
 // runs and its advanced configuration. A change in the tree applies once its dialog is confirmed, as Catalog Explorer
@@ -329,6 +330,11 @@ export default function JobEdit() {
   // The settings form as it loaded, so "unsaved" means the user changed something, not that a default differs.
   const [loaded, setLoaded] = useState("");
   const locked: Locked = usePermissions().data?.jobs[id]?.change ?? null;
+  // A job that isn't ready yet (preparing.py): what it ingests and its schedule wait for Ready; how it writes and its
+  // groups are the ones Create kept, editable while its tables are read (the server's settings_locked says when not).
+  const notReady = !!schedule?.options?.prepare?.state && schedule.options.prepare.state !== "ready";
+  const tablesLocked: Locked = notReady ? "what it ingests can be changed when the job is ready" : null;
+  const settingsLocked: Locked = settings.data?.settings_locked ?? null;
   // The cluster copies run a save started: from the save's answer until a read taken after it shows the run ended.
   const [applyStartedAt, setApplyStartedAt] = useState<number | null>(null);
   const [applyError, setApplyError] = useState<string | null>(null);
@@ -491,6 +497,10 @@ export default function JobEdit() {
             onClick={() => save.mutate()}>{saving ? "Saving…" : "Save"}</button></span>} />
       {confirm.dialog}
       {locked && <Notice tone="info">You can see this job's settings but not change them: {locked}.</Notice>}
+      {notReady && <Notice tone="info">This job isn't ready yet. Its name, when it runs, the e-mails and its advanced configuration
+        can be changed now. {settingsLocked ? "How it writes and its groups are kept as Create was asked while its tables are written."
+          : "How it writes and its groups can be changed while its tables are read."} What it ingests, and turning its schedule on,
+        are {AVAILABLE_WHEN_READY}.</Notice>}
       <ErrorBox error={settings.error || (isUnconfirmed(save.error) ? null : save.error)} />
       <StatusLine line={saveLine} />
 
@@ -500,7 +510,7 @@ export default function JobEdit() {
 
       <Section title={<>What it ingests<Info label="About what it ingests">Open a server to see its databases, and a database to see
         its tables. A table's load type is the same in every database: change it and it changes in all of them.</Info></>}
-        actions={locked ? <button className="ghost" disabled title={locked}>Add tables <Chevron open /></button> : <Menu label={<>Add tables <Chevron open /></>} buttonClass="ghost" title="Add tables">
+        actions={locked || tablesLocked ? <button className="ghost" disabled title={(locked || tablesLocked)!}>Add tables <Chevron open /></button> : <Menu label={<>Add tables <Chevron open /></>} buttonClass="ghost" title="Add tables">
           <button onClick={addTables.discover}>Discover on a source</button>
           <button onClick={addTables.open}>Import a CSV of tables</button>
           <button onClick={() => setAddOpen(true)}>Pick databases by hand</button>
@@ -509,25 +519,29 @@ export default function JobEdit() {
         {addTables.dialog}{addTables.result}
         {addOpen && <div className="toolbar"><b>Add databases</b><button className="ghost" onClick={() => setAddOpen(false)}>Close</button></div>}
         {addOpen && <AddDatabases jobId={id} servers={(servers.data?.items ?? []).map((x: Row) => x.server)} />}
-        <Tree jobId={id} locked={locked} />
+        <Tree jobId={id} locked={locked ?? tablesLocked} />
       </Section>
 
       {s && <Section title="How it writes">
+        <fieldset className="create-lock" disabled={!!settingsLocked} title={settingsLocked ?? undefined}>
         <WritesFields w={w} setW={setW} stored={s}
           reseed={<ParameterField name="reseed_on_new_columns" params={params} setParams={setParams} options={options.data} />}
           modeNote={writeModeMoves && <p className={targetsChanged ? "help" : "impact"}>A new write mode makes new target tables and loads every
             table again{targetsChanged ? "." : ": change the target names below too."}</p>}
           targetsNote={targetsChanged && <p className="impact">New target names make new tables and load their tables again. The old tables are left in place.</p>} />
+        </fieldset>
       </Section>}
 
       {s && <Section title={<>Identity columns<Info label="About identity columns">Written on every row next to __client_id__, so the
         shared tables say whose rows they are.</Info></>}>
+        <fieldset className="create-lock" disabled={!!settingsLocked} title={settingsLocked ?? undefined}>
         <IdentityFields w={w} setW={setW} identity={identity} setIdentity={setIdentity} differing={differing}
           setDiffering={setDiffering} stored={s} tables={settings.data?.tables} />
+        </fieldset>
       </Section>}
 
       {schedule && <Section title="When it runs">
-        <RunFields run={run} setRun={setRun} cadences={cadences} />
+        <RunFields run={run} setRun={setRun} cadences={cadences} pausedLocked={notReady ? AVAILABLE_WHEN_READY : null} />
         <div className="form-grid">
           <label><span>Add new databases and tables<Info label="About adding new databases and tables">Once a day the servers are
             read again and the job adds what its selection allows: every new database matching a whole server's filter, with all its
@@ -547,7 +561,7 @@ export default function JobEdit() {
         <h3>Compute</h3>
         <ClusterFields info={clusterInfo.data} error={clusterInfo.error} cluster={cluster} setCluster={setCluster} locked={locked} />
         <Compute jobId={id} />
-        <Groups jobId={id} locked={locked} saved={Number(schedule.options?.tables_per_group) || null} />
+        <Groups jobId={id} locked={locked ?? settingsLocked} saved={Number(schedule.options?.tables_per_group) || null} />
         <h3>Tuning</h3>
         <ParameterFields params={params} setParams={setParams} options={options.data} hostReads={!!settings.data?.reads_by_host} />
       </details>}

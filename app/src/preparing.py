@@ -378,15 +378,19 @@ def view(options: Optional[dict], reads: Optional[dict] = None) -> dict:
     state = state_of(options)
     set_aside = list((record.get("set_aside") or {}).values())
     left_out = list((record.get("left_out") or {}).values())
+    waiting = waiting_entries(record)
     by_kind = {kind: sum(1 for e in set_aside if e.get("kind") == kind) for kind in KINDS}
+    waiting_by_kind = {f"waiting_{kind}": sum(1 for e in waiting if e.get("kind") == kind) for kind in NEEDS_ACTION}
+    settings = record.get("settings") or {}
     return {"state": state, "stage": stage_of(options), "words": words(options),
             "recorded": bool(record), "made_at": record.get("made_at"), "ready_at": record.get("ready_at"),
             "turn_on": bool(record.get("turn_on")), "kept_paused": record.get("kept_paused"),
             "writing_started": bool(record.get("writing_started")),
+            "targets": {k: settings.get(k) for k in TARGET_FIELDS},
             "reading": reading_view(reads) if state != READY else None,
             "progress": record.get("progress") or {},
             "set_aside": _listed(set_aside), "left_out": _listed(left_out),
-            "counts": {"set_aside": len(set_aside), "waiting": len(waiting_entries(record)), **by_kind,
+            "counts": {"set_aside": len(set_aside), "waiting": len(waiting), **waiting_by_kind, **by_kind,
                        "left_out": len(left_out)}}
 
 

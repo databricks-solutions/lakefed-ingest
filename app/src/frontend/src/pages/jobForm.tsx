@@ -99,8 +99,10 @@ export function IdentityFields({ w, setW, identity, setIdentity, differing = {},
   );
 }
 
-/** When it runs: the cadence, a start time and zone for set-time cadences, paused, and who is emailed on failure. */
-export function RunFields({ run, setRun, cadences = CADENCES }: { run: Row; setRun: (r: Row) => void; cadences?: number[] }) {
+/** When it runs: the cadence, a start time and zone for set-time cadences, paused, and who is emailed on failure.
+ *  pausedLocked: why Paused can't be changed now (a job that isn't ready yet), shown beside it. */
+export function RunFields({ run, setRun, cadences = CADENCES, pausedLocked = null }: { run: Row; setRun: (r: Row) => void;
+                            cadences?: number[]; pausedLocked?: string | null }) {
   const atSetTimes = Number(run.cadence_minutes) > 60;
   return (
     <div className="form-grid">
@@ -112,7 +114,9 @@ export function RunFields({ run, setRun, cadences = CADENCES }: { run: Row; setR
         <input type="time" value={run.start} onChange={(e) => setRun({ ...run, start: e.target.value })} /></label>}
       {atSetTimes && <label><span>Time zone<Info label="About the time zone">A run between 01:00 and 02:00 can be skipped or run an
         hour late on the night the clocks change.</Info></span><input value={run.timezone} onChange={(e) => setRun({ ...run, timezone: e.target.value })} /></label>}
-      <label className="checkbox wide"><input type="checkbox" checked={!!run.paused} onChange={(e) => setRun({ ...run, paused: e.target.checked })} /> Paused</label>
+      <label className="checkbox wide" title={pausedLocked ?? undefined}><input type="checkbox" checked={!!run.paused}
+        disabled={!!pausedLocked} onChange={(e) => setRun({ ...run, paused: e.target.checked })} /> Paused
+        {pausedLocked && <span className="muted small"> ({pausedLocked})</span>}</label>
       <label className="wide emails">Emails when a run fails<input value={run.notify_emails} placeholder="a@example.com, b@example.com"
         onChange={(e) => setRun({ ...run, notify_emails: e.target.value })} /></label>
     </div>
