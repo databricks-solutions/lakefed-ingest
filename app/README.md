@@ -149,10 +149,37 @@ service principal.
 | The database list | one statement per database (`warehouse_reads.ACCESS_SQL`): opening it is the check, and it counts its tables. Only the page shown is checked (another page or filter checks its own), so a server of 22,000 databases is never checked as a whole. A database the login can't open is greyed out, can't be ticked, and says why on hover; ticking the whole server leaves out the ones found so and says how many, and one on a page not looked at fails in the read with the server's reason, named before anything is added |
 | Reading the chosen tables | one statement per database (`source_catalog.TABLE_SUMMARY_SQL`, one row per user table), saved to `discovered_table` with the same recommendations as the discovery job |
 
-At most 16 statements of one discovery are going at once (`warehouse_reads.IN_FLIGHT`). Each request the page makes
-does one step: it reads the statements going, saves the ones that ended and starts more. Where each database stands
-is kept on its `discovery` row (`listing`: its statement, its claim, and a check's answer), and a request claims the
-databases it starts, so two pages or app instances never start the same one twice.
+**The reads run in the background, truly in parallel.** A thread of the app, the background reader
+(`src/background_reads.py`), keeps every discovery's reads going whether a page is open or not: New job's drafts, Add
+tables' reads and re-discovery's. A bounded pool of workers (`BACKGROUND_READ_WORKERS`, default 32) each sends one
+database's statement with a wait of up to 30 seconds, so its answer comes back in the same call, reads it again only
+while it is still going, saves it, and takes the next. The page, Create's wait and re-discovery only ask where the
+reads stand. `BACKGROUND_READS=0` turns the reader off on an instance; the page's requests then take the reads' steps
+as before (each request reads the statements going, saves the ones that ended and starts more, without a wait).
+
+- **Each source server has a cap** on its reads in flight, counted across every discovery and app instance: in
+  Lakebase, in the claim's own transaction, under a transaction lock of that server's (its connection's name), so two
+  claimers never both take its last places. It starts at 8 (`reads_start_cap`) and moves by 4 between 4 and 32
+  (`reads_max_cap`), from the time each read takes from send to answer, the warehouse's queue included
+  (`warehouse_reads.next_cap`): while the median of the last 8 reads stays within 1.25 times the median at the
+  starting level and the server is held at its cap, it steps up; once that median passes 1.5 times, it steps down.
+  On the lab, a 100-eDTU pool's CPU capped a 1,000-table server's reads at about 0.65 databases a second, each read
+  slower the more were in flight, and a 2X-Small warehouse began queueing at 16. Each instance keeps its own cap in
+  memory and holds the shared count to it, so a restarted instance starts again at 8.
+- **A warehouse that is starting** takes one statement at a time until one answers, and that slow first answer isn't
+  timed.
+- **Nothing is read twice, nothing stays claimed.** Where each database stands is kept on its `discovery` row
+  (`listing`: its statement, its claim, and a check's answer). Whoever starts a database claims it first (`FOR UPDATE
+  SKIP LOCKED`), so two app instances, a page and the reader never start the same one twice. A claim lasts 60 seconds
+  unless whoever watches the statement renews it (the reader does every 20): after a restart, a claim with no
+  statement is free again then, and a statement saved before the restart is read again from its id, never sent again.
+- **The check of the page shown** stays with the page: at most 16 statements of one discovery at once
+  (`warehouse_reads.IN_FLIGHT`), sent together, each with a 5-second wait, so most answers are saved by the request
+  that sent them.
+- The reader only reads what someone started through the app's checks (a read through a connection the app can see,
+  or a job's re-discovery), each through the connection saved on its rows; a page's request naming another connection
+  is refused. A read started more than 6 hours ago, a discarded draft and one nobody has asked about for two hours are
+  left alone.
 
 The step's top line counts the choice: databases chosen of those listed and their tables (counting while some aren't
 checked yet); the same numbers end the step's last line and the job's Chosen summary.
@@ -167,8 +194,14 @@ don't allow and names the server and database.
 filter, starts the read of its tables at once, while the rest of the job is filled in. The read is a draft: its rows
 are the read's own `discovery` and `discovered_table` rows, marked `draft` in `listing`, and nothing of the job
 (control, checkpoint, schedule, rollups) is written before Create.
-- **Add the tables chosen** doesn't wait: the reads go on from New job's page, whose preview counts what is read so
-  far and says how far the read is (asked every 2 seconds while a database is left).
+- **Add the tables chosen** doesn't wait: the reads go on in the background reader, and New job's preview counts what
+  is read so far and says how far the read is (asked every 2 seconds while a database is left).
+- **A database un-ticked** before Create leaves the draft (`POST /api/discoveries/{id}/drop`, by the person who started
+  it): its row is marked `dropped` in `listing` (the app has no DELETE), its statement still going is cancelled, and
+  it counts nowhere: not in the progress, not in Create's wait, and not among the databases that couldn't be read.
+  Ticked again, it comes back; one read already isn't read again. A whole-server read's databases aren't dropped one
+  by one: changing its filter discards that draft and starts another. Create takes the dropped rows with the rest of
+  the draft, so the purge never takes a part of a job's discovery.
 - **Create** is enabled throughout. Pressed early, it waits for the rest of the read in a background task (its
   progress shows "reading the chosen databases' tables first"), then writes. A database that couldn't be read stops it
   by name before anything is written; one the whole server's read couldn't open is left out and counted.
@@ -353,6 +386,7 @@ elsewhere, or whose sink table no longer exists, is reseeded instead of silently
 |---|---|---|
 | Backend | `src/main.py` (FastAPI) | JSON API under `/api` (OpenAPI docs at `/api/docs`); serves the built frontend for every other path |
 | Data access | `src/lakebase.py`, `src/jobs.py` | Lakebase (psycopg, SDK-minted credential, a small pool of idle connections: `LAKEBASE_POOL_IDLE`, 0 = off) and the Jobs API, as the app's service principal |
+| Background reader | `src/background_reads.py`, `src/warehouse_reads.py` | Reads the chosen databases' tables through the SQL warehouse, in parallel, within each server's cap (see Discovery through the SQL warehouse). `BACKGROUND_READS=0` turns it off on an instance |
 | Run poller | `src/run_poller.py` | One poller (every 15 seconds, one instance at a time through an advisory lock) writes the `databricks_run` table; the pages read that table, and it closes the ingest runs whose Databricks run has ended. `RUN_POLLER=0` turns it off on an instance. Until the table exists, the app reads the Jobs API as before |
 | SQL and rules | `src/queries.py` | Every statement (parameterized), form validation, bulk-import review logic |
 | Frontend | `src/frontend/` (React, TypeScript, Vite) | Pages under `src/frontend/src/pages/`; React Router, TanStack Query, AG Grid Community for the grids |
