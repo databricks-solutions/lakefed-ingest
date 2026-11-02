@@ -1,13 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="410" viewBox="0 0 880 410" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="410" viewBox="0 0 880 410" font-family="'DM Sans', Helvetica, Arial, sans-serif">
   <title>How the parts of lakefed-ingest fit</title>
   <desc>The check job asks the source databases what changed and starts ingest runs on job clusters for the databases with work. The ingest runs read the changes through a Unity Catalog connection or JDBC and write Delta tables. Both record their state in Lakebase. The optional operations app writes the control rows to Lakebase, starts jobs through their schedules, and reads table lists from the sources through its SQL warehouse.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0 0 L10 5 L0 10 z" fill="#57606a"/>
+      <path d="M0 0 L10 5 L0 10 z" fill="#1B3139"/>
     </marker>
   </defs>
-  <rect x="0" y="0" width="880" height="410" fill="#ffffff"/>
-  <g stroke="#57606a" stroke-width="1.5" fill="none" marker-end="url(#arrow)">
+  <rect x="0" y="0" width="880" height="410" fill="#FFFFFF"/>
+  <g stroke="#1B3139" stroke-width="1.5" fill="none" marker-end="url(#arrow)">
     <path d="M290 50 L192 50"/>
     <path d="M105 80 L105 148"/>
     <path d="M420 80 L420 128"/>
@@ -18,35 +18,35 @@
     <path d="M420 260 L420 318"/>
     <path d="M550 50 L610 50 L610 350 L552 350"/>
   </g>
-  <g stroke="#57606a" stroke-width="1.5">
-    <rect x="290" y="20" width="260" height="60" rx="6" fill="#ddf4ff" stroke-dasharray="5 3"/>
-    <rect x="20" y="20" width="170" height="60" rx="6" fill="#f6f8fa"/>
-    <rect x="20" y="150" width="170" height="120" rx="6" fill="#f6f8fa"/>
-    <rect x="290" y="130" width="260" height="50" rx="6" fill="#f6f8fa"/>
-    <rect x="290" y="210" width="260" height="50" rx="6" fill="#f6f8fa"/>
-    <rect x="650" y="185" width="210" height="60" rx="6" fill="#dafbe1"/>
-    <rect x="290" y="320" width="260" height="60" rx="6" fill="#fff8c5"/>
+  <g stroke="#1B3139" stroke-width="1.25">
+    <rect x="290" y="20" width="260" height="60" rx="10" fill="#EEEDE9" stroke-dasharray="6 4"/>
+    <rect x="20" y="20" width="170" height="60" rx="10" fill="#F9F7F4"/>
+    <rect x="20" y="150" width="170" height="120" rx="10" fill="#F9F7F4"/>
+    <rect x="290" y="130" width="260" height="50" rx="10" fill="#F9F7F4"/>
+    <rect x="290" y="210" width="260" height="50" rx="10" fill="#F9F7F4"/>
+    <rect x="290" y="320" width="260" height="60" rx="10" fill="#EEEDE9"/>
   </g>
-  <g fill="#1f2328" font-size="14" text-anchor="middle">
-    <text x="420" y="45" font-weight="600">Operations app (optional)</text>
-    <text x="420" y="64" font-size="12" fill="#57606a">find tables, make and watch jobs</text>
-    <text x="105" y="45" font-weight="600">SQL warehouse</text>
-    <text x="105" y="64" font-size="12" fill="#57606a">for the app's discovery</text>
-    <text x="105" y="178" font-weight="600">Source databases</text>
-    <text x="105" y="200" font-size="12" fill="#57606a">SQL Server</text>
-    <text x="105" y="217" font-size="12" fill="#57606a">Oracle</text>
-    <text x="105" y="234" font-size="12" fill="#57606a">PostgreSQL</text>
-    <text x="105" y="251" font-size="12" fill="#57606a">MySQL</text>
-    <text x="420" y="152" font-weight="600">Check job</text>
-    <text x="420" y="170" font-size="12" fill="#57606a">serverless: what changed?</text>
-    <text x="420" y="232" font-weight="600">Ingest runs</text>
-    <text x="420" y="250" font-size="12" fill="#57606a">job clusters, UC connection or JDBC</text>
-    <text x="755" y="211" font-weight="600">Delta tables</text>
-    <text x="755" y="230" font-size="12" fill="#57606a">in Unity Catalog</text>
-    <text x="420" y="344" font-weight="600">Lakebase</text>
-    <text x="420" y="363" font-size="12" fill="#57606a">control rows, positions, run history</text>
+  <rect x="650" y="185" width="210" height="60" rx="10" fill="#FFFFFF" stroke="#FF3621" stroke-width="2"/>
+  <g fill="#1B3139" font-size="14" text-anchor="middle">
+    <text x="420" y="45" font-weight="700">Operations app (optional)</text>
+    <text x="420" y="64" font-size="12" fill="#5A6F77">find tables, make and watch jobs</text>
+    <text x="105" y="45" font-weight="700">SQL warehouse</text>
+    <text x="105" y="64" font-size="12" fill="#5A6F77">for the app's discovery</text>
+    <text x="105" y="178" font-weight="700">Source databases</text>
+    <text x="105" y="200" font-size="12" fill="#5A6F77">SQL Server</text>
+    <text x="105" y="217" font-size="12" fill="#5A6F77">Oracle</text>
+    <text x="105" y="234" font-size="12" fill="#5A6F77">PostgreSQL</text>
+    <text x="105" y="251" font-size="12" fill="#5A6F77">MySQL</text>
+    <text x="420" y="152" font-weight="700">Check job</text>
+    <text x="420" y="170" font-size="12" fill="#5A6F77">serverless: what changed?</text>
+    <text x="420" y="232" font-weight="700">Ingest runs</text>
+    <text x="420" y="250" font-size="12" fill="#5A6F77">job clusters, UC connection or JDBC</text>
+    <text x="755" y="211" font-weight="700">Delta tables</text>
+    <text x="755" y="230" font-size="12" fill="#5A6F77">in Unity Catalog</text>
+    <text x="420" y="344" font-weight="700">Lakebase</text>
+    <text x="420" y="363" font-size="12" fill="#5A6F77">control rows, positions, run history</text>
   </g>
-  <g fill="#57606a" font-size="11">
+  <g fill="#5A6F77" font-size="11">
     <text x="241" y="42" text-anchor="middle">runs on</text>
     <text x="112" y="118">reads table lists and columns only</text>
     <text x="428" y="108">a job's schedule starts the check</text>
