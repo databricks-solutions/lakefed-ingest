@@ -493,6 +493,29 @@ def test_a_selection_is_read_in_key_order_pages_and_refused_past_the_cap(monkeyp
     assert refused.value.status_code == 422 and "grew past 5 tables" in refused.value.detail["errors"][0]
 
 
+def test_a_preview_by_reference_before_the_target_is_typed_marks_no_line_invalid(client, monkeypatch):
+    # Report of 2 Nov: New job asks for this preview as the first database of a draft is read, before the target is
+    # typed. It answered "line 2, lfc_eng_010.dbo.customers: sink_catalog is required; sink_schema is required" for
+    # every line, though target_missing already named both fields for Create.
+    def query(sql, params=()):
+        if sql == q.upload_sql():
+            return [{"upload_id": "u1", "columns": ["src_connection", "src_database", "src_schema", "src_table", "select_list",
+                                                    "primary_key"]}]
+        if sql == q.selected_rows_page_sql("upload"):
+            return [{"server": "sql_a", "src_database": "lfc_eng_010", "src_schema": "dbo", "src_table": table, "line": 2 + i,
+                     "fields": {"src_connection": "sql_a", "src_database": "lfc_eng_010", "src_schema": "dbo",
+                                "src_table": table, "select_list": "id, a", "primary_key": "id"}}
+                    for i, table in enumerate(("customers", "orders"))]
+        return client.tasks.query(sql, params)
+
+    monkeypatch.setattr(main.db, "query", query)
+    source = {"upload_id": "u1", "databases": [{"server": "sql_a", "database": "lfc_eng_010"}]}
+    r = client.post("/api/ingestion-jobs", json={"name": "", "source": source,
+                                                 "settings": {**FAN_IN, "sink_catalog": "", "sink_schema": ""}})
+    assert r.status_code == 200 and r.json()["summary"]["tables"] == 2 and r.json()["summary"]["invalid"] == []
+    assert r.json()["target_missing"] == ["target catalog", "target schema"]
+
+
 def test_create_by_reference_plans_the_lines_read_back_from_lakebase(client, monkeypatch):
     asked = []
 

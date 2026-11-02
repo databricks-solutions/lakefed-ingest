@@ -117,6 +117,10 @@ def key_errors(server: str, database: str, key: Optional[str]) -> List[str]:
             f"only, 1 to 128 characters{instance}"]
 
 
+# What queries.validate_control_row says of a row whose target field is blank.
+TARGET_REQUIRED = frozenset(f"{key} is required" for key, _ in js.TARGET_SETTINGS)
+
+
 def target_errors(settings: dict) -> List[str]:
     """The target fields left blank: needed to create the job, never to preview what it would take."""
     return [f"set the {label}" for key, label in js.TARGET_SETTINGS if not str(settings[key] or "").strip()]
@@ -179,6 +183,9 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int]
     settings = settings_of(given, new_job)
     out = {"errors": given_errors(given) + setting_errors(settings, require_target, unity_catalog), "lines": [],
            "groups": [], "settings": settings}
+    # A preview is asked for before the target is typed: while a target field is blank, no line is judged by its
+    # target (that field, or another line writing the same table). Create checks the target itself (target_errors).
+    target_unset = not require_target and bool(target_errors(settings))
     if not str(job_name or "").strip():
         out["errors"].insert(0, "name the job")
     if isinstance(groups_per_server, int) and not 1 <= groups_per_server <= MAX_GROUPS_PER_SERVER:
@@ -231,12 +238,13 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int]
         identity.update(file_attrs)                                                           # the file's own values win
         row["client_attrs"] = json.dumps(identity) if identity else None
         problems += [e for e in q.validate_control_row(row)
-                     if e not in problems and not (shared and e.startswith("client_id "))]
+                     if e not in problems and not (shared and e.startswith("client_id "))
+                     and not (target_unset and e in TARGET_REQUIRED)]
         if taken_groups and row["task_collection"] in taken_groups:
             problems.append(f"group {row['task_collection']} is already in use: give the job another name")
         sink = ".".join(str(row.get(k) or "").lower() for k, _ in js.TARGET_SETTINGS)
         key = (sink, str(row.get("client_id") or ""))
-        if key in seen:
+        if key in seen and not target_unset:
             problems.append(f"line {seen[key]} already writes {sink}" + (f" for {key[1]}" if key[1] else
                             ": turn fan-in on, or put {database} in the target names"))
         seen.setdefault(key, line["line"])

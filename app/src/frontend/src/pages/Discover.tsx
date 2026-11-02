@@ -203,13 +203,15 @@ function Step1({ chosen, setChosen, tested, setTested, testing, error, setError,
             <span className="muted">A connection made in Catalog Explorer shows here after Refresh, once this app has USE CONNECTION on it.</span></div>
           <ErrorBox error={list.error} />
           {list.data?.error && <Notice tone="warn">The app can't list connections: {list.data.error}</Notice>}
-          <div className="table-wrap"><table className="data">
+          <div className="table-wrap"><table className="data connections">
+            <colgroup><col className="pick" /><col className="name" /><col className="type" /><col /><col className="owner" /></colgroup>
             <thead><tr><th></th><th>Name</th><th>Type</th><th>Host</th><th>Owner</th></tr></thead>
             <tbody>
               {found.map((c) => (
                 <tr key={c.name} className="pick-row" onClick={() => { if (!testing) setChosen(c.name); }}>
                   <td><input type="radio" checked={chosen === c.name} readOnly aria-label={`Use ${c.name}`} /></td>
-                  <td className="name"><b>{c.name}</b></td><td>{c.connection_type}</td><td className="mono">{c.host}</td><td>{c.owner}</td>
+                  <td className="name" title={c.name}><b>{c.name}</b></td><td title={c.connection_type}>{c.connection_type}</td>
+                  <td className="mono" title={c.host}>{c.host}</td><td title={c.owner}>{c.owner}</td>
                 </tr>
               ))}
               {list.data && !found.length && <tr><td colSpan={5} className="muted">No SQL Server connection {search ? "matches" : "the app can see"}.

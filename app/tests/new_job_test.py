@@ -683,6 +683,33 @@ def test_the_target_is_needed_to_create_but_not_to_preview_the_lines():
     assert nj.setting_errors(nj.settings_of(no_target), require_target=False) == []
 
 
+def test_a_preview_with_no_target_marks_no_line_invalid_for_it():
+    # Report of 2 Nov: tables chosen before the target was typed showed "1,002 lines can't be added: line 2,
+    # lfc_eng_010.dbo.customers: sink_catalog is required; sink_schema is required" while no more than BACKGROUND_ROWS
+    # tables were read, and nothing once more were (that preview goes by database and checks no line).
+    text = HEAD + 'sql_a,lfc_eng_010,dbo,customers,"id, name",id\n' + 'sql_a,lfc_eng_010,dbo,orders,"id, qty",id\n'
+    no_target = {**PLAIN, "sink_catalog": "", "sink_schema": ""}
+    previewed = nj.plan("Job", text, no_target, require_target=False)
+    assert [(line["status"], line["errors"]) for line in previewed["lines"]] == [("valid", []), ("valid", [])]
+    created = nj.plan("Job", text, no_target)
+    assert created["errors"][:2] == ["set the target catalog", "set the target schema"] and created["lines"] == []
+
+
+def test_a_preview_with_no_target_table_says_no_line_writes_another_lines_table():
+    # With no table name yet every line's target is the same blank name, so none can be said to clash with another.
+    text = HEAD + 'sql_a,db1,dbo,customers,"id",id\n' + 'sql_a,db1,dbo,orders,"id",id\n'
+    previewed = nj.plan("Job", text, {**PLAIN, "sink_table": ""}, require_target=False)
+    assert [(line["status"], line["errors"]) for line in previewed["lines"]] == [("valid", []), ("valid", [])]
+
+
+def test_a_preview_with_its_target_set_still_finds_two_lines_writing_one_table():
+    text = HEAD + 'sql_a,db1,dbo,customers,"id",id\n' + 'sql_a,db2,dbo,customers,"id",id\n'
+    lines = nj.plan("Job", text, TABLE_ONLY, require_target=False)["lines"]
+    assert lines[0]["status"] == "valid" and lines[1]["status"] == "invalid"
+    assert lines[1]["errors"] == ["line 2 already writes main.s.customers: turn fan-in on, or put {database} in the "
+                                  "target names"]
+
+
 def test_a_preview_by_lines_needs_no_name_but_its_create_does(client):
     r = _create(client, name="", settings={**FAN_IN, "sink_catalog": ""})
     assert r.status_code == 200 and r.json()["summary"]["tables"] and r.json()["name_missing"] is True

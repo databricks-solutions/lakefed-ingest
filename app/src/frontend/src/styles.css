@@ -364,6 +364,15 @@ details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }
 .discover .radio-row { display: flex; gap: 8px; align-items: center; font-weight: var(--db-font-weight-semibold); margin: var(--db-space-2) 0; }
 .discover .radio-body { margin: 0 0 var(--db-space-3) 24px; }
 .discover .tree-pick { max-height: 46vh; overflow: auto; }
+/* The connections to choose from (Add tables, step 1), as Databricks' tables show names: each value on one line, cut
+   with an ellipsis when it does not fit, whole on hover (its title). The columns are fixed: in an automatic layout the
+   dialog body's overflow-wrap let the long host squeeze Name, Type and Owner until they broke mid-word. */
+table.data.connections { table-layout: fixed; }
+table.data.connections col.pick { width: 40px; }
+table.data.connections col.name { width: 24%; }
+table.data.connections col.type { width: 96px; }
+table.data.connections col.owner { width: 30%; }
+table.data.connections tr.pick-row td { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; }
 /* A database the connection's login can't open: greyed out and not choosable; its reason shows on hover. */
 .tree-pick tr.closed td.name { color: var(--muted); }
 .tree-pick tr.closed .tri-box { opacity: .35; pointer-events: none; }
