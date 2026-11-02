@@ -94,8 +94,33 @@ def test_create_stops_before_anything_is_written_when_a_database_couldnt_be_read
 def test_a_preview_counts_what_is_read_so_far_and_says_how_far_the_read_is(monkeypatch):
     reading = {**_reads(pending=4, done=6, tables=600), "left_out": 0, "failed_databases": []}
     monkeypatch.setattr(main, "_draft_reading", lambda selection, advance=True: reading)
+    monkeypatch.setattr(main, "_selected_tables", lambda selection: 600)
     monkeypatch.setattr(main, "_create_now", lambda body, request, inline=None: {"summary": {"tables": 600}})
     assert main.create_ingestion_job(_body(True), request=None) == {"summary": {"tables": 600}, "reading": reading}
+
+
+def test_a_preview_with_nothing_chosen_read_yet_says_it_is_reading_and_is_asked_again(monkeypatch):
+    """Regression: before any chosen database was read, the preview answered 422 "the selection takes no tables", and
+    New job showed that error and stopped asking (NewJob.tsx asks again only while reading.pending), though the reads
+    going would bring the tables. It now says it is reading, with no summary, after the source's own checks; once the
+    reads end with still no table, the refusal is Create's as before."""
+    reading = {**_reads(pending=3, done=0, tables=0), "left_out": 0, "failed_databases": []}
+    readings = [reading, None]
+    checked = []
+    monkeypatch.setattr(main, "_draft_reading", lambda selection, advance=True: readings.pop(0))
+    monkeypatch.setattr(main, "_selected_tables", lambda selection: 0)
+    monkeypatch.setattr(main, "_new_job_source", lambda run, source, user, applying: checked.append(applying))
+
+    def refused(body, request, inline=None):
+        raise HTTPException(422, {"errors": ["the selection takes no tables"]})
+
+    monkeypatch.setattr(main, "_create_now", refused)
+    answer = main.create_ingestion_job(_body(True), request=None)
+    assert answer == {"summary": None, "settings": {}, "created": False, "reading": reading}
+    assert answer["reading"]["pending"] == 3 and checked == [False]
+    with pytest.raises(HTTPException) as no_tables:
+        main.create_ingestion_job(_body(True), request=None)
+    assert no_tables.value.status_code == 422
 
 
 def test_create_waits_for_the_read_in_a_task_then_writes_in_it(monkeypatch):

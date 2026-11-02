@@ -4994,7 +4994,7 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
     tables still read, a database that couldn't be read, more than BACKGROUND_ROWS tables, or a file with database-only
     lines) records the job at once and answers with its id (_create_preparing); its prepare task reads, writes and
     syncs it, setting aside a database it can't take. A preview of a draft whose read hasn't ended counts what is read
-    so far and says how far the read is (reading)."""
+    so far and says how far the read is (reading); with nothing chosen read yet, it says only how far the read is."""
     database_lines = body.source is not None and _has_database_lines(body.source)
     reading = _draft_reading(body.source) if body.source is not None and not database_lines else None
     if not body.dry_run and PREPARE_CREATES and body.source is not None:
@@ -5008,6 +5008,11 @@ def create_ingestion_job(body: NewJobRequest, request: Request):
             raise HTTPException(422, {"errors": problems})
         if reading["pending"]:
             return _create_after_reading(body, request)
+    if body.dry_run and reading and reading["pending"] and not _selected_tables(body.source):
+        # Nothing chosen is read yet: a refusal ("the selection takes no tables") would stop the page asking, while
+        # the reads still going may bring every table, so the preview says it is reading and the page asks again.
+        _new_job_source(body.run.model_copy(), body.source, "", applying=False)    # a preview's checks need no user
+        return {"summary": None, "settings": {}, "created": False, "reading": reading}
     result = _create_now(body, request)
     if body.dry_run and reading and isinstance(result, dict):
         result["reading"] = reading
