@@ -11,9 +11,9 @@
     <path d="M290 50 L192 50"/>
     <path d="M105 80 L105 148"/>
     <path d="M420 80 L420 128"/>
-    <path d="M192 180 L288 158"/>
+    <path d="M290 158 L192 180"/>
     <path d="M420 180 L420 208"/>
-    <path d="M192 240 L288 240"/>
+    <path d="M290 240 L192 240"/>
     <path d="M550 235 L648 214"/>
     <path d="M420 260 L420 318"/>
     <path d="M550 50 L610 50 L610 350 L552 350"/>
@@ -48,12 +48,12 @@
   </g>
   <g fill="#57606a" font-size="11">
     <text x="241" y="42" text-anchor="middle">runs on</text>
-    <text x="112" y="118">table lists and columns only</text>
+    <text x="112" y="118">reads table lists and columns only</text>
     <text x="428" y="108">a job's schedule starts the check</text>
-    <text x="206" y="160">asks</text>
-    <text x="428" y="199">starts runs for the databases with work</text>
-    <text x="214" y="232">changes</text>
-    <text x="560" y="210">MERGE or append</text>
+    <text x="198" y="198">asks what changed</text>
+    <text x="428" y="199">starts the runs with work</text>
+    <text x="200" y="233">reads changes</text>
+    <text x="655" y="178">MERGE or append</text>
     <text x="428" y="295">records positions and outcomes</text>
     <text x="618" y="282">writes control rows,</text>
     <text x="618" y="296">reads state</text>
