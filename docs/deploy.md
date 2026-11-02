@@ -1,11 +1,39 @@
 # Deploying lakefed_ingest
 
-Everything the default version needs is a resource in its bundle (`lakefed_ingest_v2`, at the repo
-root): the Lakebase instance and its UC-registered database, the secret scope, and the ingestion and
-setup jobs on job clusters (`resources/lakefed_ingest*.yml`). `databricks bundle deploy` is
-idempotent for resources the bundle owns. This page covers the steps the bundle can't do. Run all
-commands from the repo root. (The job orchestration version is a separate bundle; see
-`../job_orchestration/README.md`.)
+Everything the root implementation needs is a resource in its bundle (`lakefed_ingest_v2`, at the repo
+root): the Lakebase instance and its UC-registered database, the secret scope, and its jobs
+(`resources/lakefed_ingest*.yml`). The ingestion job runs on job clusters; the setup, check, cluster-copies and
+delete jobs on serverless; discovery on the bundle's single-node `lakefed_ingest utility` cluster. `databricks
+bundle deploy` is idempotent for resources the bundle owns. This page covers the steps the bundle can't do. Run all
+commands from the repo root. (The job orchestration implementation is a separate bundle; see
+[`../job_orchestration/README.md`](../job_orchestration/README.md).)
+
+## Before you start
+
+On your machine: Git, a Databricks CLI version that supports bundles, and a profile logged in to the workspace:
+
+```bash
+git clone https://github.com/databricks-solutions/lakefed-ingest.git
+cd lakefed-ingest
+databricks auth login --host <workspace-url> -p <profile>
+```
+
+In the workspace:
+
+| What | How |
+|---|---|
+| Lakebase instance, database, UC catalog | Bundle resources in `resources/lakefed_ingest_setup.yml`, created on deploy (billable), or adopt existing ones with `bundle deployment bind` (step 1) |
+| Schema | The `lakefed_ingest_setup` job on a new deployment (idempotent); after an upgrade the first run migrates the schema itself ([Upgrading](#upgrading)) |
+| Lakebase auth | An SDK-minted OAuth token at runtime: the identity the jobs run as must be a Postgres role on the instance |
+| Job clusters to Lakebase (port 5432) | The workspace IP access list must allow the clusters' egress, or use Private Link. Verify first (step 3) |
+| Job clusters to each source (SQL Server 1433, Oracle 1521, PostgreSQL 5432, MySQL 3306) | Your network |
+| Serverless to each source the check reads | The check job reads the sources from serverless: private endpoints through a network connectivity configuration, or source firewall rules ([Compute for the check](#compute-for-the-check)) |
+| A way into each source | A Unity Catalog connection with `USE CONNECTION` and `MANAGE` for the jobs' identity, or one JSON secret `{"user","password"}` per source database in the `secret_scope` (step 3). The app's [JDBC connections](../app/README.md#jdbc-connections-entered-by-hand) keep their logins the same way |
+| `ct` source tables | Change Tracking on the database and the table, a primary key, and a `CHANGE_RETENTION` longer than the seed takes |
+| Oracle or MySQL sources | Their JDBC driver library on the job cluster (step 3) |
+| The operations app (optional) | Databricks Apps allowed in the workspace. The app bundle makes its own serverless Pro SQL warehouse for discovery, or uses one you name ([The app's SQL warehouse](#the-apps-sql-warehouse)) |
+
+The engine itself needs no SQL warehouse; only the app's discovery does.
 
 ## 1. Add a target
 
@@ -27,18 +55,18 @@ targets:
       # lakebase_database: lakefed_ingest
       # lakebase_catalog: lakefed_ingest_lakebase
       # secret_scope: lakefed_ingest
-      # Ingestion job parameter defaults, e.g. for a large estate (see README "Large estates"):
-      # append_batch_size: "16"
-      # max_seeds_per_run: "10000"
-      # max_queries_per_source: "64"         # see README "Concurrency"
-      # table_retry_budget: "20"              # retries per run; the default "0" retries no table (README "Table retries")
+      # Ingestion job parameter examples for a large estate, not the defaults (see how-it-works.md, "Large estates"):
+      # append_batch_size: "16"                # default "4"
+      # max_seeds_per_run: "10000"             # default "0", no limit
+      # max_queries_per_source: "64"         # default "0", no cap; see how-it-works.md, "Concurrency"
+      # table_retry_budget: "20"              # retries per run; the default "0" retries no table (how-it-works.md, "Table retries")
       # table_retries: "2"                    # attempts per table; used only while table_retry_budget is above 0
 ```
 
 The default compute needs ~32 cores; a subscription with a small vCPU quota must use smaller nodes
 or raise the quota first.
 
-**Already have a Lakebase instance or secret scope?** Adopt it instead of creating a new one —
+**Already have a Lakebase instance or secret scope?** Adopt it instead of creating a new one:
 `bind` works for the instance, its database catalog, and the secret scope:
 
 ```bash
@@ -52,43 +80,17 @@ Before binding, set the matching bundle variables (`lakebase_instance`, `lakebas
 jobs can be adopted the same way (`bind lakefed_ingest <job-id>`, `bind lakefed_ingest_setup
 <job-id>`). Run `databricks bundle plan -t dev` before the first deploy and confirm it deletes nothing.
 
-**Upgrading a preview deployment (Lakebase resources in the `lakefed_ingest` bundle).** Earlier
-preview builds deployed the Lakebase instance (`lakefed-ingest-mt`), its catalog
-(`lakefed_ingest_mt_pg`), the secret scope (`lakefed_ingest_mt`), and jobs `lakefed_ingest_mt_sweep` /
-`lakefed_ingest_mt_setup` from the root `lakefed_ingest` bundle. That bundle name now belongs to
-`job_orchestration/`, whose config no longer has those resources, so **a deploy from
-`job_orchestration/` would delete them** (including all control/checkpoint data and source secrets).
-Move them to this bundle before deploying either version:
-
-```bash
-# 1. Release them from the old bundle state (run from job_orchestration/; resource keys from the old config)
-cd job_orchestration
-databricks bundle deployment unbind mt_lakebase         -t <target>
-databricks bundle deployment unbind mt_lakebase_catalog -t <target>
-databricks bundle deployment unbind mt_secret_scope     -t <target>
-databricks bundle deployment unbind lakefed_ingest_mt_sweep -t <target>
-databricks bundle deployment unbind lakefed_ingest_mt_setup -t <target>
-databricks bundle plan -t <target>        # must show 0 to delete
-cd ..
-```
-
-2. In this bundle's target, set the old names, because the defaults point to a *new, empty* instance:
-   `lakebase_instance: lakefed-ingest-mt`, `lakebase_database: lakefed_ingest_mt`,
-   `lakebase_catalog: lakefed_ingest_mt_pg`, `secret_scope: lakefed_ingest_mt`.
-3. Bind them here (`bind lakebase`, `bind lakebase_catalog`, `bind secret_scope`, and optionally the
-   two jobs as `lakefed_ingest` / `lakefed_ingest_setup`), run `databricks bundle plan` and confirm it
-   deletes nothing, deploy, then run `lakefed_ingest_setup` to migrate the schema in place.
-
-If `unbind` reports that a key isn't in the state, that resource was never deployed by the old
-bundle, so skip it.
+Upgrading an earlier preview of this version? Its Lakebase resources sit in another bundle: see
+[Upgrading a preview deployment](#upgrading-a-preview-deployment) before you deploy.
 
 **One catalog per Lakebase database.** A Lakebase database can be registered by only one UC
 catalog. If the database is already registered (for example by a catalog created by hand), bind that
-catalog or set `lakebase_catalog` to its name — creating a second catalog for it fails.
+catalog or set `lakebase_catalog` to its name; creating a second catalog for it fails.
 
 ## 2. Deploy and apply the schema
 
 ```bash
+databricks bundle validate -t dev           # checks the target and its variables before anything is created
 databricks bundle deploy -t dev
 databricks bundle run lakefed_ingest_setup -t dev   # idempotent
 ```
@@ -299,31 +301,32 @@ own warehouse. The app reads the setting as `APP_WAREHOUSE_ID` and uses it in pl
 2. **Postgres role.** The identity the jobs run as must be a Postgres role on the Lakebase instance
    (the deployer is one; add a role for a service principal if jobs run as one).
 3. **Source credentials.** One secret per source database: JSON `{"user": "...", "password": "..."}`.
-   The scope may be Azure Key Vault-backed — AKV secret names allow only letters, digits, and dashes.
+   The scope may be Azure Key Vault-backed; AKV secret names allow only letters, digits, and dashes.
    Each control row names its secret in `secret_key`. A row can instead read through an existing
    Unity Catalog connection, which holds the credentials: set `src_connection` to its name and
    `use_remote_query` to `true`. Then grant the identity the job runs as `USE CONNECTION` and
    `MANAGE` on the connection (`MANAGE` because the job cluster is dedicated), for example
    `GRANT USE CONNECTION, MANAGE ON CONNECTION <name> TO <principal>`. `remote_query` needs
    Databricks Runtime 18.3 or later (the job runs `18.x`).
-4. **Control rows.** Register tables in the Lakebase `control` table (see `../README.md`, "Control
-   rows", and `notebooks/load_control_example.ipynb`): `src_type`, `load_type`, source
+4. **Control rows.** Register tables in the Lakebase `control` table (see [Control rows](how-it-works.md#control-rows) and
+   `notebooks/load_control_example.ipynb`): `src_type`, `load_type`, source
    host/port/database/table, `secret_key`, `primary_key` (not needed for `full`), explicit
    `select_list`, sink, `task_collection`, and optional partitioned-seed settings. `cursor` rows also
    need `cursor_column` (rowversion recommended). To consolidate many source databases into shared
-   sink tables, give their rows the same sink and a distinct `client_id` each (see "Consolidated
-   sinks" in the README).
+   sink tables, give their rows the same sink and a distinct `client_id` each (see [Consolidated sinks](how-it-works.md#consolidated-sinks-optional)).
    - `ct` tables need Change Tracking enabled on the database and the table, a primary key, and a
-     `CHANGE_RETENTION` longer than the expected seed time. Snapshot isolation is not required (the
-     reads don't use it).
+     `CHANGE_RETENTION` longer than the expected seed time. Snapshot isolation is not required by
+     default; with the job parameter `snapshot_isolation = "true"` change reads run under SNAPSHOT, which needs
+     `ALLOW_SNAPSHOT_ISOLATION ON` on every source database.
 5. **Oracle / MySQL sources only: JDBC driver.** Databricks Runtime bundles the SQL Server and
    PostgreSQL drivers but not Oracle's or MySQL's. Uncomment the matching Maven library in
    `resources/lakefed_ingest.yml` (pin an approved version) and redeploy. Connection notes:
    - Oracle: `src_database` = service name, `src_schema` = owner (use the stored upper-case names).
      The partitioned seed sizes tables from `ALL_TABLES` statistics (needs only `SELECT` on the
-     table; gather statistics for accurate partition counts). TLS (TCPS) needs a wallet/truststore
-     and a custom URL — not configured by the adapter yet.
-   - PostgreSQL: TLS is always on — `sslmode=verify-full` when `trust_server_certificate` is
+     table; gather statistics for accurate partition counts; a table without statistics gets the 2-partition floor).
+     Exact segment sizes (`DBA_SEGMENTS`) would need extra privileges, so the adapter doesn't use them. TLS (TCPS) needs a wallet/truststore
+     and a custom URL, not configured by the adapter yet.
+   - PostgreSQL: TLS is always on: `sslmode=verify-full` when `trust_server_certificate` is
      `false`, `require` otherwise.
    - MySQL: `src_schema` = the database; `sslMode=VERIFY_IDENTITY` / `REQUIRED` likewise.
 
@@ -343,14 +346,60 @@ The first run seeds; later runs apply Change Tracking increments (`ct` rows), re
 watermark (`cursor` rows), or reload the table (`full` rows). Check progress and results with the telemetry queries in [monitoring.md](monitoring.md)
 (`ingest_run`, `ingest_event`, per-table freshness).
 
-**Upgrading an existing deployment:** pull and deploy. The next ingestion run finds the database
-behind its schema version and migrates it first, in one transaction (a failure changes nothing and
-fails the run with the cause). To migrate before the next run instead, run `lakefed_ingest_setup`.
+**Scheduling:** the ingestion job's schedule (paused by default) can't pass parameters, so it only ingests
+the default `task_collection`. For per-collection cadence, use the operations app's schedules (a wrapper
+job per collection), or the check job, `lakefed_ingest_check`: it checks a group of collections on
+serverless and starts the ingestion job only for those with work. It then waits for the runs it started and
+fails if one failed, so its failure email fires; `timeout_s` (default 21600, six hours; 0 = no limit) bounds
+that wait, after which the runs still going are cancelled and the check fails. While it waits, its serverless
+compute is idle. Its own schedule (paused) checks every
+collection; a schedule of the app's `check` variant starts it with that schedule's members. It reads the
+sources like the ingest does, so serverless needs the same network path to them (a UC connection, or
+serverless network connectivity to the servers; see [Compute](#compute-for-the-setup-and-discovery-jobs)).
+
+## Upgrading
+
+### Upgrading from an earlier release
+
+The original version moved from the repo root to [`job_orchestration/`](../job_orchestration/README.md),
+unchanged and with the same bundle name and uuid, so deploying it **from `job_orchestration/`** updates your
+existing jobs in place. The repo root is now the root implementation, a different bundle (`lakefed_ingest_v2`): a
+`databricks bundle deploy` run from the root, including CI or scripts written for the old layout, doesn't touch
+your existing jobs, but creates the root implementation's resources, including a billable Lakebase instance. Update
+deploy automation to `cd job_orchestration` first. If you deployed a preview of the root implementation, follow
+[Upgrading a preview deployment](#upgrading-a-preview-deployment) before deploying either version.
+
+### Upgrading an existing deployment
+
+Pull and deploy both bundles. The database records its schema version (`schema_version`), and the next
+ingestion run whose code needs a newer one migrates the schema before it starts, in one transaction, while runs
+of other collections wait for it. If the migration fails (for example, existing rows break a new constraint),
+nothing changes and the run fails with the cause; fix it and run again. If it can't get its locks within its
+retries, the run ingests nothing and ends `migration_waiting` (see
+[Locks and waiting](lakebase_schema.md#locks-and-waiting)); the next run tries again. The app, when it starts and
+finds the database behind, starts the setup job once to migrate it. To migrate before the next run instead, run `lakefed_ingest_setup`.
 Either way the migration needs the schema's owner: the deployer, unless the jobs run as another
 identity. From an early deploy, it renames the `ct_checkpoint` / `sweep_run` tables and their
 CT-specific columns to the generic `checkpoint` / `ingest_run` names in place (data kept).
 
-**Large telemetry tables:** the schema-14 upgrade builds `ingest_event_control_started_idx` on `ingest_event`
+It also renames the checkpoint phase `cdc` to `incremental` (history included); a run still going on the older
+code then has its checkpoint writes rejected, and the next run picks those tables up. This only reaches the
+existing data if the bundle points to the existing instance and database.
+
+**The one-row-per-sink index.** The migration also creates the unique index `control_sink_client_uq`, one row
+per sink and `client_id`. If existing control rows already write the same sink with the same `client_id` (or
+both with none), it fails with `could not create unique index "control_sink_client_uq"`: those rows were
+overwriting each other's data. Find them, point each at its own sink (or give each its own `client_id` to
+consolidate), and run again:
+
+```sql
+select lower(sink_catalog), lower(sink_schema), lower(sink_table), coalesce(client_id, ''),
+       array_agg(id order by id)
+from lakefed_ingest.control group by 1, 2, 3, 4
+having count(*) > 1;
+```
+
+**Large telemetry tables.** The schema-14 upgrade builds `ingest_event_control_started_idx` on `ingest_event`
 inside the migration transaction, which holds that table's lock for the whole build (see
 [lakebase_schema.md](lakebase_schema.md#locks-and-waiting)). On a deployment with a large `ingest_event`, build
 it first, as the schema's owner and outside any transaction, so the migration skips it:
@@ -364,13 +413,36 @@ Check that it is valid: `select indisvalid from pg_index where indexrelid = 'lak
 must return `true`. A concurrent build that fails leaves an invalid index under the same name, which the migration
 would skip, so drop it (`drop index concurrently lakefed_ingest.ingest_event_control_started_idx;`) and build it again.
 
-**Scheduling:** the ingestion job's schedule (paused by default) can't pass parameters, so it only ingests
-the default `task_collection`. For per-collection cadence, use the operations app's schedules (a wrapper
-job per collection), or the check job, `lakefed_ingest_check`: it checks a group of collections on
-serverless and starts the ingestion job only for those with work. Its own schedule (paused) checks every
-collection; a schedule of the app's `check` variant starts it with that schedule's members. It reads the
-sources like the ingest does, so serverless needs the same network path to them (a UC connection, or
-serverless network connectivity to the servers; see [Compute](#compute-for-the-setup-and-discovery-jobs)).
+### Upgrading a preview deployment
+
+Earlier preview builds kept their Lakebase resources in the `lakefed_ingest` bundle. They deployed the Lakebase instance (`lakefed-ingest-mt`), its catalog
+(`lakefed_ingest_mt_pg`), the secret scope (`lakefed_ingest_mt`), and jobs `lakefed_ingest_mt_sweep` /
+`lakefed_ingest_mt_setup` from the root `lakefed_ingest` bundle. That bundle name now belongs to
+`job_orchestration/`, whose config no longer has those resources, so **a deploy from
+`job_orchestration/` would delete them** (including all control/checkpoint data and source secrets).
+Move them to this bundle before deploying either version:
+
+```bash
+# 1. Release them from the old bundle state (run from job_orchestration/; resource keys from the old config)
+cd job_orchestration
+databricks bundle deployment unbind mt_lakebase         -t <target>
+databricks bundle deployment unbind mt_lakebase_catalog -t <target>
+databricks bundle deployment unbind mt_secret_scope     -t <target>
+databricks bundle deployment unbind lakefed_ingest_mt_sweep -t <target>
+databricks bundle deployment unbind lakefed_ingest_mt_setup -t <target>
+databricks bundle plan -t <target>        # must show 0 to delete
+cd ..
+```
+
+2. In this bundle's target, set the old names, because the defaults point to a *new, empty* instance:
+   `lakebase_instance: lakefed-ingest-mt`, `lakebase_database: lakefed_ingest_mt`,
+   `lakebase_catalog: lakefed_ingest_mt_pg`, `secret_scope: lakefed_ingest_mt`.
+3. Bind them here (`bind lakebase`, `bind lakebase_catalog`, `bind secret_scope`, and optionally the
+   two jobs as `lakefed_ingest` / `lakefed_ingest_setup`), run `databricks bundle plan` and confirm it
+   deletes nothing, deploy, then run `lakefed_ingest_setup` to migrate the schema in place.
+
+If `unbind` reports that a key isn't in the state, that resource was never deployed by the old
+bundle, so skip it.
 
 ## Schema changes
 

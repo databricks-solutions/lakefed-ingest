@@ -70,7 +70,7 @@ variables:
     description: Seconds between freshness writes for unchanged tables already at the current version ("0" = every run).
     default: "0"
   max_queries_per_source:
-    description: Concurrent queries per source server across all runs, shared between them (at least 1 per run; see README "Concurrency"; "0" = no cap).
+    description: Concurrent queries per source server across all runs, shared between them (at least 1 per run; see docs/how-it-works.md, "Concurrency"; "0" = no cap).
     default: "0"
   discover_workers:
     description: Databases the discovery job (lakefed_ingest_discover) reads at once, each taking its three catalog queries in turn. Capped by max_queries_per_source when that is set.

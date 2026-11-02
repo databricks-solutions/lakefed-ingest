@@ -20,7 +20,7 @@ queries below.
 | `database_check` | per (collection, source database) | stamped when the whole database is unchanged, in place of each table's `last_success_at` |
 
 `ingest_event` carries `action` (seed/increment/reseed/full), `stage` (plan/detect/ensure_sink/read/
-seed/merge/load/checkpoint). It pinpoints *where* a failure happened; `plan` means the row's
+seed/merge/load/checkpoint/verify). It pinpoints *where* a failure happened; `plan` means the row's
 `src_type`/`load_type` pair isn't supported; `status`, `duration_ms`, `rows_read`/`rows_merged`,
 `position_from`/`position_to` (checkpoint positions as text, the CT version for `ct`; NULL for
 `full`), `pool`, and `error`. One row is INSERTed at start
@@ -31,7 +31,7 @@ don't appear among the in-flight tables. A `verify` stage is a run checking the 
 an earlier run left pending, or a retry checking for the rows of the attempt that failed.
 
 With `table_retries` set and the run's `table_retry_budget` above 0 (its default is 0, so nothing is retried:
-README "Table retries"), an attempt that fails with a transient source error and is tried again finishes as `retried`, with its stage and error, and the table gets another row for
+[Table retries](how-it-works.md#table-retries)), an attempt that fails with a transient source error and is tried again finishes as `retried`, with its stage and error, and the table gets another row for
 its next attempt; `retry_count` numbers them (0, 1, ...). Only a final failure is `failed`, so the
 failure query below lists tables that are still failing. A table stopped by a Cancel is `cancelled`
 instead, so it is not in that list.
@@ -220,11 +220,13 @@ CREATE OR REPLACE TABLE <catalog>.<schema>.ingest_event_history AS
 SELECT * FROM lakefed_ingest_lakebase.lakefed_ingest.ingest_event;
 ```
 
-For append-only growth, an incremental MERGE on the primary key instead of a full snapshot:
+For growth without a full snapshot each time, an incremental MERGE on the primary key. An event row is written
+when its table starts and updated when it finishes, so the MERGE updates the rows it has already copied too:
 ```sql
 MERGE INTO <catalog>.<schema>.ingest_event_history t
 USING lakefed_ingest_lakebase.lakefed_ingest.ingest_event s
 ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET *
 WHEN NOT MATCHED THEN INSERT *;
 ```
 
