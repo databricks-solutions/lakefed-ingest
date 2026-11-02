@@ -34,6 +34,7 @@ import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 import ct_engine
+import parallel
 import planner
 import state_store as ss
 
@@ -330,15 +331,25 @@ class BatchRunner:
                                             stage=stage, action=action)
         except Exception as e:
             print(f"[telemetry] batch: record_failed_tables failed: {_line(e)}")
+        stopping = self._stopping()
         for m, err in items:
-            results[_id(m)] = _failed(m, err)
+            results[_id(m)] = _failed(m, err, ss.failure_status(err, stopping))
+
+    def _stopping(self) -> bool:
+        """Whether the run is being cancelled. A failed read counts as not, so the error itself decides."""
+        try:
+            return self.store.stopping_run(self.run_id)
+        except Exception:
+            return False
 
     def _run_alone(self, m: dict) -> dict:
         try:
             return {"item": m["cfg"]["id"], "pool": None, "status": "ok", "detail": self.per_table(m)}
+        except parallel.Cancelled as e:
+            return _failed(m, str(e), "cancelled")
         except Exception as e:
             return _failed(m, str(e))
 
 
-def _failed(m: dict, error: str) -> dict:
-    return {"item": m["cfg"]["id"], "pool": None, "status": "failed", "detail": error}
+def _failed(m: dict, error: str, status: str = "failed") -> dict:
+    return {"item": m["cfg"]["id"], "pool": None, "status": status, "detail": error}

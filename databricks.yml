@@ -35,6 +35,9 @@ variables:
   lakebase_database:
     description: Postgres database on the Lakebase instance.
     default: lakefed_ingest
+  deleted_job_retention_days:
+    description: Days a deleted operations-app job is kept, so it can be restored, before the delete job purges it. The app's DELETED_JOB_RETENTION_DAYS (app/databricks.yml) must have the same value.
+    default: 7
   lakebase_catalog:
     description: Unity Catalog catalog the Lakebase database is registered as (for DBSQL monitoring).
     default: lakefed_ingest_lakebase
@@ -42,10 +45,12 @@ variables:
     description: Secret scope holding per-database source credentials (may be Azure Key Vault-backed).
     default: lakefed_ingest
   # Defaults of the ingestion job's tuning parameters (resources/lakefed_ingest.yml explains each); a
-  # run can still override them.
+  # run can still override them. parallelism, append_batch_size and spark_conf are the values the
+  # one-database tuning sweep validated on one Standard_D16ds_v5 driver + 1 x Standard_D8ds_v5 worker
+  # (192, 4, code generation off). On a source server that hosts other work, set max_queries_per_source too.
   parallelism:
     description: Units of query work running at once in one run.
-    default: "32"
+    default: "192"
   trust_server_certificate:
     description: Trust the source's TLS certificate without validating it (production false).
     default: "true"
@@ -56,8 +61,8 @@ variables:
     description: Reseed a table whose select_list gained columns (false carries on from the checkpoint).
     default: "true"
   append_batch_size:
-    description: Append sinks with client_id, tables per batched append ("1" = per table).
-    default: "1"
+    description: Append sinks with client_id, tables per batched append ("1" = per table; 4 and 8 load alike, 16 is slower).
+    default: "4"
   max_seeds_per_run:
     description: Seeds per run ("0" = no limit).
     default: "0"
@@ -67,15 +72,24 @@ variables:
   max_queries_per_source:
     description: Concurrent queries per source server across all runs, shared between them (at least 1 per run; see README "Concurrency"; "0" = no cap).
     default: "0"
+  discover_workers:
+    description: Databases the discovery job (lakefed_ingest_discover) reads at once, each taking its three catalog queries in turn. Capped by max_queries_per_source when that is set.
+    default: "32"
   detection_chunk:
     description: Tables per batched change-detection query.
     default: "200"
   table_retries:
-    description: Extra attempts per table after a transient source error, in the same run ("0" = off).
-    default: "0"
+    description: Extra attempts per table after a transient source error, in the same run ("0" = off). Used only when table_retry_budget is above 0.
+    default: "2"
   table_retry_budget:
-    description: Table retries in the whole run; once spent, failures fail at once.
-    default: "20"
+    description: Table retries in the whole run. At "0", the default, no table is retried and a failing table fails the run at once. Each job can raise it in the app's Advanced configuration.
+    default: "0"
+  fail_on_table_errors:
+    description: Accepted so that existing job definitions load; it no longer decides anything, as a run with failed tables always ends as failed.
+    default: "false"
+  spark_conf:
+    description: Spark session settings for a run, a JSON object of setting to value (a string, number or boolean; blank keeps the cluster's). Code generation off saves compiling every append's plan (+26% tables per second on one cluster in the sweep).
+    default: '{"spark.sql.codegen.wholeStage": "false"}'
 
 targets:
   dev:

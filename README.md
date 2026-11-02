@@ -20,6 +20,10 @@ version doesn't support yet. Use the default version when you have many source d
 consolidated into shared tables, or need Change Tracking (incremental loads without a reliable
 watermark column, deletes included).
 
+An optional **operations app** (a Databricks App) for the default version is in [`app/`](app/README.md):
+run and table observability, control-row management, and starting or cancelling runs. It's a
+separate bundle, so workspaces that haven't approved Databricks Apps simply don't deploy it.
+
 > **Upgrading from an earlier release (deploy-path change).** The original version moved from the
 > repo root to [`job_orchestration/`](job_orchestration/README.md), unchanged and with the same bundle
 > name and uuid, so deploying it **from `job_orchestration/`** updates your existing jobs in place.
@@ -206,7 +210,13 @@ database, so detection is grouped by source database:
     first enabled), the toggle leaves no trace in SQL Server metadata. Checkpoints created before
     `ct_begin_version` existed record it the first time they're seen, so a toggle before that
     upgrade isn't detected either. After CT maintenance like this, force a reseed:
-    `update lakefed_ingest.checkpoint set phase = 'seeding' where control_id in (...);`
+    `update lakefed_ingest.checkpoint set phase = 'seeding', status = 'ok', pending_position = null,
+    pending_run_id = null where control_id in (...);` (or Force reseed in the operations app)
+- **Edited or missing sinks.** Each checkpoint records the source, sink and primary key it was
+  written for. A `ct` / `cursor` table whose control row now points at a different source, sink or
+  key, or whose sink table no longer exists, is reseeded rather than merging only new changes into
+  the new place (a silent gap). The sink check is one `information_schema` query per sink catalog
+  per run; it's skipped with a warning if a catalog can't be listed.
 
 ### Partitioned seed (large tables)
 
@@ -281,7 +291,8 @@ with four extra columns:
   change set or a seed) the run records on the checkpoint the position the append reaches and its
   `run_id`; the checkpoint advance clears them. If a run stops in between, the next run looks in the sink for that client's
   rows with that `__run_id`: found, the append committed and the checkpoint advances (outcome
-  `recovered`); not found, the table reads again from its checkpoint.
+  `recovered`); not found, the table reads again from its checkpoint. If the row was meanwhile pointed at
+  another source, sink or key (or its sink is gone), the table reseeds instead: that append belonged to the old place.
 - Downstream (for example SCD2 or a current-state view), order a key's rows by `__change_version`.
 
 **Batched appends.** With many source databases per sink, most of a run is per-table overhead: a
@@ -305,6 +316,13 @@ the staging swap. Each unit holds one slot of a shared budget and its own FAIR p
 holds a slot while waiting on other work, so nested fan-out can't deadlock. The budget is per run;
 concurrent runs of different collections each have their own.
 
+**Defaults.** The bundle's defaults are what a one-database tuning sweep validated on one
+Standard_D16ds_v5 driver with one Standard_D8ds_v5 worker: `parallelism` 192, `append_batch_size` 4
+(8 loads the same, 16 is slower) and `spark_conf` `{"spark.sql.codegen.wholeStage": "false"}`, which
+saves compiling every append's plan (the sinks' clustering on write) for about 26% more tables per second
+on one cluster. 192 per run is many queries on one server when several collections run at once: on a
+server that hosts other work, set `max_queries_per_source` below.
+
 **Per-source cap.** Concurrent runs whose collections read the same server add up, so a source can
 get many runs' `parallelism` at once. Set `max_queries_per_source` (default `0`, off) to cap the
 queries on one source across every run that shares the Lakebase database. A source is a UC connection
@@ -326,16 +344,26 @@ driver first.
 
 ### Table retries
 
-By default a table that fails waits for the next run. Set the job parameter `table_retries` (default
-`0`, off) to try it again in the same run when the failure is a transient source error: a refused or
-dropped connection, a timeout, or Azure SQL throttling (`table_retry.py`). Errors that would fail again
-(a missing table, a denied permission, a schema error, a failed login when Spark passes on its cause)
-and errors it doesn't recognise fail at once, as without retries.
+By default no table is retried. The run's retry budget, `table_retry_budget`, defaults to `0`, so a table
+that fails ends its run as failed, whatever the error. A job raises the budget in the app's Advanced
+configuration (Tuning: Table retry budget), and only then do its tables get retried.
+
+With the budget above `0`, a table that fails with a transient source error is tried again in the same run,
+up to `table_retries` more times (job parameter, default `2`; `0` turns it off and the table waits for the next
+run): a refused or dropped connection, a timeout, a deadlock, a cancelled query (SQLSTATE 57014), an Oracle
+listener error (ORA-12514, ORA-12528), Azure SQL throttling, or Unity Catalog throttling a `remote_query` read
+("TEMPORARILY_UNAVAILABLE: Too many requests") (`table_retry.py`). Errors that would fail again (a missing table,
+a denied permission, a schema error, bad data (SQLSTATE class 22), a schema change under the write
+(`DELTA_SCHEMA_CHANGE`, `INCOMPATIBLE_*`), a failed login when Spark passes on its cause) fail at once, as without
+retries. An error it doesn't recognise gets one retry in the run, then fails.
+
+With the budget at `0`, nothing is retried: a transient error fails at once, and so does an unrecognised one,
+since its one retry comes out of the budget. `table_retries` only applies when the budget is above `0`.
 
 - **Pauses** double with each attempt, with jitter: 5 to 10 s, then 10 to 20 s, up to 2 minutes
   (environment variables `LAKEFED_TABLE_RETRY_BASE_S`, default `10`, and `LAKEFED_TABLE_RETRY_MAX_S`,
   default `120`). A waiting table holds no `parallelism` slot.
-- **Limits:** `table_retry_budget` (default `20`) retries in the whole run, and a source server stops
+- **Limits:** `table_retry_budget` (default `0`, which retries nothing) retries in the whole run, and a source server stops
   retrying for the rest of the run after 5 failed retries (`LAKEFED_TABLE_RETRY_PER_SOURCE`); retries
   that succeed don't count, so a short blip is retried in full. An outage that fails a server's tables
   all at once gets at most the budget's retries before any of them fails. Either way a source outage
@@ -347,6 +375,11 @@ and errors it doesn't recognise fail at once, as without retries.
 - **Records:** each attempt is its own `ingest_event` row: `retried` (with the error and the stage),
   then `ok` or `failed`, with `retry_count`. The run's `detail` has the totals (`table_retries`). See
   [monitoring.md](docs/monitoring.md).
+
+A run whose tables failed ends as failed, after recording them, so its job's failure email and any run alerts fire.
+A table that recovers on its retry is not a failure. The run's error text names the first five failing tables
+with their errors and links the run's page. The `fail_on_table_errors` parameter no longer changes this; it is
+still accepted so that older jobs load.
 
 ### Large estates
 
@@ -418,9 +451,20 @@ required for `ct`, `cursor` and `cdc`), `select_list` (explicit columns — `*` 
 `sink_catalog` / `sink_schema` / `sink_table`, `load_type` (`ct` | `full` | `cursor` | `cdc`), the
 optional partitioned-seed settings, `cursor_column` (required for `cursor`), `client_id`
 (consolidated sinks), `write_mode` (`merge` | `append`, see [Append sinks](#append-sinks-optional)),
-`client_attrs` (identity columns, JSON), and `jdbc_options`.
-`cdc_capture_instance` is reserved for the placeholder `cdc` strategy. Check constraints reject invalid combinations (e.g.
+`client_attrs` (identity columns, JSON), `jdbc_options`, and `freshness_sla_minutes` (optional freshness
+SLA for monitoring; see `docs/monitoring.md`).
+`cdc_capture_instance` is reserved for the placeholder `cdc` strategy.
+
+**Bulk onboarding.** The `lakefed_ingest_discover` job lists a SQL Server database's tables with
+recommended settings (load type from Change Tracking / rowversion / primary key, select list, partition
+column) into Lakebase. The optional operations app reviews them and creates control rows in bulk;
+without the app, query `discovered_table` and insert control rows yourself. Check constraints reject invalid combinations (e.g.
 `ct` on a non-SQL Server source). See `notebooks/load_control_example.ipynb`.
+A whole server's databases are listed through `master` (the spec's `pattern` is a LIKE filter), or, for an
+Azure SQL server whose login can't open `master`, through Azure Resource Manager: the spec's `azure_credential` (a
+Unity Catalog service credential whose managed identity has Reader on the server; the job's runner needs `ACCESS` on
+it) and `azure_resource_id` (`/subscriptions/<id>/resourceGroups/<group>/providers/Microsoft.Sql/servers/<server>`,
+or `managedInstances/<instance>`). The databases are then read through the connection as usual.
 
 **Schema changes.** Writes use schema evolution. Adding a column to `select_list` adds it to the
 sink and reseeds that table so historical rows are backfilled. With the job parameter
@@ -436,9 +480,11 @@ snapshot of every table that gained the column). New sinks get
 |---|---|
 | Lakebase instance, database, UC catalog | Bundle resources in `resources/lakefed_ingest_setup.yml` (created on deploy, or adopt existing ones with `bundle deployment bind`) |
 | Schema + migrations | `lakefed_ingest_setup` job on a new deployment (idempotent); after an upgrade, the first ingestion run migrates the schema itself |
+| Serverless jobs compute (default for setup) | The `lakefed_ingest_setup` job (and the operations app's grant job) default to serverless: they only talk to Lakebase, so they don't wait for a cluster. Without serverless, point them at an all-purpose cluster ([docs/deploy.md](docs/deploy.md#compute-for-the-setup-and-discovery-jobs)). Discovery reads the sources, so it runs on the bundle's single-node all-purpose `lakefed_ingest utility` cluster, which stays up between runs (auto-terminates after an hour). Ingestion runs on job clusters |
+| Serverless network path to the sources (check variant) | The check job, `lakefed_ingest_check`, reads the source databases from serverless compute, so serverless needs a network path to every source it checks (for example private endpoints through a network connectivity configuration, or source firewall rules), not only to Lakebase. Without one, run the check on a classic job cluster or an existing cluster, or use the default variant for those groups ([docs/deploy.md](docs/deploy.md#compute-for-the-check)) |
 | Lakebase auth | SDK-minted OAuth token at runtime; the run identity must be a Postgres role on the instance |
 | Cluster → Lakebase network path (port 5432) | Workspace IP access list must allow cluster egress, or use Private Link. Verify first. |
-| Per-database source credentials | One JSON secret `{"user","password"}` per source database, named by `control.secret_key`, in the `secret_scope` (may be Azure Key Vault-backed); or, for rows with `use_remote_query`, a UC connection on which the job's identity has `USE CONNECTION` and `MANAGE` |
+| Per-database source credentials | One JSON secret `{"user","password"}` per source database, named by `control.secret_key`, in the `secret_scope` (may be Azure Key Vault-backed); or, for rows with `use_remote_query`, a UC connection on which the job's identity has `USE CONNECTION` and `MANAGE`. The operations app's JDBC connections name a scope and key the same way ([app/README.md](app/README.md#jdbc-connections-entered-by-hand)) |
 | Cluster → source network path (SQL Server 1433, Oracle 1521, PostgreSQL 5432, MySQL 3306) | Customer networking |
 | `ct` source tables: CT enabled + primary key, `CHANGE_RETENTION` longer than the seed time (snapshot isolation is not required) | Source-side configuration |
 | Oracle / MySQL sources: JDBC driver library on the job cluster | Uncomment it in `resources/lakefed_ingest.yml` |
@@ -472,7 +518,22 @@ databricks bundle run lakefed_ingest -t <target> -p <profile> \
 
 The job ships with a paused 15-minute schedule. Job schedules can't pass parameters, so the
 schedule only ingests the job's default `task_collection`; run other collections with `run-now`
-and `job_parameters` (a launcher over collections is planned).
+and `job_parameters`.
+
+**The check first:** the `lakefed_ingest_check` job runs on serverless over a group of collections
+(`task_collections`, blank for every collection with enabled rows), asks each source database
+whether anything changed, stamps the unchanged ones, and starts `lakefed_ingest` (run-now) only for
+the collections with work, each for its databases with work. A quiet cycle starts no ingest cluster.
+The check then waits for the runs it started and fails if one of them failed (so the check's failure email
+fires). `timeout_s` (default 21600, six hours; 0 = no limit) bounds that wait: the runs still going are cancelled
+and the check fails. While it waits, the check's serverless compute is idle.
+
+```bash
+databricks bundle run lakefed_ingest_check -t <target> -p <profile> --params task_collections=<c1>,<c2>
+```
+
+Its schedule (paused) checks every collection; an operations-app schedule of the `check` variant
+starts it with its members instead.
 
 **Monitoring:** run and per-table telemetry, failures, and freshness queries are in
 [docs/monitoring.md](docs/monitoring.md).
@@ -481,6 +542,19 @@ and `job_parameters` (a launcher over collections is planned).
 script to run once per SQL Server database. It reports table sizes, CT settings, and how many
 tables and rows change per time bucket — the inputs for choosing collections, `parallelism`, and
 cluster size.
+
+## Compute options
+
+- **The check** (`lakefed_ingest_check`) runs on serverless by default. A classic job cluster or an existing
+  cluster can run it instead. The check reads the sources itself, so whichever compute it uses needs a network
+  path to each source.
+  No bundle variable switches it: a task has one compute reference, and YAML has no conditionals. Each alternative
+  is a ready target override in [docs/deploy.md](docs/deploy.md#compute-for-the-check).
+- **The operations app's SQL warehouse** is the bundle's own serverless Pro warehouse by default. The app bundle's
+  `app_warehouse_id` variable names a warehouse of your own instead, say a Pro warehouse in your network that reaches
+  sources serverless can't. It must be Pro or serverless, on version 2025.35 or above (`remote_query` doesn't run on
+  a Classic warehouse), and the app's grants job gives the app `CAN_USE` on it. See
+  [docs/deploy.md](docs/deploy.md#the-apps-sql-warehouse).
 
 ## Tests
 
@@ -514,8 +588,14 @@ team will help on a best-effort basis.
 
 | library | description | license | source |
 |---|---|---|---|
+| ag-grid-community | Data grid (operations app) | MIT | https://github.com/ag-grid/ag-grid |
+| ag-grid-react | React wrapper for AG Grid (operations app) | MIT | https://github.com/ag-grid/ag-grid |
 | certifi | Mozilla CA bundle (live SQL Server validation tests) | MPL-2.0 | https://pypi.org/project/certifi/ |
+| @databricks/design-system | The Databricks design system's CSS tokens, copied into the operations app (`app/src/frontend/src/dbui/tokens.css`) | ISC | https://www.npmjs.com/package/@databricks/design-system |
 | databricks-sdk | Databricks SDK for Python | Apache-2.0 | https://pypi.org/project/databricks-sdk/ |
+| DM Sans | Font of the operations app (`app/src/frontend/src/dbui/DMSans-variable.woff2`, from the design system) | SIL Open Font License 1.1 | https://github.com/googlefonts/dm-fonts |
+| fastapi | Web framework for APIs (operations app) | MIT | https://pypi.org/project/fastapi/ |
+| httpx | HTTP client (operations app API tests) | BSD-3-Clause | https://pypi.org/project/httpx/ |
 | ibm_db | IBM Db2 driver (Db2 test data generator, job orchestration version) | Apache-2.0 | https://pypi.org/project/ibm-db/ |
 | Microsoft JDBC Driver for SQL Server | SQL Server JDBC driver (included in Databricks Runtime) | MIT | https://github.com/microsoft/mssql-jdbc |
 | MySQL Connector/J | MySQL JDBC driver (optional cluster library) | GPL-2.0 with Universal FOSS Exception | https://github.com/mysql/mysql-connector-j |
@@ -523,6 +603,29 @@ team will help on a best-effort basis.
 | pandas | Data manipulation and analysis (table profiler notebook) | BSD-3-Clause | https://pypi.org/project/pandas/ |
 | PostgreSQL JDBC Driver | PostgreSQL JDBC driver (included in Databricks Runtime) | BSD-2-Clause | https://github.com/pgjdbc/pgjdbc |
 | psycopg | PostgreSQL database adapter (v3), for Lakebase | LGPL-3.0 | https://pypi.org/project/psycopg/ |
+| pydantic | Data validation using Python type hints (operations app) | MIT | https://pypi.org/project/pydantic/ |
 | pyspark | Apache Spark Python API (provided by Databricks Runtime) | Apache-2.0 | https://pypi.org/project/pyspark/ |
 | pytest | Testing framework | MIT | https://pypi.org/project/pytest/ |
 | python-tds | SQL Server TDS client (live SQL Server validation tests) | MIT | https://pypi.org/project/python-tds/ |
+| react | Library for building user interfaces (operations app) | MIT | https://github.com/facebook/react |
+| react-dom | React DOM rendering (operations app) | MIT | https://github.com/facebook/react |
+| react-router-dom | Routing for React (operations app) | MIT | https://github.com/remix-run/react-router |
+| @tanstack/react-query | Data fetching and caching for React (operations app) | MIT | https://github.com/TanStack/query |
+| @types/react | TypeScript types for React (operations app, build only) | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| @types/react-dom | TypeScript types for React DOM (operations app, build only) | MIT | https://github.com/DefinitelyTyped/DefinitelyTyped |
+| typescript | TypeScript compiler (operations app, build only) | Apache-2.0 | https://github.com/microsoft/TypeScript |
+| uvicorn | ASGI web server (operations app) | BSD-3-Clause | https://pypi.org/project/uvicorn/ |
+| vite | Frontend build tool (operations app, build only) | MIT | https://github.com/vitejs/vite |
+| @vitejs/plugin-react | React support for Vite (operations app, build only) | MIT | https://github.com/vitejs/vite-plugin-react |
+
+Notices for the files the operations app ships with it:
+- **@databricks/design-system** (ISC): Copyright (c) Databricks, Inc. Permission to use, copy, modify, and/or
+  distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright
+  notice and this permission notice appear in all copies. THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS
+  ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO
+  EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+  TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+- **DM Sans** (SIL Open Font License, Version 1.1): Copyright 2014 The DM Sans Project Authors
+  (https://github.com/googlefonts/dm-fonts). This Font Software is licensed under the SIL Open Font License,
+  Version 1.1, available with a FAQ at https://openfontlicense.org.

@@ -57,6 +57,7 @@ import contextlib
 import datetime
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -80,6 +81,12 @@ _HOST_KEYS = ("host", "server", "dsn")
 def _split(csv: Optional[str]) -> List[str]:
     """Split a comma-separated control-table field (primary_key / select_list) into names."""
     return [c.strip() for c in (csv or "").split(",") if c.strip()]
+
+
+def delta_column(name: str) -> str:
+    """A column name quoted for Delta SQL. Always quoted, and any backtick inside the name is doubled,
+    so ``a`b`` reaches Delta as the column it is."""
+    return "`" + str(name).replace("`", "``") + "`"
 
 
 def _without(cols: List[str], names: List[str]) -> List[str]:
@@ -143,7 +150,7 @@ def ct_read_query(cfg: dict, from_version: int, to_version: Optional[int] = None
 
 def merge_on(primary_key: str) -> str:
     """MERGE ON clause (Delta backtick-quoted) keyed on the (composite) PK."""
-    return " AND ".join(f"tgt.`{c}` = s.`{c}`" for c in _split(primary_key))
+    return " AND ".join(f"tgt.{delta_column(c)} = s.{delta_column(c)}" for c in _split(primary_key))
 
 
 def merge_set(select_list: str, primary_key: str) -> str:
@@ -153,15 +160,15 @@ def merge_set(select_list: str, primary_key: str) -> str:
     target doesn't have yet only resolves unqualified (``tgt.`c` `` fails on DBR 18)."""
     non_pk = _without(_split(select_list), _split(primary_key))
     cols = non_pk or _split(primary_key)
-    return ", ".join(f"`{c}` = s.`{c}`" for c in cols)
+    return ", ".join(f"{delta_column(c)} = s.{delta_column(c)}" for c in cols)
 
 
 def merge_insert_cols(select_list: str) -> str:
-    return ", ".join(f"`{c}`" for c in _split(select_list))
+    return ", ".join(delta_column(c) for c in _split(select_list))
 
 
 def merge_insert_vals(select_list: str) -> str:
-    return ", ".join(f"s.`{c}`" for c in _split(select_list))
+    return ", ".join(f"s.{delta_column(c)}" for c in _split(select_list))
 
 
 # ======================================================================================
@@ -255,18 +262,59 @@ def _uc_host(conn_name: str):
         return _uc_host_cache[conn_name]
 
 
+# The logins typed into the operations app, as recorded in lakefed_ingest.jdbc_login_write: (the scope they are in,
+# {secret key: the JDBC connection its newest login was typed for, with that connection's host, port and source type}).
+# Set once a run from Lakebase (guard_typed_logins); None until then, so a caller that never sets it reads as before.
+_typed_logins: Optional[Tuple[str, dict]] = None
+
+
+def guard_typed_logins(scope: str, logins: dict) -> None:
+    """Hold this run's reads from ``scope`` to the logins typed there: each goes only to the host, port and source type
+    of the connection its newest login was typed for (state_store.typed_logins reads them)."""
+    global _typed_logins
+    _typed_logins = (scope, dict(logins))
+
+
+def typed_login_refusal(scope: str, key: str, host: str, port: int, src_type: str, typed) -> Optional[str]:
+    """Why the login under (scope, key) may not be sent to this host, or None when it may. Only a key that holds a login
+    typed into the app is checked: it goes to the host of the connection it was typed for and nowhere else, whatever
+    the control row or the discovery spec says. A key no one typed (an admin's secret) is not checked here."""
+    if typed is None or scope != typed[0] or key not in typed[1]:
+        return None
+    login = typed[1][key]
+    if not login.get("src_host"):
+        return (f"the login under {scope}/{key} was typed for the JDBC connection {login.get('connection')}, which is "
+                "not stored, so it is sent nowhere")
+    login_type = str(login.get("src_type") or source_adapters.SQLSERVER).lower()
+    login_port = int(login.get("src_port") or source_adapters.get_adapter(login_type).default_port)
+    if (str(host).strip().lower(), int(port), str(src_type).lower()) != (str(login["src_host"]).strip().lower(),
+                                                                         login_port, login_type):
+        return (f"the login under {scope}/{key} was typed for the JDBC connection {login.get('connection')} "
+                f"({login['src_host']}:{login_port}), so it is not sent to {host}:{port}")
+    return None
+
+
 def _jdbc_config(cfg: dict) -> dict:
-    """Resolve {host, port, user, password} for this control row (cached per host/port/secret)."""
+    """Resolve {host, port, user, password} for this control row (cached per host/port/secret). A login typed into the
+    app is refused for any host but its own connection's (typed_login_refusal)."""
     scope, key = secret_ref(cfg)
-    user, pwd, secret_host = _creds(scope, key)
     host, port = cfg.get("src_host"), cfg.get("src_port")
     if not host and cfg.get("src_connection"):
         host, uc_port = _uc_host(cfg["src_connection"])
         port = port or uc_port
+    port = int(port or source_adapters.for_cfg(cfg).default_port)
+    typed = _typed_logins
+    if typed is not None and host and scope == typed[0] and key in typed[1]:
+        refusal = typed_login_refusal(scope, key, host, port, source_adapters.for_cfg(cfg).src_type, typed)
+        if refusal:
+            raise ValueError(f"control row {cfg.get('id')}: {refusal}")
+    user, pwd, secret_host = _creds(scope, key)
+    if typed is not None and not host and scope == typed[0] and key in typed[1]:
+        raise ValueError(f"control row {cfg.get('id')}: a login typed into the app goes only to its connection's host, "
+                         "and this row names none")
     host = host or secret_host or os.environ.get("LAKEFED_SQL_HOST")
     if not host:
         raise ValueError(f"control row {cfg.get('id')}: no src_host could be resolved")
-    port = int(port or source_adapters.for_cfg(cfg).default_port)
     ck = config_cache_key(host, port, scope, key)
     with _lock:
         if ck not in _config_cache:
@@ -352,7 +400,7 @@ def quote_delta_ident(name: str) -> str:
     name = str(name)
     if len(name) >= 2 and name[0] == name[-1] == "`" and "`" not in name[1:-1].replace("``", ""):
         return name
-    return "`" + name.replace("`", "``") + "`"
+    return delta_column(name)
 
 
 def sink_fqn(cfg: dict) -> str:
@@ -611,12 +659,13 @@ CT_DATABASE_STATE_SQL = (
     f"FROM (SELECT 1 AS one) AS d LEFT JOIN ({CT_TABLE_STATUS_SQL}) AS x ON 1 = 1")
 
 
-def database_ct_state(cfg: dict, slots=None) -> Tuple[Optional[int], dict]:
+def database_ct_state(cfg: dict, slots=None, spark=None) -> Tuple[Optional[int], dict]:
     """(B) ``current_version`` and ``ct_table_status`` of the database in ONE query (one unit):
     (CT version or None, {(schema, table) lower-cased: (min_valid_version, begin_version)}). Most
-    databases are quiet at scale, and for them this is the only question a cycle asks."""
+    databases are quiet at scale, and for them this is the only question a cycle asks. ``spark``:
+    the session to read through (default: the active one)."""
     with _unit(slots, cfg):
-        rows = _read(_spark(), cfg, CT_DATABASE_STATE_SQL).collect()
+        rows = _read(spark or _spark(), cfg, CT_DATABASE_STATE_SQL).collect()
     as_int = lambda v: int(v) if v is not None else None
     cur = as_int(rows[0]["v"]) if rows else None
     status = {(str(r["sch"]).lower(), str(r["tbl"]).lower()): (as_int(r["mv"]), as_int(r["bv"]))
@@ -648,6 +697,11 @@ def ct_begin_version(cfg: dict, slots=None) -> Optional[int]:
 
 CT_TABLE_NOT_ENABLED_MSG = ("Change Tracking is not enabled on this source table "
                             "(CHANGE_TRACKING_MIN_VALID_VERSION() is NULL); enable it, then the table re-seeds")
+
+# OBJECT_ID is NULL: no such table at the source, or the login cannot see it. Its CT state is NULL too, so this is
+# checked first, or a missing table would read as one with Change Tracking off.
+SOURCE_TABLE_NOT_FOUND_MSG = ("source table not found: {table} does not exist at the source, or the login cannot "
+                              "see it; check src_schema and src_table")
 
 
 def require_table_ct(cfg: dict, slots=None) -> int:
@@ -704,6 +758,41 @@ def check_sink_mode(cfg: dict, sink_fqn: str, sink_columns: List[str]) -> None:
                                                         col=OP_COLUMN, mode=write_mode(cfg)))
 
 
+# The sinks checked so far in this run, and their columns: ensure_sink_table asks Unity Catalog about
+# each sink once per run instead of once per batch. Each run starts with forget_sinks().
+_known_sinks: dict = {}
+_known_schemas: set = set()
+
+# A target schema the first run can't make: it is made as the identity the ingestion job runs as, which needs these.
+SCHEMA_CREATE_MSG = ("can't create the target schema {schema}: the identity this job runs as needs USE CATALOG and "
+                     "CREATE SCHEMA on {catalog} (or the schema made beforehand, with USE SCHEMA and CREATE TABLE "
+                     "on it). {error}")
+
+
+def forget_sinks() -> None:
+    """Start a run: the next ``ensure_sink_table`` of every sink asks the catalog again."""
+    _known_sinks.clear()
+    _known_schemas.clear()
+
+
+def ensure_sink_schema(spark, cfg: dict) -> None:
+    """Create the row's target schema if it doesn't exist, as Lakeflow Connect's pipeline creation makes a new
+    destination schema: a job set up in the app may name a schema nobody made yet. It is made once per run, owned
+    by the identity the job runs as. A row without a catalog and schema (a test, a two-part name) is left alone."""
+    if not cfg.get("sink_catalog") or not cfg.get("sink_schema"):
+        return
+    catalog = quote_delta_ident(cfg["sink_catalog"])
+    schema = f"{catalog}.{quote_delta_ident(cfg['sink_schema'])}"
+    if schema in _known_schemas:
+        return
+    try:
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema} COMMENT 'Target of lakefed ingestion jobs'")
+    except Exception as e:
+        raise RuntimeError(SCHEMA_CREATE_MSG.format(schema=schema, catalog=catalog,
+                                                    error=str(e).strip().split("\n")[0][:300])) from e
+    _known_schemas.add(schema)
+
+
 def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
     """Create the Delta bronze sink if absent, typed from the source via a 0-row JDBC read (so the
     JDBC dialect infers the Spark schema natively), then check the sink's mode (dedicated vs
@@ -711,8 +800,17 @@ def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
 
     A consolidated sink is created with the ``__client_id__`` column and liquid clustering on it, so
     each client's slice is cheap to find and concurrent clients' writes touch separate files. An
-    append sink is created with the client_attrs and APPEND_COLUMNS too."""
+    append sink is created with the client_attrs and APPEND_COLUMNS too.
+
+    The catalog is asked once per sink per run (``forget_sinks``): later calls check the row's mode
+    against the columns found then. The mode columns never change within a run."""
+    known = _known_sinks.get(sink_fqn)
+    if known is not None:
+        check_sink_mode(cfg, sink_fqn, known)
+        return
     if not spark.catalog.tableExists(sink_fqn):
+        ensure_sink_schema(spark, cfg)
+
         def create():
             with _unit(slots, cfg):
                 if spark.catalog.tableExists(sink_fqn):      # another client created it meanwhile
@@ -726,7 +824,90 @@ def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
                 finally:
                     spark.catalog.dropTempView(view)
         with_write_retry(create, what=f"create {sink_fqn}")
-    check_sink_mode(cfg, sink_fqn, spark.table(sink_fqn).columns)
+    columns = list(spark.table(sink_fqn).columns)
+    check_sink_mode(cfg, sink_fqn, columns)
+    _known_sinks[sink_fqn] = columns
+
+
+def _bare_ident(name) -> str:
+    """A sink name part without its quotes (a control row may hold an already-quoted name)."""
+    name = str(name or "").strip()
+    if len(name) >= 2 and name[0] == name[-1] == "`":
+        name = name[1:-1].replace("``", "`")
+    return name
+
+
+def sink_lookup_key(cfg: dict) -> str:
+    """Lower-cased, unquoted catalog.schema.table of a control row's sink, as ``existing_sinks``
+    returns them (not ``sink_fqn``, which quotes each part for SQL)."""
+    return ".".join(_bare_ident(cfg.get(k)).lower() for k in ("sink_catalog", "sink_schema", "sink_table"))
+
+
+def existing_sinks_sql(catalog: str, schemas) -> str:
+    """Tables that exist in the given schemas of one catalog — ONE information_schema query per sink
+    catalog per run, so the planner can reseed an incremental table whose sink is gone."""
+    cat = "`" + str(catalog).replace("`", "``") + "`"
+    lits = ", ".join("'" + str(s).lower().replace("'", "''") + "'" for s in sorted(schemas))
+    return (f"SELECT lower(table_schema) AS s, lower(table_name) AS t FROM {cat}.information_schema.tables "
+            f"WHERE lower(table_schema) IN ({lits})")
+
+
+def existing_sinks(spark, configs) -> Optional[set]:
+    """{catalog.schema.table} (lower) of the sink tables that exist for these control rows, or None
+    when a catalog can't be listed (the caller then skips the check rather than guessing)."""
+    by_cat = {}
+    for c in configs:
+        by_cat.setdefault(_bare_ident(c["sink_catalog"]).lower(), set()).add(_bare_ident(c["sink_schema"]).lower())
+    found = set()
+    for cat, schemas in by_cat.items():
+        try:
+            rows = spark.sql(existing_sinks_sql(cat, schemas)).collect()
+        except Exception as e:
+            print(f"[warn] can't list tables in catalog {cat} ({str(e)[:160]}); skipping the missing-sink check")
+            return None
+        found |= {f"{cat}.{r['s']}.{r['t']}" for r in rows}
+    return found
+
+
+def spark_conf_settings(text) -> dict:
+    """The Spark session settings of the job parameter ``spark_conf``: a JSON object of setting -> value
+    (blank: none), as strings. A string or number is used as written; a boolean becomes "true" or "false".
+    Anything else (null, a list, an object, NaN, or a number too large to be finite such as 1e999) is refused:
+    its text would be a value nobody wrote ("None", "[1]", "inf"). Raises ValueError, naming the setting."""
+    if text is None or not str(text).strip():
+        return {}
+    try:
+        settings = json.loads(text, parse_constant=_refuse_json_constant)
+    except ValueError as e:
+        raise ValueError(f"spark_conf is not JSON: {e}") from e
+    if not isinstance(settings, dict):
+        raise ValueError("spark_conf must be a JSON object of setting -> value")
+    out = {}
+    for key, value in settings.items():
+        if isinstance(value, bool):
+            out[str(key)] = "true" if value else "false"
+        elif isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"spark_conf setting {key!r} must be a finite number")
+        elif isinstance(value, (str, int, float)):
+            out[str(key)] = str(value)
+        else:
+            kind = "null" if value is None else type(value).__name__
+            raise ValueError(f"spark_conf setting {key!r} must be a string, number or boolean, not {kind}")
+    return out
+
+
+def _refuse_json_constant(name: str):
+    raise ValueError(f"{name} is not a setting value")
+
+
+def apply_session_conf(spark, text) -> dict:
+    """Set this run's Spark session settings from ``spark_conf`` (see ``spark_conf_settings``; all of them
+    are checked before the first is set), so one cluster can run collections with different code generation
+    or write settings. Returns what was set."""
+    settings = spark_conf_settings(text)
+    for key, value in settings.items():
+        spark.conf.set(key, value)
+    return settings
 
 
 def _is_partitioned(cfg: dict) -> bool:
@@ -740,7 +921,7 @@ def insert_sql(mode: str, target: str, cols: List[str], source: str, evolve: boo
     BY NAME maps columns by name, so a reordered/edited select_list can never shift values into the
     wrong columns; with ``evolve`` the target gains any select_list column it lacks (spike-validated
     on DBR 18 — an explicit column list instead would require the columns to already exist)."""
-    collist = ", ".join(f"`{c}`" for c in cols)
+    collist = ", ".join(delta_column(c) for c in cols)
     evo = "WITH SCHEMA EVOLUTION " if evolve else ""
     return f"INSERT {evo}{mode} {target} BY NAME SELECT {collist} FROM {source}"
 
@@ -751,7 +932,7 @@ def insert_overwrite_sql(sink_fqn: str, cols: List[str], source: str, cfg: Optio
     __client_id__ = '<id>' SELECT ...``; validated on DBR: other clients untouched, BY NAME mapping,
     new columns added. BY NAME must precede REPLACE WHERE)."""
     if cfg is not None and client_id(cfg):
-        collist = ", ".join(f"`{c}`" for c in cols)
+        collist = ", ".join(delta_column(c) for c in cols)
         return (f"INSERT WITH SCHEMA EVOLUTION INTO {sink_fqn} BY NAME REPLACE WHERE {client_predicate(cfg)} "
                 f"SELECT {collist} FROM {source}")
     return insert_sql("OVERWRITE", sink_fqn, cols, source, evolve=True)
@@ -1256,11 +1437,13 @@ def committed_clients(spark, sink_fqn: str, cfgs, run_id, slots=None) -> set:
 
 def seed_prep_sql(cfg: dict) -> str:
     """What a CT seed needs before it reads, in one query: the database's CT version (V0, captured
-    BEFORE the seed), the table's min valid version (NULL: CT is off on it) and its begin_version."""
+    BEFORE the seed), the table's min valid version (NULL: CT is off on it), its begin_version, and its
+    object id (NULL: the table is not there)."""
     obj = quote_nstr(f"{quote_ident(cfg['src_schema'])}.{quote_ident(cfg['src_table'])}")
     return (f"SELECT CAST({int(cfg['id'])} AS BIGINT) AS control_id, "
             "CAST(CHANGE_TRACKING_CURRENT_VERSION() AS BIGINT) AS v, "
             f"CAST(CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID({obj})) AS BIGINT) AS mv, "
+            f"CAST(OBJECT_ID({obj}) AS BIGINT) AS oid, "
             "(SELECT CAST(begin_version AS BIGINT) FROM sys.change_tracking_tables "
             f"WHERE object_id = OBJECT_ID({obj})) AS bv")
 
@@ -1297,6 +1480,9 @@ def prepare_seed(spark, cfg: dict, slots=None) -> Tuple[int, Optional[int]]:
         row = _read(spark, cfg, seed_prep_sql(cfg)).first()
     if row is None or row["v"] is None:
         raise RuntimeError(CT_NOT_ENABLED_MSG)
+    if row["oid"] is None:
+        raise RuntimeError(SOURCE_TABLE_NOT_FOUND_MSG.format(
+            table=f"{quote_ident(cfg['src_schema'])}.{quote_ident(cfg['src_table'])}"))
     if row["mv"] is None:
         raise RuntimeError(CT_TABLE_NOT_ENABLED_MSG)
     return int(row["v"]), (int(row["bv"]) if row["bv"] is not None else None)

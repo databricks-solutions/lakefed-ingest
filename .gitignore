@@ -49,3 +49,7 @@ override.tf.json
 .terraformrc
 terraform.rc
 .isaac/config.json
+
+# Operations app (React): dependencies and build output
+node_modules/
+app/src/static/

@@ -64,6 +64,32 @@ def test_sink_fqn_keeps_names_that_are_already_quoted():
     assert ce.quote_delta_ident("`") == "````"
 
 
+def test_delta_column_quotes_every_name_and_doubles_embedded_backticks():
+    assert ce.delta_column("Order-Lines") == "`Order-Lines`"
+    assert ce.delta_column("Sales (2024)") == "`Sales (2024)`"
+    assert ce.delta_column("a--b") == "`a--b`"
+    assert ce.delta_column("a`b") == "`a``b`"
+    assert ce.delta_column("a b") == "`a b`"
+    assert ce.delta_column("`a`") == "```a```"   # a column never passes through as already quoted
+
+
+def test_merge_and_insert_columns_quote_names_with_dashes_spaces_and_backticks():
+    assert ce.merge_on("id, a`b") == "tgt.`id` = s.`id` AND tgt.`a``b` = s.`a``b`"
+    assert ce.merge_set("id, Order-Lines, Sales (2024)", "id") == (
+        "`Order-Lines` = s.`Order-Lines`, `Sales (2024)` = s.`Sales (2024)`")
+    assert ce.merge_insert_cols("a--b, a`b") == "`a--b`, `a``b`"
+    assert ce.merge_insert_vals("a--b, a`b") == "s.`a--b`, s.`a``b`"
+
+
+def test_insert_sql_quotes_column_names_for_every_insert_mode():
+    cols = ["Order-Lines", "Sales (2024)", "a`b"]
+    assert ce.insert_sql("INTO", "`c`.`s`.`t`", cols, "v") == (
+        "INSERT INTO `c`.`s`.`t` BY NAME SELECT `Order-Lines`, `Sales (2024)`, `a``b` FROM v")
+    assert ce.insert_sql("OVERWRITE", "`c`.`s`.`t`", cols, "v", evolve=True) == (
+        "INSERT WITH SCHEMA EVOLUTION OVERWRITE `c`.`s`.`t` BY NAME "
+        "SELECT `Order-Lines`, `Sales (2024)`, `a``b` FROM v")
+
+
 def test_staging_table_name_stays_valid_for_quoted_sinks():
     assert ce.staging_table_name("`c-1`.`s`.`t`") == "`c-1`.`s`.`t__seed_staging`"
     assert ce.staging_table_name("`c-1`.`s`.`t`", _CONS).startswith("`c-1`.`s`.`t__seed_staging__tenant_001_")
@@ -531,6 +557,46 @@ def test_ensure_sink_table_is_noop_when_sink_exists(monkeypatch):
     spark = _FakeSpark()
     spark.catalog.tableExists = lambda name: True
     ce.ensure_sink_table(spark, {"src_schema": "dbo", "src_table": "t", "select_list": "id"}, "c.s.t")
+    assert spark.statements == []
+
+
+def test_a_missing_target_schema_is_made_once_per_run_before_its_first_table(monkeypatch):
+    monkeypatch.setattr(ce, "_read", lambda sp, cfg, q, **kw: _DF(sp, q))
+    ce.forget_sinks()
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: False
+    cfg = {"src_schema": "dbo", "src_table": "t", "select_list": "id, v", "sink_catalog": "main",
+           "sink_schema": "lakefed_100k", "sink_table": "t0001"}
+    ce.ensure_sink_table(spark, cfg, ce.sink_fqn(cfg))
+    ce.ensure_sink_table(spark, dict(cfg, sink_table="t0002"), ce.sink_fqn(dict(cfg, sink_table="t0002")))
+    schemas = [x for x in spark.statements if x.startswith("CREATE SCHEMA")]
+    assert schemas == ["CREATE SCHEMA IF NOT EXISTS `main`.`lakefed_100k` COMMENT 'Target of lakefed ingestion jobs'"]
+    assert spark.statements.index(schemas[0]) < next(i for i, x in enumerate(spark.statements) if x.startswith("CREATE TABLE"))
+    ce.forget_sinks()                                              # a new run asks again
+    ce.ensure_sink_table(spark, dict(cfg, sink_table="t0003"), ce.sink_fqn(dict(cfg, sink_table="t0003")))
+    assert len([x for x in spark.statements if x.startswith("CREATE SCHEMA")]) == 2
+
+
+def test_a_target_schema_the_run_cant_make_names_the_grant_it_needs(monkeypatch):
+    ce.forget_sinks()
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: False
+    def refuse(stmt):
+        raise Exception("[PERMISSION_DENIED] User does not have CREATE SCHEMA on Catalog 'main'.\nmore")
+    spark.sql = refuse
+    cfg = {"src_schema": "dbo", "src_table": "t", "select_list": "id", "sink_catalog": "main", "sink_schema": "s",
+           "sink_table": "t"}
+    with pytest.raises(RuntimeError) as refused:
+        ce.ensure_sink_table(spark, cfg, ce.sink_fqn(cfg))
+    assert "USE CATALOG and CREATE SCHEMA on `main`" in str(refused.value) and "PERMISSION_DENIED" in str(refused.value)
+
+
+def test_an_existing_target_table_makes_no_schema(monkeypatch):
+    ce.forget_sinks()
+    spark = _FakeSpark()
+    spark.catalog.tableExists = lambda name: True
+    ce.ensure_sink_table(spark, {"src_schema": "dbo", "src_table": "t", "select_list": "id", "sink_catalog": "main",
+                                 "sink_schema": "s", "sink_table": "t"}, "`main`.`s`.`t`")
     assert spark.statements == []
 
 
@@ -1158,6 +1224,7 @@ def test_seed_prep_asks_every_database_in_one_job_then_one_by_one_on_failure(mon
     sql = ce.seed_prep_sql(cfgs[0])
     assert sql.startswith("SELECT CAST(1 AS BIGINT) AS control_id, CAST(CHANGE_TRACKING_CURRENT_VERSION() AS BIGINT)")
     assert "CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID(N'[dbo].[t]'))" in sql and "begin_version" in sql
+    assert "CAST(OBJECT_ID(N'[dbo].[t]') AS BIGINT) AS oid" in sql
 
 
 def test_prepare_seed_asks_the_version_ct_state_and_begin_version_in_one_query(monkeypatch):
@@ -1165,14 +1232,18 @@ def test_prepare_seed_asks_the_version_ct_state_and_begin_version_in_one_query(m
     # seed, ct_begin_version), each a statement the driver plans. One query answers all three, and
     # the begin_version is then the one CT had BEFORE the read, as a batched seed records it.
     import pytest
-    seen = _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": 7, "bv": 3}])
+    seen = _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": 7, "bv": 3, "oid": 901}])
     assert ce.prepare_seed(None, _APP) == (500, 3)
     assert seen == [ce.seed_prep_sql(_APP)]
     _fake_read(monkeypatch, [{"control_id": 1, "v": None, "mv": None, "bv": None}])
     with pytest.raises(RuntimeError, match="not enabled on this source database"):
         ce.prepare_seed(None, _APP)
-    _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": None, "bv": None}])
+    _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": None, "bv": None, "oid": 901}])
     with pytest.raises(RuntimeError, match="not enabled on this source table"):
+        ce.prepare_seed(None, _APP)
+    # A table that is not there has no Change Tracking either: say it is missing, not that CT is off.
+    _fake_read(monkeypatch, [{"control_id": 1, "v": 500, "mv": None, "bv": None, "oid": None}])
+    with pytest.raises(RuntimeError, match=r"source table not found: \[dbo\]\.\[t\]"):
         ce.prepare_seed(None, _APP)
 
 
@@ -1184,6 +1255,15 @@ def test_database_ct_state_reads_the_version_and_every_tables_state_in_one_query
     assert seen == [ce.CT_DATABASE_STATE_SQL] and ce.CT_TABLE_STATUS_SQL in ce.CT_DATABASE_STATE_SQL
     _fake_read(monkeypatch, [{"v": None, "sch": None, "tbl": None, "mv": None, "bv": None}])   # CT off
     assert ce.database_ct_state({"src_database": "d"}) == (None, {})
+
+
+def test_database_ct_state_reads_through_a_given_session(monkeypatch):
+    # The initial check calls it from its own threads, with the notebook's session.
+    sessions = []
+    monkeypatch.setattr(ce, "_spark", lambda: pytest.fail("looked up the active session"))
+    monkeypatch.setattr(ce, "_read", lambda spark, cfg, q, **kw: (sessions.append(spark), _Rows([]))[1])
+    assert ce.database_ct_state({"src_database": "d"}, spark="the session") == (None, {})
+    assert sessions == ["the session"]
 
 
 # ---- reads through a Unity Catalog connection (use_remote_query) ---------------------------------------
@@ -1279,3 +1359,116 @@ def test_units_take_a_permit_of_each_rows_source():
     with ce._unit(slots):                                    # Delta-only units take no permit
         assert slots.in_flight == 1
     assert ce._unit(None, _REMOTE) is not None and ce._units(None, [_REMOTE]) is not None
+
+
+def test_existing_sinks_query_and_fallback():
+    sql = ce.existing_sinks_sql("Main", ["Bronze", "it's"])
+    assert sql.startswith("SELECT lower(table_schema) AS s, lower(table_name) AS t FROM `Main`.information_schema.tables")
+    assert "IN ('bronze', 'it''s')" in sql
+
+    class _Spark:
+        def __init__(self, fail): self.fail = fail
+        def sql(self, q):
+            if self.fail:
+                raise RuntimeError("PERMISSION_DENIED")
+            return type("R", (), {"collect": lambda s: [{"s": "bronze", "t": "orders"}]})()
+    cfgs = [{"sink_catalog": "Main", "sink_schema": "Bronze", "sink_table": "Orders"}]
+    assert ce.existing_sinks(_Spark(False), cfgs) == {"main.bronze.orders"}
+    assert ce.existing_sinks(_Spark(True), cfgs) is None
+    assert ce.sink_lookup_key(cfgs[0]) == "main.bronze.orders"
+    # An already-quoted part (allowed by sink_fqn) is looked up unquoted, never as SQL text.
+    assert ce.sink_lookup_key(dict(cfgs[0], sink_catalog="`Main`")) == "main.bronze.orders"
+    assert ce.existing_sinks(_Spark(False), [dict(cfgs[0], sink_schema="`Bronze`")]) == {"main.bronze.orders"}
+
+
+# ---- sink checks: once per sink per run ---------------------------------------------------------
+
+@pytest.fixture
+def counted_catalog(monkeypatch):
+    """A fake Spark whose catalog lookups are counted: (spark, calls)."""
+    ce.forget_sinks()
+    spark, calls = _FakeSpark(), []
+
+    def table_exists(name):
+        calls.append(("exists", name))
+        return True
+
+    def table(name):
+        calls.append(("columns", name))
+        return _Table()
+    spark.catalog.tableExists, spark.table = table_exists, table
+    monkeypatch.setattr(_Table, "columns", ["__client_id__", "id", "v", "__change_op"])
+    yield spark, calls
+    ce.forget_sinks()
+
+
+def test_ensure_sink_table_checks_each_sink_once_per_run(counted_catalog):
+    spark, calls = counted_catalog
+    app = dict(_CONS, write_mode="append")
+    for _ in range(3):
+        ce.ensure_sink_table(spark, app, "c.s.t")
+    assert calls == [("exists", "c.s.t"), ("columns", "c.s.t")]
+    ce.ensure_sink_table(spark, app, "c.s.other")                  # another sink is checked on its own
+    assert calls[2:] == [("exists", "c.s.other"), ("columns", "c.s.other")]
+    ce.forget_sinks()                                              # the next run checks again
+    ce.ensure_sink_table(spark, app, "c.s.t")
+    assert calls[4:] == [("exists", "c.s.t"), ("columns", "c.s.t")]
+
+
+def test_a_known_sink_still_refuses_a_row_of_the_wrong_mode(counted_catalog):
+    spark, calls = counted_catalog
+    ce.ensure_sink_table(spark, dict(_CONS, write_mode="append"), "c.s.t")
+    with pytest.raises(ValueError, match="has a '__client_id__' column"):
+        ce.ensure_sink_table(spark, dict(_CONS, client_id=None, write_mode="append"), "c.s.t")
+    assert len(calls) == 2                                         # judged on the known columns
+
+
+def test_a_failed_check_is_not_remembered(counted_catalog):
+    spark, calls = counted_catalog
+    with pytest.raises(ValueError):
+        ce.ensure_sink_table(spark, dict(_CONS, client_id=None, write_mode="append"), "c.s.t")
+    ce.ensure_sink_table(spark, dict(_CONS, write_mode="append"), "c.s.t")
+    assert calls == [("exists", "c.s.t"), ("columns", "c.s.t")] * 2
+
+
+# ---- session settings for a run ---------------------------------------------------------------
+
+class _Conf:
+    def __init__(self):
+        self.values = {}
+
+    def set(self, key, value):
+        self.values[key] = value
+
+
+def test_apply_session_conf_sets_each_setting_as_a_string():
+    spark = type("S", (), {"conf": _Conf()})()
+    applied = ce.apply_session_conf(spark, '{"spark.sql.codegen.wholeStage": false, "spark.x.n": 200}')
+    assert spark.conf.values == {"spark.sql.codegen.wholeStage": "false", "spark.x.n": "200"}
+    assert applied == spark.conf.values
+
+
+def test_apply_session_conf_refuses_a_null_or_a_container_before_setting_anything():
+    spark = type("S", (), {"conf": _Conf()})()
+    for bad in ('{"x": null}', '{"y": [1]}', '{"z": {"a": 1}}', '{"n": NaN}', '{"n": Infinity}',
+                '{"n": 1e999}'):
+        with pytest.raises(ValueError, match="spark_conf"):
+            ce.apply_session_conf(spark, bad)
+    with pytest.raises(ValueError, match="spark_conf"):
+        ce.apply_session_conf(spark, '{"ok.setting": "1", "y": [1]}')
+    assert spark.conf.values == {}
+
+
+def test_spark_conf_settings_writes_booleans_as_true_and_false_and_keeps_strings_and_numbers():
+    assert ce.spark_conf_settings('{"a": true, "b": false, "c": 1.5, "d": 7, "e": "x"}') == {
+        "a": "true", "b": "false", "c": "1.5", "d": "7", "e": "x"}
+
+
+def test_apply_session_conf_ignores_blank_and_refuses_anything_but_an_object():
+    spark = type("S", (), {"conf": _Conf()})()
+    assert ce.apply_session_conf(spark, "") == {} and ce.apply_session_conf(spark, "  ") == {}
+    assert ce.apply_session_conf(spark, None) == {}
+    for bad in ('["a"]', '"x"', "{not json"):
+        with pytest.raises(ValueError, match="spark_conf"):
+            ce.apply_session_conf(spark, bad)
+    assert spark.conf.values == {}

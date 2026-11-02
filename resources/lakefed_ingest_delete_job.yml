@@ -1,0 +1,72 @@
+# Delete job: purges operations-app jobs (delete_job.ipynb). The app has no DELETE privilege on the Lakebase tables,
+# so a deleted job is only marked deleted and kept for deleted_job_retention_days, which lets a Restore bring it back.
+# This job runs as the deployer (the state database's owner) and, in one of its modes:
+# - schedule_id: the app's Delete now. It deletes the job's groups' rows in one transaction under their run locks,
+#   keeps run history and the change log, and, when asked, drops the target tables only those groups wrote.
+# - schedule_id with control_ids: one table of a live job, removed in the app. Its rows and state go, its target
+#   stays, and the job and its other tables stay (delete_job.delete_table_rows).
+# - purge_expired (the daily schedule below, with no schedule_id): the same for every deleted job whose retention has
+#   run out, each in its own transaction (delete_job.purge_expired).
+# - purge_drafts: the tables the app read for choices no job took (delete_job.purge_drafts), started by the app.
+# The app needs CAN_MANAGE_RUN on it (an app resource).
+resources:
+  jobs:
+    lakefed_ingest_delete_job:
+      name: "lakefed_ingest_delete_job"
+      description: "Purges deleted app jobs: their groups' control rows and state, and, if asked, their target tables."
+      # One at a time, queued: two purges whose groups share a target table must not both decide it is theirs alone.
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+      # Daily: purges every deleted job whose retention has run out. A job schedule passes no parameters, so this run
+      # takes the job's defaults below (purge_expired on, no schedule_id).
+      schedule:
+        quartz_cron_expression: "0 0 3 * * ?"
+        timezone_id: UTC
+        pause_status: UNPAUSED
+      tasks:
+        - task_key: delete
+          environment_key: lakebase_client
+          notebook_task:
+            notebook_path: ../src/lakefed_ingest/delete_job.ipynb
+            base_parameters:
+              schedule_id: "{{job.parameters.schedule_id}}"
+              drop_targets: "{{job.parameters.drop_targets}}"
+              purge_drafts: "{{job.parameters.purge_drafts}}"
+              draft_ttl_s: "{{job.parameters.draft_ttl_s}}"
+              control_ids: "{{job.parameters.control_ids}}"
+              purge_expired: "{{job.parameters.purge_expired}}"
+              retention_days: "{{job.parameters.retention_days}}"
+              # Fixed here, not job parameters: whoever may start a run (the app) can't point it at another database.
+              db_instance: ${var.lakebase_instance}
+              db_name: ${var.lakebase_database}
+      environments:
+        - environment_key: lakebase_client
+          spec:
+            environment_version: "4"
+            dependencies:
+              - "psycopg[binary]"
+              - "databricks-sdk==0.145.0"
+      tags:
+        project: lakefed_ingest
+      parameters:
+        # The deleted app job, and whether to drop its target tables too. The app passes both.
+        - name: schedule_id
+          default: ""
+        - name: drop_targets
+          default: "false"
+        # The other mode: purge the drafts of tables the app read for a choice no job took (no schedule_id). The app
+        # starts it at most hourly, only when there is one, with its own time limit.
+        - name: purge_drafts
+          default: "false"
+        - name: draft_ttl_s
+          default: "7200"
+        # The third mode: remove some tables from a live job (schedule_id names it, control_ids are its control rows,
+        # comma-separated). Their rows and state go and their target tables stay; the app starts it per request.
+        - name: control_ids
+          default: ""
+        # The daily run's mode, and how long a deleted job is kept (the app's Restore window, the same variable).
+        - name: purge_expired
+          default: "true"
+        - name: retention_days
+          default: "${var.deleted_job_retention_days}"

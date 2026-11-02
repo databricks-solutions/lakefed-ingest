@@ -62,6 +62,29 @@ def test_summarize_counts_by_status_and_outcome():
     assert s["by_outcome"] == {"seeded": 2, "incremented": 1}
 
 
+def test_summarize_counts_a_cancelled_result_apart_from_the_failures():
+    results = [
+        {"item": 1, "status": "ok", "detail": "seeded"},
+        {"item": 2, "status": "cancelled", "detail": "stopped"},
+        {"item": 3, "status": "failed", "detail": "err"},
+    ]
+    s = parallel.summarize(results)
+    assert s["ok"] == 1 and s["failed"] == 1 and s["cancelled"] == 1
+    assert s["by_outcome"] == {"seeded": 1}
+
+
+def test_run_parallel_records_a_cancelled_item_as_cancelled_and_a_crashed_one_as_failed():
+    def worker(item):
+        if item == 2:
+            raise parallel.Cancelled("stopped by the cancel")
+        if item == 3:
+            raise RuntimeError("boom")
+        return "done"
+    results = parallel.run_parallel([1, 2, 3], worker, 2)
+    assert [r["status"] for r in results] == ["ok", "cancelled", "failed"]
+    assert results[1]["detail"] == "stopped by the cancel"
+
+
 # ---- WorkSlots: ONE concurrency budget for all units of query work in a sweep -------------
 import threading
 import time
@@ -108,6 +131,33 @@ def test_workslots_set_pool_uses_slot_id():
     with slots.acquire() as sid:
         assert seen == [f"pool{sid}"]
     assert all(p in {"pool0", "pool1", "pool2"} for p in seen)
+
+
+def test_workslots_runs_on_when_the_pool_is_refused():
+    # Standard access mode can refuse sparkContext: the units still run, without FAIR pools, and the
+    # pool is asked for only until the first refusal.
+    calls, ran = [], []
+
+    def refuse(pool):
+        calls.append(pool)
+        raise RuntimeError("[JVM_ATTRIBUTE_NOT_SUPPORTED] sparkContext is not supported")
+
+    slots = parallel.WorkSlots(2, set_pool=refuse)
+    with slots.acquire():
+        ran.append("one")
+    with slots.acquire_many(2):
+        ran.append("many")
+    assert ran == ["one", "many"]
+    assert len(calls) == 1
+    assert "JVM_ATTRIBUTE_NOT_SUPPORTED" in slots.pool_error
+    assert slots.in_flight == 0
+
+
+def test_workslots_pool_error_is_none_when_pools_work():
+    slots = parallel.WorkSlots(2, set_pool=lambda pool: None)
+    with slots.acquire():
+        pass
+    assert slots.pool_error is None
 
 
 def test_workslots_returns_slot_on_exception():

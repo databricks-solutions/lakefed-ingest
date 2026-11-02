@@ -3,6 +3,7 @@ import pytest
 
 import batch_append as ba
 import ct_engine as ce
+import parallel
 import state_store as ss
 
 
@@ -141,15 +142,17 @@ class _Engine:
 
 
 class _Store:
-    """Records every StateStore call; ``advance_many`` can be made to fail."""
-    def __init__(self, fail_advance=False):
-        self.calls, self.fail_advance = [], fail_advance
+    """Records every StateStore call; ``advance_many`` can be made to fail; ``stopping_run`` answers ``stopping``."""
+    def __init__(self, fail_advance=False, stopping=False):
+        self.calls, self.fail_advance, self.stopping = [], fail_advance, stopping
 
     def __getattr__(self, name):
         def record(*args, **kw):
             if name == "advance_many" and self.fail_advance:
                 raise RuntimeError("Lakebase unavailable")
             self.calls.append((name, args, kw))
+            if name == "stopping_run":
+                return self.stopping
         return record
 
     def call(self, name):
@@ -238,6 +241,21 @@ def test_written_members_whose_checkpoint_advance_failed_are_reported_failed():
     assert [a[1] for a in engine.appends] == [[1, 2]]
     assert all(r["status"] == "failed" and "checkpoint advance failed" in r["detail"] for r in out["members"])
     assert store.call("record_failed_tables")[2] == {"stage": "checkpoint", "action": "increment"}
+
+
+def test_a_member_failing_in_a_cancelled_run_is_reported_cancelled():
+    engine, store, alone = _Engine(), _Store(fail_advance=True, stopping=True), []
+    out = _runner(engine, store, alone).run({"kind": "changes", "members": [_plan(1), _plan(2)]})
+    assert all(r["status"] == "cancelled" and "checkpoint advance failed" in r["detail"] for r in out["members"])
+
+
+def test_a_member_stopped_by_a_cancel_when_it_runs_alone_is_reported_cancelled():
+    def stopped(plan):
+        raise parallel.Cancelled("stopped by the cancel")
+    runner = ba.BatchRunner(None, _Store(), None, 42, per_table=stopped, guard=lambda: None,
+                            engine=_Engine(ensure_fails=True))
+    out = runner.run({"kind": "changes", "members": [_plan(1)]})
+    assert out["members"] == [{"item": 1, "pool": None, "status": "cancelled", "detail": "stopped by the cancel"}]
 
 
 # ---- row totals (ingest_run.detail) ------------------------------------------------------------------

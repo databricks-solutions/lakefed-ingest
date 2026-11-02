@@ -1,0 +1,124 @@
+# The check job: one run checks a group of collections on serverless, then starts lakefed_ingest only
+# for the collections with work, each for its databases with work, and ends (check_launch.ipynb). A
+# quiet cycle starts no ingest cluster.
+#
+# A group is `task_collections`: a schedule's members when an operations-app schedule in group mode
+# starts it (one wrapper job per schedule, which also passes the schedule's id, `schedule_id`, so the
+# check reads the members from Lakebase), or blank for every collection with enabled rows. Without an
+# app schedule, this job's own schedule (paused) is the cadence. The runs are started with run-now, as
+# the app's Run now starts them: no For each, and no job is created. The job's run-as identity needs
+# CAN_MANAGE_RUN on lakefed_ingest (the deployer has it on both). It starts no more runs than
+# lakefed_ingest's max_concurrent_runs leaves room for, unless lakefed_ingest's queue is on: then it
+# starts every run and Databricks queues those beyond the limit.
+resources:
+  jobs:
+    lakefed_ingest_check:
+      name: "lakefed_ingest_check"
+      description: "Checks a group of collections, then starts lakefed_ingest for those with work (no For each)."
+      # One run per group at a time is enough; groups of different schedules may check at once. Two checks
+      # of the same collection take turns on its lock, and the second leaves it to the first.
+      max_concurrent_runs: 20
+      queue:
+        enabled: true
+      schedule:
+        # Paused by default: the fallback cadence when no app schedule in group mode starts this job.
+        quartz_cron_expression: "0 0/15 * * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED
+      tasks:
+        - task_key: check
+          environment_key: lakebase_client
+          notebook_task:
+            notebook_path: ../src/lakefed_ingest/check_launch.ipynb
+            base_parameters:
+              task_collections: "{{job.parameters.task_collections}}"
+              schedule_id: "{{job.parameters.schedule_id}}"
+              ingest_job_id: "{{job.parameters.ingest_job_id}}"
+              launch_id: "{{task.run_id}}"
+              db_instance: "{{job.parameters.db_instance}}"
+              db_name: "{{job.parameters.db_name}}"
+              secret_scope: "{{job.parameters.secret_scope}}"
+              trust_server_certificate: "{{job.parameters.trust_server_certificate}}"
+              snapshot_isolation: "{{job.parameters.snapshot_isolation}}"
+              reseed_on_new_columns: "{{job.parameters.reseed_on_new_columns}}"
+              freshness_interval_s: "{{job.parameters.freshness_interval_s}}"
+              detection_chunk: "{{job.parameters.detection_chunk}}"
+              parallelism: "{{job.parameters.parallelism}}"
+              append_batch_size: "{{job.parameters.append_batch_size}}"
+              max_seeds_per_run: "{{job.parameters.max_seeds_per_run}}"
+              max_queries_per_source: "{{job.parameters.max_queries_per_source}}"
+              table_retries: "{{job.parameters.table_retries}}"
+              table_retry_budget: "{{job.parameters.table_retry_budget}}"
+              fail_on_table_errors: "{{job.parameters.fail_on_table_errors}}"
+              spark_conf: "{{job.parameters.spark_conf}}"
+              runs_by: "{{job.parameters.runs_by}}"
+              wait: "{{job.parameters.wait}}"
+              timeout_s: "{{job.parameters.timeout_s}}"
+      environments:
+        - environment_key: lakebase_client
+          spec:
+            environment_version: "4"
+            dependencies:
+              - "psycopg[binary]"
+              - "databricks-sdk==0.145.0"
+      tags:
+        business_unit: ""
+        project: lakefed_ingest
+      parameters:
+        # The group: comma-separated collections; blank = every collection with an enabled control row.
+        - name: task_collections
+          default: ""
+        # Or an operations-app ingestion job's id: its groups are read from Lakebase (a long list of groups
+        # doesn't fit in one job parameter, capped at 10,000 characters). Wins over task_collections.
+        - name: schedule_id
+          default: ""
+        # The ingestion job to start: the bundle's, or an app job's copy with its own cluster (cluster_copies.ipynb).
+        - name: ingest_job_id
+          default: ${resources.jobs.lakefed_ingest.id}
+        - name: db_instance
+          default: ${var.lakebase_instance}
+        - name: db_name
+          default: ${var.lakebase_database}
+        # The check reads the sources as the ingest does, with the same settings.
+        - name: secret_scope
+          default: ${var.secret_scope}
+        - name: trust_server_certificate
+          default: ${var.trust_server_certificate}
+        - name: snapshot_isolation
+          default: ${var.snapshot_isolation}
+        - name: reseed_on_new_columns
+          default: ${var.reseed_on_new_columns}
+        - name: freshness_interval_s
+          default: ${var.freshness_interval_s}
+        - name: detection_chunk
+          default: ${var.detection_chunk}
+        # Passed on to each ingest run only when set; blank keeps lakefed_ingest's own default.
+        - name: parallelism
+          default: ""
+        - name: append_batch_size
+          default: ""
+        - name: max_seeds_per_run
+          default: ""
+        - name: max_queries_per_source
+          default: ""
+        - name: table_retries
+          default: ""
+        - name: table_retry_budget
+          default: ""
+        - name: fail_on_table_errors
+          default: ""
+        - name: spark_conf
+          default: ""
+        # How a cycle's runs are made: "changes" shares the changed databases out over as many runs as their
+        # changed tables over the job's group size need, each database whole on one run (a group with a first
+        # load keeps a run of its own); "group" starts one run per group with work, as before, and is the default
+        # until the lab proof of "changes" passes (the proof sets runs_by on each run it starts).
+        - name: runs_by
+          default: "group"
+        # The check waits for the ingest runs it started and fails when one failed. timeout_s bounds that wait in
+        # seconds (0: no limit): the runs still going then are cancelled and the check fails. While it waits the
+        # check's serverless compute is idle, so this bound is also the most a cycle's wait can cost.
+        - name: wait
+          default: "true"
+        - name: timeout_s
+          default: "21600"

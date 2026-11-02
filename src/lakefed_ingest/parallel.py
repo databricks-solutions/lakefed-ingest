@@ -115,7 +115,9 @@ class WorkSlots:
 
     Each slot has a stable id; ``acquire()`` calls ``set_pool(f"pool{id}")`` on the current
     thread so the unit's Spark jobs land in that slot's FAIR scheduler pool (``capacity`` pools,
-    one per concurrent unit). ``peak`` records the most units ever in flight (for telemetry).
+    one per concurrent unit). Where the cluster refuses that (standard access mode can refuse
+    sparkContext), the units run on without FAIR pools: the first refusal is kept in ``pool_error``
+    and the pool is not asked for again. ``peak`` records the most units ever in flight (for telemetry).
 
     With ``sources`` (a ``SourceLimiter``), a unit that names the source it queries also holds one of
     that source's permits, taken BEFORE its slot: a slot then never waits on a source, and a permit
@@ -136,6 +138,7 @@ class WorkSlots:
         self._local = threading.local()   # per-thread list of pools used (see start_tracking)
         self.in_flight = 0
         self.peak = 0
+        self.pool_error: Optional[str] = None
 
     def start_tracking(self) -> None:
         """Start recording, for the CURRENT thread, the FAIR pools its units acquire."""
@@ -175,6 +178,14 @@ class WorkSlots:
             with self._held(taken):
                 yield taken[0]
 
+    def _apply_pool(self, pool: str) -> None:
+        try:
+            self._set_pool(pool)
+        except Exception as e:
+            self._set_pool = None
+            self.pool_error = self.pool_error or f"{type(e).__name__}: {str(e).splitlines()[0][:300] if str(e) else ''}"
+            print(f"FAIR pools unavailable on this cluster, units run without them ({self.pool_error})")
+
     def _permits(self, sources: List[Optional[str]]):
         if self.sources is None or not any(sources):
             return contextlib.nullcontext()
@@ -191,13 +202,17 @@ class WorkSlots:
             if tracked is not None and pool not in tracked:
                 tracked.append(pool)
             if self._set_pool is not None:
-                self._set_pool(pool)
+                self._apply_pool(pool)
             yield
         finally:
             with self._mu:
                 self.in_flight -= len(taken)
             for slot in taken:
                 self._free.put(slot)
+
+
+class Cancelled(Exception):
+    """Raised by a worker whose item was stopped by a cancel: the item is recorded as 'cancelled', not 'failed'."""
 
 
 def run_parallel(
@@ -218,7 +233,7 @@ def run_parallel(
     - ``item_id`` maps an item to a short identifier for the result record (default: the item).
 
     Returns one result dict per item, in input order:
-        {"item": <id>, "pool": <pool>, "status": "ok"|"failed", "detail": <worker return | error>}
+        {"item": <id>, "pool": <pool>, "status": "ok"|"failed"|"cancelled", "detail": <worker return | error>}
     """
     items = list(items)
     max_parallel = max(1, int(max_parallel))
@@ -234,6 +249,9 @@ def run_parallel(
             if set_pool is not None:
                 set_pool(pool)
             rec["detail"] = worker(item)
+        except Cancelled as e:
+            rec["status"] = "cancelled"
+            rec["detail"] = str(e)
         except Exception as e:  # isolate: one bad item must not fail the batch
             rec["status"] = "failed"
             rec["detail"] = str(e)
@@ -248,11 +266,14 @@ def run_parallel(
 
 
 def summarize(results: List[dict]) -> dict:
-    """Count results by status and by worker outcome (the 'detail' string on success)."""
-    summary = {"total": len(results), "ok": 0, "failed": 0, "by_outcome": {}}
+    """Count results by status and by worker outcome (the 'detail' string on success). A cancelled result is
+    counted apart from the failures, so a cancel never reads as a failure."""
+    summary = {"total": len(results), "ok": 0, "failed": 0, "cancelled": 0, "by_outcome": {}}
     for r in results:
         if r.get("status") == "failed":
             summary["failed"] += 1
+        elif r.get("status") == "cancelled":
+            summary["cancelled"] += 1
         else:
             summary["ok"] += 1
             outcome = str(r.get("detail"))

@@ -1,0 +1,110 @@
+# OPTIONAL Databricks asset bundle: the lakefed_ingest operations app (a Databricks App).
+# Deploy it only if your workspace allows Databricks Apps. The ingestion bundle (repo root) doesn't
+# depend on it. Deploy the ingestion bundle first; this app uses its Lakebase database and jobs.
+# See README.md in this directory.
+bundle:
+  name: lakefed_ingest_app
+
+include:
+  - resources/*.yml
+
+variables:
+  app_name:
+    description: App name (lowercase letters, digits and dashes; 30 characters max).
+    default: lakefed-ingest-ops
+  app_managers:
+    description: Who manages the app (sees Manage) besides workspace admins, users or groups, comma separated. By
+      default the user who deploys the bundle.
+    default: ${workspace.current_user.userName}
+  app_version:
+    description: The version the app shows under Manage. By default the commit deployed from; it is blank when the
+      bundle is deployed from a folder that isn't a git checkout, so pass --var app_version=<commit> there.
+    default: ${bundle.git.commit}
+  lakebase_instance:
+    description: Lakebase instance of the ingestion bundle (its `lakebase_instance` variable).
+    default: lakefed-ingest
+  lakebase_database:
+    description: Postgres database on that instance (the ingestion bundle's `lakebase_database`).
+    default: lakefed_ingest
+  ingest_job_id:
+    description: Id of the ingestion job. Looked up by name; in development mode the ingestion
+      bundle prefixes job names (e.g. "[dev your_name] lakefed_ingest"), so override per target.
+    lookup:
+      job: lakefed_ingest
+  setup_job_id:
+    description: Id of the schema setup job (looked up by name, like ingest_job_id).
+    lookup:
+      job: lakefed_ingest_setup
+  discover_job_id:
+    description: Id of the table discovery job (bulk import; looked up by name, like ingest_job_id).
+    lookup:
+      job: lakefed_ingest_discover
+  check_job_id:
+    description: Id of the check job (schedules of the check variant; looked up by name, like ingest_job_id).
+    lookup:
+      job: lakefed_ingest_check
+  source_connections:
+    description: Unity Catalog connections the app discovers through, comma-separated. The grants job gives the
+      app's service principal USE CONNECTION on each, as whoever runs it (that person needs to own or manage them).
+    default: ""
+  cluster_copies_job_id:
+    description: Id of the cluster copies job, which makes the ingestion job's copies for app jobs with their own
+      cluster (looked up by name, like ingest_job_id).
+    lookup:
+      job: lakefed_ingest_cluster_copies
+  delete_job_id:
+    description: Id of the delete job, which deletes a deleted app job's groups and, if asked, their target tables
+      (looked up by name, like ingest_job_id).
+    lookup:
+      job: lakefed_ingest_delete_job
+  deleted_job_retention_days:
+    description: Days a deleted job is kept, so it can be restored, before the delete job's daily run purges it. Must
+      equal deleted_job_retention_days in the engine bundle (the root databricks.yml), which the purge reads.
+    default: 7
+  discovery_warehouse_size:
+    description: Size of the serverless SQL warehouse discovery runs on (the connection test, the database list and the
+      tables of the chosen databases). Catalog queries only, so the smallest size; more clusters, not a bigger size, if
+      many statements queue.
+    default: 2X-Small
+  discovery_warehouse_max_clusters:
+    description: The most clusters the discovery warehouse scales out to when its statements queue.
+    default: 2
+  discovery_warehouse_auto_stop_mins:
+    description: Idle minutes before the discovery warehouse stops. It is used only while someone chooses tables.
+    default: 5
+  app_warehouse_id:
+    description: Id of a SQL warehouse of your own for the app's queries (the connection test, the database list, the
+      access checks and the table reads through remote_query), say one that runs in your network and reaches sources
+      serverless can't. Blank (the default) uses the bundle's own discovery warehouse. It must be Pro or serverless, on
+      version 2025.35 or above; remote_query doesn't run on a Classic warehouse. The lakefed_ingest_app_grants job gives
+      the app's service principal CAN_USE on it, as whoever runs that job (who needs CAN_MANAGE on the warehouse).
+    default: ""
+  jdbc_login_scope:
+    description: Secret scope for the JDBC logins users type into the operations app. This bundle creates it, so its
+      deployer holds MANAGE; the lakefed_ingest_app_grants job gives the app's service principal WRITE on it and nothing
+      more. Deploy this bundle as the user who runs the ingestion jobs, since that user is the scope's creator (MANAGE)
+      and the jobs read the logins as their run-as identity.
+    default: lakefed_ingest_jdbc_logins
+  reads_start_cap:
+    description: How many databases of one source server are read through the warehouse at once to begin with (one
+      statement each, counted across every discovery and app instance). The app raises it by 4 while each read keeps
+      its time, and lowers it by 4, never below 4, once reads slow down (the source or the warehouse is saturated).
+    default: 8
+  reads_max_cap:
+    description: The most databases of one source server read through the warehouse at once; reads_start_cap rises no
+      higher.
+    default: 32
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://company-dev.cloud.databricks.com/
+
+
+  prod:
+    mode: production
+    workspace:
+      host: https://company-prd.cloud.databricks.com/
+      root_path: /Workspace/${bundle.name}
