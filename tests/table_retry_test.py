@@ -181,11 +181,44 @@ def _policy(retries=2, budget=20, per_source=5):
     (RuntimeError("Invalid object name 'dbo.orders'."), tr.PERMANENT),
     (RuntimeError("The SELECT permission was denied on the object 'orders'"), tr.PERMANENT),
     (RuntimeError(ce.CT_TABLE_NOT_ENABLED_MSG), tr.PERMANENT),
+    (RuntimeError(ce.SOURCE_TABLE_NOT_FOUND_MSG.format(table="[dbo].[t]")), tr.PERMANENT),
     (RuntimeError("collection lock lost; table deferred to the next sweep"), tr.PERMANENT),
     (RuntimeError(f"{ce.RETENTION_LAPSED_MARKER}: Connection reset"), tr.PERMANENT),   # never wins over transient
     (ValueError("control row 3: Connection reset"), tr.PERMANENT),            # a configuration error
     (RuntimeError("[DELTA_FAILED_TO_MERGE_FIELDS] Failed to merge fields 'v'"), tr.PERMANENT),
-    (RuntimeError("something nobody has seen before"), tr.PERMANENT),         # unknown: as today
+    (RuntimeError("something nobody has seen before"), tr.UNKNOWN),          # no rule: one retry, then fails
+    # bad data (SQLSTATE class 22) and Spark's schema-compatibility and Delta schema-change classes
+    (RuntimeError("[NUMERIC_VALUE_OUT_OF_RANGE] 1e9 cannot be represented. SQLSTATE: 22003"), tr.PERMANENT),
+    (RuntimeError('org.postgresql.util.PSQLException: ERROR: invalid input syntax for type integer: "x" '
+                  "state=22P02"), tr.PERMANENT),
+    (_spark_error(cause=_JavaError("org.postgresql.util.PSQLException", "ERROR: value too long for type varchar(3)",
+                                   0, "22001")), tr.PERMANENT),
+    (RuntimeError("[INCOMPATIBLE_DATA_FOR_TABLE.CANNOT_SAFELY_CAST] Cannot write incompatible data for table `x`"),
+     tr.PERMANENT),
+    (RuntimeError("[DELTA_SCHEMA_CHANGE] The schema of your Delta table has changed in an incompatible way"),
+     tr.PERMANENT),
+    (RuntimeError("[DELTA_SCHEMA_CHANGE_SINCE_ANALYSIS] The schema changed since the query was analyzed"),
+     tr.PERMANENT),
+    # deadlocks and serialization failures: the victim's transaction runs again and succeeds
+    (RuntimeError("com.microsoft.sqlserver.jdbc.SQLServerException: Transaction (Process ID 61) was deadlocked on "
+                  "lock resources with another process and has been chosen as the deadlock victim."), tr.TRANSIENT),
+    (_spark_error(cause=_JavaError("org.postgresql.util.PSQLException", "ERROR: deadlock detected", 0, "40P01")),
+     tr.TRANSIENT),
+    (RuntimeError("org.postgresql.util.PSQLException: ERROR: could not serialize access due to concurrent update "
+                  "state=40001"), tr.TRANSIENT),
+    (RuntimeError("java.sql.SQLTransactionRollbackException: Transaction was rolled back SQLSTATE: 40001"),
+     tr.TRANSIENT),
+    # a cancelled query (SQLSTATE 57014, e.g. a statement timeout or a cancel from the server side)
+    (_spark_error(cause=_JavaError("org.postgresql.util.PSQLException",
+                                   "ERROR: canceling statement due to statement timeout", 0, "57014")), tr.TRANSIENT),
+    (RuntimeError("java.sql.SQLException: ORA-01013: user requested cancel of current operation SQLSTATE: 57014"),
+     tr.TRANSIENT),
+    # Oracle listener: no instance of the service is up, or all of them are blocking new connections
+    (RuntimeError("java.sql.SQLRecoverableException: IO Error: The Network Adapter could not establish the connection "
+                  "ORA-12514: TNS:listener does not currently know of service requested in connect descriptor"),
+     tr.TRANSIENT),
+    (RuntimeError("java.sql.SQLRecoverableException: ORA-12528: TNS:listener: all appropriate instances are blocking "
+                  "new connections"), tr.TRANSIENT),
     # the other source adapters: Spark wraps their refused logins in FAILED_JDBC.CONNECTION too
     (_spark_error(cause=_JavaError("java.sql.SQLException", "ORA-01017: invalid username/password; logon denied",
                                    1017, "72000")), tr.PERMANENT),
@@ -209,14 +242,24 @@ def _policy(retries=2, budget=20, per_source=5):
      tr.TRANSIENT),
     (RuntimeError("com.microsoft.sqlserver.jdbc.SQLServerException: An error occurred during the current command "
                   "(Done status 0)."), tr.TRANSIENT),
-    (RuntimeError("An error occurred during the current command (Done status 0)."), tr.PERMANENT),   # no driver
+    (RuntimeError("An error occurred during the current command (Done status 0)."), tr.UNKNOWN),   # no driver
     (RuntimeError("com.microsoft.sqlserver.jdbc.SQLServerException: An error occurred during the current command "
-                  "(Done status 16)."), tr.PERMANENT),
+                  "(Done status 16)."), tr.UNKNOWN),
     (RuntimeError("com.microsoft.sqlserver.jdbc.SQLServerException: Invalid object name 'gen.h0800'. "
                   "An error occurred during the current command (Done status 0)."), tr.PERMANENT),  # deny wins
+    # Unity Catalog throttling a remote_query read (a 100,000-table lab load, 29 Oct: lfc_eng_065.gen.t0936)
+    (RuntimeError("[UC_SERVER_UNCAUGHT_EXCEPTION] Unity Catalog error: TEMPORARILY_UNAVAILABLE: Too many requests. "
+                  "Please retry later. SQLSTATE: XXKUC"), tr.TRANSIENT),
+    (RuntimeError("REQUEST_LIMIT_EXCEEDED: the rate limit for this API has been exceeded"), tr.TRANSIENT),
+    (RuntimeError("[TABLE_OR_VIEW_NOT_FOUND] gen.t0936 TEMPORARILY_UNAVAILABLE"), tr.PERMANENT),     # deny wins
 ])
 def test_classify_retries_transient_source_errors_only(error, expected):
     assert tr.classify(error) == expected
+
+
+def test_a_permanent_rule_wins_over_a_transient_one_in_the_same_message():
+    message = "[INCOMPATIBLE_DATA_FOR_TABLE] write failed after a deadlock on the retry"
+    assert tr.classify(RuntimeError(message)) == tr.PERMANENT
 
 
 def test_describe_adds_the_java_cause_spark_leaves_out():
@@ -251,6 +294,33 @@ def test_a_permanent_failure_fails_at_once_without_a_pause():
     assert policy.summary()["retries"] == 0 and policy.summary()["budget_left"] == 20
 
 
+# ---- 3b. an unknown error gets one retry, then fails as permanent ------------------------------------------
+
+def test_an_unknown_failure_is_retried_once_and_then_fails():
+    unknown = "something nobody has seen before"
+    sink, policy, sleeps = _Sink(faults={1: ["before", "before"]}, error=unknown), _policy(), []
+    worker = _Worker(sink, policy)
+    assert _run(worker, policy, [_plan(1)], sleeps)[0][0] == "failed"
+    assert worker.events == [(1, "retried", "seed", 0), (1, "failed", "seed", 1)] and len(sleeps) == 1
+    assert policy.summary()["retries"] == 1 and policy.summary()["failed_after_retry"] == 1
+
+
+def test_an_unknown_failure_that_recovers_on_its_retry_is_not_a_failure():
+    sink, policy, sleeps = _Sink(faults={1: ["before"]}, error="something nobody has seen before"), _policy(), []
+    worker = _Worker(sink, policy)
+    assert _run(worker, policy, [_plan(1)], sleeps) == [("ok", "seeded")]
+    assert worker.events == [(1, "retried", "seed", 0), (1, "ok", "checkpoint", 1)]
+    assert policy.summary()["recovered"] == 1
+
+
+def test_claim_grants_an_unknown_error_one_retry_and_a_permanent_one_none():
+    policy, cfg = _policy(retries=3), _cfg(1)
+    assert policy.claim(cfg, RuntimeError("something nobody has seen before"), 0) is not None
+    assert policy.claim(cfg, RuntimeError("something nobody has seen before"), 1) is None
+    assert policy.claim(cfg, RuntimeError("Invalid object name 'dbo.orders'."), 0) is None
+    assert policy.claim(cfg, _spark_error(), 1) is not None      # a transient error keeps its retries
+
+
 # ---- 4. the run's budget -----------------------------------------------------------------------------------
 
 def test_once_the_budget_is_spent_failures_fail_at_once():
@@ -260,6 +330,36 @@ def test_once_the_budget_is_spent_failures_fail_at_once():
     assert [o[0] for o in out] == ["ok", "ok", "failed", "failed", "failed"] and len(sleeps) == 2
     summary = policy.summary()
     assert (summary["retries"], summary["budget_left"], summary["budget_exhausted"]) == (2, 0, True)
+
+
+# ---- 4b. a budget of 0: no retries at all -----------------------------------------------------------------
+
+def test_the_default_budget_is_zero_so_no_table_is_retried_until_a_job_raises_it():
+    assert tr.DEFAULT_BUDGET == 0 and tr.RetryPolicy().budget == 0 and tr.RetryPolicy(retries=2).budget == 0
+
+
+def test_with_a_budget_of_zero_a_transient_failure_fails_at_once_and_is_not_reported_as_spent():
+    sink, policy, sleeps = _Sink(faults={1: ["before"]}), _policy(retries=2, budget=0), []
+    worker = _Worker(sink, policy)
+    assert _run(worker, policy, [_plan(1)], sleeps)[0][0] == "failed"
+    assert worker.events == [(1, "failed", "seed", 0)] and sleeps == []
+    assert policy.summary() == {"retries": 0, "recovered": 0, "failed_after_retry": 0, "budget": 0, "budget_left": 0,
+                                "budget_exhausted": False, "sources_stopped": [], "by_class": {}}
+
+
+def test_with_a_budget_of_zero_an_unknown_failure_fails_at_once_without_its_one_retry():
+    sink = _Sink(faults={1: ["before"]}, error="something nobody has seen before")
+    policy, sleeps = _policy(budget=0), []
+    worker = _Worker(sink, policy)
+    assert _run(worker, policy, [_plan(1)], sleeps)[0][0] == "failed"
+    assert worker.events == [(1, "failed", "seed", 0)] and sleeps == []
+
+
+def test_claim_with_a_budget_of_zero_grants_no_retry_whatever_the_error():
+    policy, cfg = _policy(retries=3, budget=0), _cfg(1)
+    assert policy.claim(cfg, _spark_error(), 0) is None
+    assert policy.claim(cfg, RuntimeError("something nobody has seen before"), 0) is None
+    assert policy.summary()["retries"] == 0 and policy.summary()["budget_exhausted"] is False
 
 
 # ---- 5. a source that keeps failing stops retrying ---------------------------------------------------------
@@ -465,3 +565,12 @@ def test_the_spark_condition_is_read_once_preferring_the_current_name():
             return "08001"
     error = _Captured("Failed to connect to the database.")
     assert tr.classify(error) == tr.TRANSIENT and _Captured.calls == ["getCondition"]
+
+
+def test_a_spark_cancellation_is_recognised_from_text_and_exception_and_never_retried():
+    cancelled = "org.apache.spark.SparkException: [SPARK_JOB_CANCELLED] Job 12 cancelled part of cancelled job group"
+    aborted = RuntimeError("Job aborted due to cancellation: stage 4 was cancelled")
+    assert tr.is_cancellation(cancelled) and tr.is_cancellation(aborted)
+    assert tr.classify(aborted) == tr.PERMANENT
+    assert not tr.is_cancellation("Connection reset by peer")
+    assert not tr.is_cancellation("")

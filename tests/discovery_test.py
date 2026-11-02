@@ -1,4 +1,6 @@
 """Table discovery: recommendations per table, assembly of the catalog queries, helpers."""
+import re
+
 import pytest
 
 import discovery as d
@@ -129,3 +131,273 @@ def test_nullable_rowversion_is_not_a_cursor_candidate():
     rec = d.recommend({"ct_enabled": 0}, cols, ["id"])
     assert rec["load_type"] == "full" and rec["cursor_column"] is None
     assert "is_nullable" in d.COLUMNS_SQL
+
+
+def test_a_discovery_through_a_uc_connection_reads_with_no_secret():
+    cfg = d.cfg_for({"src_connection": "sql_a"}, "eng_001")
+    assert cfg == {"id": 0, "src_type": "sqlserver", "src_database": "eng_001", "src_connection": "sql_a",
+                   "use_remote_query": True}
+    jdbc = d.cfg_for({"src_host": "h1", "src_port": 1433, "secret_key_template": "creds-{database}"}, "eng_001")
+    assert (jdbc["src_host"], jdbc["secret_key"]) == ("h1", "creds-eng_001") and "use_remote_query" not in jdbc
+
+
+def test_listing_keeps_how_a_discovery_listed_but_never_the_secret():
+    spec = {"src_host": "h1", "secret_key": "s3cret", "secret_key_template": "creds-{database}", "pattern": "lfc_%",
+            "azure_credential": "", "azure_resource_id": "/subscriptions/x", "databases": "*"}
+    assert d.listing_of(spec) == {"pattern": "lfc_%", "secret_key_template": "creds-{database}",
+                                  "azure_resource_id": "/subscriptions/x"}
+    assert d.listing_of({"src_connection": "sql_a", "databases": ["a"]}) == {}
+    assert d.listing_of({"src_host": "h1", "secret_key": "creds-a", "jdbc_connection": "orders_jdbc"}) == {
+        "jdbc_connection": "orders_jdbc"}
+
+
+@pytest.mark.parametrize("spec,error", [
+    ({"databases": ["a"]}, "src_connection (a UC connection) or src_host"),
+    ({"src_host": "h1", "databases": ["a"]}, "secret_key"),
+    ({"src_connection": "sql_a"}, "databases"),
+])
+def test_a_spec_says_what_it_lacks(spec, error):
+    assert any(error in e for e in d.spec_errors(spec))
+
+
+def test_listing_only_needs_a_connection_and_no_databases():
+    assert d.spec_errors({"src_connection": "sql_a", "kind": "list"}) == []
+    assert d.spec_errors({"src_connection": "sql_a", "databases": "*"}) == []
+
+
+def test_a_servers_databases_are_read_through_master():
+    seen = []
+    names = d.list_databases({"src_connection": "sql_a"}, query=lambda cfg, sql: seen.append((cfg, sql)) or
+                             [{"name": "eng_001"}, {"name": "eng_002"}])
+    assert names == ["eng_001", "eng_002"]
+    cfg, sql = seen[0]
+    assert cfg["src_database"] == "master" and cfg["use_remote_query"] and sql == d.databases_sql("")
+    assert "database_id > 4" in sql and "ONLINE" in sql
+    with pytest.raises(ValueError):
+        d.list_databases({"src_connection": "ora", "src_type": "oracle"}, query=lambda cfg, sql: [])
+
+
+def test_databases_are_listed_by_name_not_by_access_through_master():
+    # A contained user in each database has no access through master, so HAS_DBACCESS would list none of them.
+    assert "HAS_DBACCESS" not in d.databases_sql("")
+    seen = []
+    d.list_databases({"src_connection": "sql_a", "pattern": "lfc_eng_%"}, query=lambda cfg, sql: seen.append(sql) or [])
+    assert seen == ["SELECT name FROM sys.databases WHERE database_id > 4 AND state_desc = 'ONLINE' "
+                    "AND name LIKE N'lfc_eng_%'"]
+
+
+@pytest.mark.parametrize("pattern", ["x' OR 1=1 --", "a b", "a;drop", "x" * 129])
+def test_a_filter_that_isnt_a_plain_name_pattern_is_refused(pattern):
+    assert d.pattern_errors(pattern) and d.spec_errors({"src_connection": "sql_a", "kind": "list", "pattern": pattern})
+    with pytest.raises(ValueError):
+        d.databases_sql(pattern)
+
+
+@pytest.mark.parametrize("pattern", ["", "lfc_eng_%", "eng_0[0-4]%", "sales-2024.%"])
+def test_name_patterns_as_like_reads_them_are_taken(pattern):
+    assert d.pattern_errors(pattern) == []
+
+
+# The two lab connections, as found on 29 Oct: one whose login is a user contained in each database (it opens
+# every lab database but not master), and one whose login is a server login with ##MS_DefinitionReader## (master
+# lists all 201 databases, though HAS_DBACCESS there is 0 for every one of them).
+LAB = ([f"lfc_eng_{i:03d}" for i in range(1, 101)] + ["lfc_test"] + [f"lfc_test_{i:03d}" for i in range(1, 51)]
+       + [f"lfc_heavy_{i:03d}" for i in range(1, 51)])
+CANT_OPEN_MASTER = ("[FAILED_JDBC.CONNECTION] Failed JDBC on the operation: Failed to connect to the database. "
+                    "SQLSTATE: HV000")
+
+
+def _server_login(cfg, sql):
+    """master as the server login sees it: every database by name, whatever HAS_DBACCESS would say."""
+    assert cfg["src_database"] == "master" and "HAS_DBACCESS" not in sql
+    like = re.search(r"name LIKE N'([^']*)'", sql)
+    pattern = re.compile("^" + "".join(".*" if c == "%" else "." if c == "_" else re.escape(c)
+                                       for c in (like.group(1) if like else "%")) + "$")
+    return [{"name": n} for n in LAB if pattern.match(n)]
+
+
+def _contained_user(cfg, sql):
+    if cfg["src_database"] == "master":
+        raise RuntimeError(CANT_OPEN_MASTER)
+    return []
+
+
+def test_a_contained_user_cant_list_and_its_typed_databases_are_read_by_name_never_through_master():
+    spec = {"src_connection": "lfc_sqlserver_test", "kind": "list"}
+    with pytest.raises(RuntimeError, match="FAILED_JDBC.CONNECTION"):
+        d.list_databases(spec, query=_contained_user)       # the notebook records it on the master row
+    typed = {"src_connection": "lfc_sqlserver_test", "databases": ["lfc_eng_001", "lfc_eng_002"]}
+    assert not d.needs_listing(typed) and d.spec_errors(typed) == []
+    assert [d.cfg_for(typed, db)["src_database"] for db in typed["databases"]] == ["lfc_eng_001", "lfc_eng_002"]
+
+
+def test_a_server_login_lists_all_201_databases_by_name_and_the_filter_narrows_them_to_the_lab():
+    spec = {"src_connection": "lfc_sqlserver_discover", "kind": "list"}
+    assert d.needs_listing(spec) and len(d.list_databases(spec, query=_server_login)) == 201
+    lab = d.list_databases(dict(spec, pattern="lfc_eng_%"), query=_server_login)
+    assert lab == [f"lfc_eng_{i:03d}" for i in range(1, 101)]
+
+
+def test_a_whole_server_discovery_lists_with_the_same_filter():
+    spec = {"src_connection": "lfc_sqlserver_discover", "databases": "*", "pattern": "lfc_eng_%"}
+    assert d.needs_listing(spec) and d.spec_errors(spec) == []
+    assert len(d.list_databases(spec, query=_server_login)) == 100
+
+
+def test_a_database_the_login_can_name_but_not_open_fails_on_its_own(monkeypatch):
+    # discover_tables.ipynb reads each database in its own try (one()), recording a failure on that database's row
+    # and going on: so the reading of a database raises, and the others are read as usual.
+    def catalog(cfg, sql, *args):
+        if cfg["src_database"] == "lfc_heavy_001":
+            raise RuntimeError('Cannot open database "lfc_heavy_001" requested by the login. The login failed.')
+        return []
+    monkeypatch.setattr(d, "_query", catalog)
+    spec = {"src_connection": "lfc_sqlserver_discover", "databases": ["lfc_eng_001", "lfc_heavy_001", "lfc_eng_002"]}
+    read, failed = {}, {}
+    for db in spec["databases"]:
+        try:
+            read[db] = d.discover_database(d.cfg_for(spec, db))
+        except RuntimeError as e:
+            failed[db] = str(e)
+    assert sorted(read) == ["lfc_eng_001", "lfc_eng_002"] and list(failed) == ["lfc_heavy_001"]
+
+
+# Listing an Azure SQL server's databases through Azure Resource Manager, with a Unity Catalog service credential:
+# the credential and the HTTP call are faked; nothing reaches Azure.
+SERVER_ID = "/subscriptions/0000-1111/resourceGroups/rg-lab/providers/Microsoft.Sql/servers/lab-sql"
+LIST_URL = f"https://management.azure.com{SERVER_ID}/databases?api-version=2023-08-01"
+THROUGH_AZURE = {"src_connection": "lfc_sqlserver_test", "kind": "list", "azure_credential": "lab_reader",
+                 "azure_resource_id": SERVER_ID}
+
+
+class _Credential:
+    """dbutils.credentials.getServiceCredentialsProvider's provider, as azure-identity uses it."""
+    def __init__(self):
+        self.scopes = []
+
+    def get_token(self, scope):
+        self.scopes.append(scope)
+        return type("Token", (), {"token": f"token-{len(self.scopes)}"})()
+
+
+def _azure(pages, calls=None):
+    """Azure Resource Manager's list as pages, keyed by URL; each value is a page or an error to raise."""
+    def get(url, token):
+        if calls is not None:
+            calls.append((url, token))
+        answer = pages[url]
+        if isinstance(answer, list):
+            answer = answer.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+    return get
+
+
+def _refusal(code, body=b"", headers=None):
+    import email.message
+    import io
+    import urllib.error
+    message = email.message.Message()
+    for key, value in (headers or {}).items():
+        message[key] = value
+    return urllib.error.HTTPError(LIST_URL, code, "refused", message, io.BytesIO(body))
+
+
+def _db(name, status="Online"):
+    return {"name": name, "properties": {"status": status}}
+
+
+def test_azure_lists_the_lab_servers_databases_page_by_page_with_a_token_for_each_page():
+    second = LIST_URL + "&$skiptoken=page2"
+    calls, credential = [], _Credential()
+    get = _azure({LIST_URL: {"value": [_db("master")] + [_db(n) for n in LAB[:120]], "nextLink": second},
+                  second: {"value": [_db(n) for n in LAB[120:]]}}, calls)
+    assert d.needs_listing(THROUGH_AZURE) and d.lists_through_azure(THROUGH_AZURE)
+    assert d.spec_errors(THROUGH_AZURE) == []
+    names = d.list_databases(THROUGH_AZURE, query=lambda cfg, sql: pytest.fail("not through master"),
+                             credential=credential, get=get)
+    assert len(names) == 201 and "master" not in names and names == sorted(LAB)
+    assert [url for url, _ in calls] == [LIST_URL, second] and [t for _, t in calls] == ["token-1", "token-2"]
+    assert credential.scopes == ["https://management.azure.com/.default"] * 2
+
+
+def test_the_filter_reads_as_like_does_on_the_names_azure_lists():
+    get = _azure({LIST_URL: {"value": [_db(n) for n in LAB] + [_db("LFC_ENG_999")]}})
+    spec = dict(THROUGH_AZURE, pattern="lfc_eng_%")
+    assert d.list_databases(spec, credential=_Credential(), get=get) == [f"lfc_eng_{i:03d}" for i in range(1, 101)] + [
+        "LFC_ENG_999"]
+    get = _azure({LIST_URL: {"value": [_db(n) for n in LAB]}})
+    assert d.list_databases(dict(spec, pattern="lfc_eng_0[0-1]_"), credential=_Credential(), get=get) == [
+        f"lfc_eng_{i:03d}" for i in range(1, 20)]
+    for pattern, name, matches in [("lfc_test", "lfc_test", True), ("lfc_test", "lfc_test_001", False),
+                                   ("a.b", "axb", False), ("[[]x", "[x", True), ("a[b", "a[b", True)]:
+        assert bool(d.like(pattern).match(name)) is matches, (pattern, name)
+
+
+def test_system_databases_and_those_that_cant_be_opened_are_left_out():
+    listed = [_db("master"), _db("eng_paused", "Paused"), _db("eng_new", "Creating"), _db("eng_off", "Offline"),
+              {"name": "eng_plain"}, _db("eng_ok")]
+    get = _azure({LIST_URL: {"value": listed}})
+    assert d.list_databases(THROUGH_AZURE, credential=_Credential(), get=get) == ["eng_ok", "eng_paused", "eng_plain"]
+
+
+def test_a_managed_instance_lists_the_same_way():
+    instance = "/subscriptions/0000-1111/resourceGroups/rg-lab/providers/Microsoft.Sql/managedInstances/lab-mi"
+    spec = dict(THROUGH_AZURE, azure_resource_id=instance)
+    url = f"https://management.azure.com{instance}/databases?api-version=2023-08-01"
+    assert d.spec_errors(spec) == []
+    assert d.list_databases(spec, credential=_Credential(), get=_azure({url: {"value": [_db("sales")]}})) == ["sales"]
+
+
+def test_azure_throttling_is_waited_out_and_a_refusal_says_what_to_grant():
+    waits = []
+    get = _azure({LIST_URL: [_refusal(429, headers={"Retry-After": "7"}), _refusal(503), {"value": [_db("eng")]}]})
+    assert d.azure_databases(THROUGH_AZURE, _Credential(), get=get, sleep=waits.append) == ["eng"]
+    assert waits == [7.0, 10.0]
+    denied = _refusal(403, b'{"error": {"code": "AuthorizationFailed", "message": "no access"}}')
+    with pytest.raises(RuntimeError, match=r"\(HTTP 403 AuthorizationFailed\): give the service credential's managed "
+                                           r"identity \(its access connector's\) Reader on the server"):
+        d.azure_databases(THROUGH_AZURE, _Credential(), get=_azure({LIST_URL: denied}), sleep=waits.append)
+    with pytest.raises(RuntimeError, match="HTTP 404.*check the server's resource id"):
+        d.azure_databases(THROUGH_AZURE, _Credential(), get=_azure({LIST_URL: _refusal(404)}))
+    always = _azure({LIST_URL: [_refusal(500)] * 4})
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        d.azure_databases(THROUGH_AZURE, _Credential(), get=always, sleep=lambda s: None)
+
+
+def test_the_token_never_follows_a_next_page_outside_azure_resource_manager():
+    calls = []
+    get = _azure({LIST_URL: {"value": [_db("eng")], "nextLink": "https://elsewhere.example.com/databases"}}, calls)
+    with pytest.raises(RuntimeError, match="outside https://management.azure.com"):
+        d.azure_databases(THROUGH_AZURE, _Credential(), get=get)
+    assert [url for url, _ in calls] == [LIST_URL]
+
+
+@pytest.mark.parametrize("change,error", [
+    ({"azure_resource_id": None}, "needs both azure_credential"),
+    ({"azure_credential": ""}, "needs both azure_credential"),
+    ({"azure_credential": "lab reader"}, "azure_credential 'lab reader'"),
+    ({"azure_resource_id": SERVER_ID + "/../../x"}, "azure_resource_id"),
+    ({"azure_resource_id": SERVER_ID + "?api-version=1"}, "azure_resource_id"),
+    ({"azure_resource_id": "/subscriptions/0000/resourceGroups/rg/providers/Microsoft.Web/sites/app"}, "resource_id"),
+    ({"azure_resource_id": "https://evil.example.com" + SERVER_ID}, "azure_resource_id"),
+])
+def test_a_listing_through_azure_says_what_it_lacks(change, error):
+    assert any(error in e for e in d.spec_errors(dict(THROUGH_AZURE, **change)))
+
+
+def test_without_both_settings_the_server_is_listed_through_master_as_before():
+    assert not d.lists_through_azure({"src_connection": "sql_a", "kind": "list"})
+    listed = d.list_databases({"src_connection": "lfc_sqlserver_discover", "kind": "list"}, query=_server_login)
+    assert listed == sorted(LAB)
+    with pytest.raises(ValueError, match="service credential 'lab_reader'"):
+        d.list_databases(THROUGH_AZURE)
+
+
+def test_workers_are_the_requested_count_bounded_by_the_databases_and_the_source_cap():
+    assert d.workers_for(d.DEFAULT_WORKERS, 22_000) == 32
+    assert d.workers_for(32, 5) == 5
+    assert d.workers_for(32, 22_000, max_queries_per_source=8) == 8
+    assert d.workers_for(32, 22_000, max_queries_per_source=0) == 32
+    assert d.workers_for(0, 10) == 1 and d.workers_for(32, 0) == 1

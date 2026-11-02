@@ -1,0 +1,45 @@
+# Cluster copies: one copy of lakefed_ingest per operations-app job that sets its own cluster (driver type, worker
+# type, worker count), since neither a run_job task nor run-now can change a job's cluster (cluster_copies.ipynb).
+# It runs as the deployer, like lakefed_ingest, so each copy runs with exactly the ingestion job's rights; the app's
+# service principal could not make them itself (a job it creates runs as the service principal). The app starts
+# this job when an app job's cluster changes and on Sync jobs; it needs CAN_MANAGE_RUN on it (an app resource).
+resources:
+  jobs:
+    lakefed_ingest_cluster_copies:
+      name: "lakefed_ingest_cluster_copies"
+      description: "Makes, updates and deletes the copies of lakefed_ingest that app jobs with their own cluster run."
+      # One at a time, queued: two copies runs for one schedule must not both create its copy.
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
+      tasks:
+        - task_key: copies
+          environment_key: lakebase_client
+          notebook_task:
+            notebook_path: ../src/lakefed_ingest/cluster_copies.ipynb
+            base_parameters:
+              schedule_id: "{{job.parameters.schedule_id}}"
+              app_service_principal: "{{job.parameters.app_service_principal}}"
+              ingest_job_id: ${resources.jobs.lakefed_ingest.id}
+              db_instance: "{{job.parameters.db_instance}}"
+              db_name: "{{job.parameters.db_name}}"
+      environments:
+        - environment_key: lakebase_client
+          spec:
+            environment_version: "4"
+            dependencies:
+              - "psycopg[binary]"
+              - "databricks-sdk==0.145.0"
+      tags:
+        project: lakefed_ingest
+      parameters:
+        # The schedule to copy for (blank = every schedule), and the app's service principal (its application id),
+        # which gets Can Manage on each copy. The app passes both.
+        - name: schedule_id
+          default: ""
+        - name: app_service_principal
+          default: ""
+        - name: db_instance
+          default: ${var.lakebase_instance}
+        - name: db_name
+          default: ${var.lakebase_database}

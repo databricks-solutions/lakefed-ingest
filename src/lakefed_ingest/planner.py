@@ -23,8 +23,9 @@ the advanced checkpoint (at-least-once; the MERGE is idempotent).
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
-from typing import Optional, Callable, Dict, List, Tuple
+from typing import Optional, Callable, Dict, Iterable, List, Tuple
 
 import ct_engine
 import cursor_engine
@@ -130,6 +131,67 @@ def config_error(cfg: dict, mixed_sinks=frozenset(), snapshot_isolation: bool = 
         return ("sink {}.{}.{} is claimed by a dedicated row (client_id NULL) and by other rows; a sink is "
                 "either dedicated to one source table or shared by client_id".format(*sink_key(cfg)))
     return None
+
+
+def locked_run_status(work_id: str) -> str:
+    """How a run that finds its collection locked by another sweep ends. A run with a work list was started
+    for databases that only it would ingest, so it fails; a run without one is a plain skip."""
+    return "failed" if str(work_id or "").strip() else "skipped"
+
+
+def work_database_keys(task_collection: str, work: Iterable[tuple]) -> Dict[str, tuple]:
+    """{lock key: (source, src_database)} for a work list's databases (``state_store.database_lock_key``)."""
+    return {ss.database_lock_key(task_collection, source, database): (source, database)
+            for source, database in sorted({(str(s), str(d)) for s, d in work})}
+
+
+def work_after_locks(work: Iterable[tuple], keys: Dict[str, tuple], held: set) -> Tuple[set, List[tuple]]:
+    """A work-list run's databases once it has tried their locks: (the ones it keeps, the ones another run holds).
+    A database another run holds (two overlapping checks gave it to both) is skipped, not failed: the run that holds
+    it ingests it, and if not, the next cycle's check finds it again (it was never stamped)."""
+    kept = {keys[key] for key in held if key in keys}
+    return {tuple(item) for item in work if tuple(item) in kept}, sorted(set(keys.values()) - kept)
+
+
+def cycle_parts(work_all: Iterable[tuple]) -> List[str]:
+    """The collections a run of a cycle's share takes, in turn and in name order, from its whole work list
+    ({(task_collection, source, src_database)}, ``StateStore.get_check_work_all``)."""
+    return sorted({str(collection) for collection, _, _ in work_all})
+
+
+def cycle_summary(work_id: str, parts: Dict[str, dict]) -> dict:
+    """How a run of a cycle's share ended, from each part's own answer (its notebook exit, or the error that
+    stopped it): the parts that failed fail the run; skipped ones (locked, or nothing of theirs left) don't. A part
+    with failed tables ends as failed (its run raises, see ``failure_message``), so it fails the cycle too."""
+    status = {name: str(answer.get("status") or "completed") for name, answer in parts.items()}
+    return {"work_id": work_id, "parts": len(parts),
+            "failed": sorted(name for name, s in status.items() if s == "failed"),
+            "skipped": sorted(name for name, s in status.items() if s in ("skipped", "migration_waiting")),
+            "tables": sum(int(a.get("total") or 0) for a in parts.values()),
+            "ok": sum(int(a.get("ok") or 0) for a in parts.values()),
+            "run_ids": {name: a.get("run_id") for name, a in parts.items()}}
+
+
+FAILURE_TABLES_NAMED = 5
+
+
+def failure_message(run_id, task_collection: str, failed: List[tuple], link: str = "") -> str:
+    """The error a run ends with when tables failed: how many, the first few with their errors, and where to
+    look for the rest. ``failed`` is (control row, error) pairs in the order they failed."""
+    lines = [f"{len(failed)} table(s) failed in run {run_id} of {task_collection}:"]
+    for cfg, error in failed[:FAILURE_TABLES_NAMED]:
+        lines.append(f"{cfg['src_database']}.{cfg['src_schema']}.{cfg['src_table']}: {str(error)[:200]}")
+    if len(failed) > FAILURE_TABLES_NAMED:
+        lines.append(f"and {len(failed) - FAILURE_TABLES_NAMED} more")
+    lines.append(f"Job page: {link}" if link else
+                 "See the run in the operations app or lakefed_ingest.ingest_event.")
+    return "\n".join(lines)
+
+
+def sink_checked_configs(configs: List[dict]) -> List[dict]:
+    """The rows whose sink table must exist for them to continue (``route_tables`` reseeds a missing
+    one): the incremental strategies, ct and cursor. The sweep and the check list the sinks of these."""
+    return [c for c in configs if ss.strategy_name(c) in (ls.CT, ls.CURSOR)]
 
 
 def route_tables(configs: List[dict], checkpoints: Dict[int, dict], mixed_sinks=frozenset(),
@@ -400,24 +462,135 @@ def apply_seed_budget(plans: List[dict], max_seeds: int) -> Tuple[List[dict], Li
             [p for p in seeds if id(p) not in run])
 
 
-def bulk_rows_to_write(unchanged: list, checkpoints: Dict[int, dict], interval_s: float, now=None) -> list:
+def _refresh_only(row, cp: dict) -> bool:
+    """Writing this unchanged row would only refresh the table's last_success_at: its checkpoint is
+    already at the captured version, ok, and there is no select_list, begin version or identity (a
+    checkpoint written before the identity backstop) to record."""
+    cid, cur, select_list, begin, identity = (tuple(row) + (None, None))[:5]
+    unrecorded = identity is not None and any(cp.get(k) is None for k in ("source_identity", "sink_identity"))
+    return (ct_position(cp) >= int(cur) and select_list is None and cp.get("status") == "ok"
+            and (begin is None or cp.get("ct_begin_version") is not None) and not unrecorded)
+
+
+def bulk_rows_to_write(unchanged: list, checkpoints: Dict[int, dict], interval_s: float, now=None,
+                       stamp_of: Optional[Callable] = None) -> list:
     """The unchanged rows the bulk advance has to write. With ``interval_s`` > 0, a row is left out
     when writing it would only refresh ``last_success_at`` and that stamp is under ``interval_s``
     old: the checkpoint is already at the captured version, ok, and has nothing to record (select_list
     or begin version). At scale nearly every table is quiet nearly every run, so this removes most of
     a run's Lakebase writes; ``last_success_at`` of a quiet table is then at most ``interval_s``
-    stale. ``interval_s`` 0 = write every row (stamped every run)."""
+    stale. ``interval_s`` 0 = write every row (stamped every run). ``stamp_of(control_id)`` gives the
+    table's database check stamp, if any: a table's last success is the later of the two
+    (``last_success``)."""
     if not interval_s or interval_s <= 0:
         return list(unchanged)
     now = now or datetime.now(timezone.utc)
     out = []
     for row in unchanged:
-        cid, cur, select_list, begin = (tuple(row) + (None,))[:4]
-        cp = checkpoints.get(int(cid)) or {}
-        stamp = cp.get("last_success_at")
-        quiet = (ct_position(cp) >= int(cur) and select_list is None and cp.get("status") == "ok"
-                 and (begin is None or cp.get("ct_begin_version") is not None)
-                 and stamp is not None and (now - stamp).total_seconds() < interval_s)
-        if not quiet:
+        cp = checkpoints.get(int(row[0])) or {}
+        stamp = last_success(cp, stamp_of(int(row[0])) if stamp_of else None)
+        if not (_refresh_only(row, cp) and stamp is not None and (now - stamp).total_seconds() < interval_s):
             out.append(row)
     return out
+
+
+# ---- per-database check stamps ------------------------------------------------------------------
+# When a whole source database is unchanged, one row in database_check (its CT version and the time)
+# stands in for a last_success_at on each of its tables. At 1,000 tables a database, that turns a
+# quiet run's Lakebase writes from one per table into one per database.
+
+def database_key(cfg: dict) -> tuple:
+    """(source, src_database): the database a check stamp is kept for, within a collection."""
+    return (ss.database_source(cfg), cfg.get("src_database") or "")
+
+
+def database_keys(cfgs) -> set:
+    return {database_key(c) for c in cfgs}
+
+
+def select_work(configs: List[dict], work: Optional[set]) -> List[dict]:
+    """A collection's rows on the databases of a work list ({database_key}), as the check job wrote it
+    for this run (``StateStore.get_check_work``); no work list keeps them all. A list none of whose
+    databases has a row now (moved, disabled or deleted since the check) raises: the run must not
+    succeed having ingested nothing."""
+    if work is None:
+        return list(configs)
+    selected = [c for c in configs if database_key(c) in work]
+    if not selected:
+        names = ", ".join(sorted({database for _, database in work})) or "none"
+        raise ValueError(f"none of the work list's databases ({names}) has an enabled row in this collection now")
+    return selected
+
+
+def work_without_rows(configs: List[dict], work: Optional[set]) -> List[tuple]:
+    """The databases of a work list that no row of ``configs`` is on, sorted: after ``select_work``, the
+    part of the list that was not ingested."""
+    return sorted(set(work or ()) - database_keys(configs))
+
+
+def stamp_vouches(cp: Optional[dict], stamp: Optional[dict]) -> bool:
+    """A database stamp speaks for a table when the table is a CT table in the incremental phase whose
+    position is at or past the stamp's version: the database had nothing newer than that position when
+    it was checked. A table re-seeding, of another strategy, or behind the version is not covered."""
+    if not stamp or not cp or cp.get("position") is None:
+        return False
+    if cp.get("phase") != ss.INCREMENTAL or (cp.get("strategy") or ls.CT) != ls.CT:
+        return False
+    return ct_position(cp) >= int(stamp["version"])
+
+
+def last_success(cp: dict, stamp: Optional[dict] = None):
+    """When the table last ingested or was confirmed current: its own ``last_success_at``, or its
+    database's check time when that stamp vouches for it and is later."""
+    own = cp.get("last_success_at")
+    if not stamp_vouches(cp, stamp) or stamp.get("checked_at") is None:
+        return own
+    return stamp["checked_at"] if own is None else max(own, stamp["checked_at"])
+
+
+def _stamp_is_fresh(stamp: Optional[dict], cur: int, interval_s: float, now) -> bool:
+    return bool(interval_s and interval_s > 0 and stamp and stamp.get("checked_at") is not None
+                and int(stamp["version"]) <= int(cur) and (now - stamp["checked_at"]).total_seconds() < interval_s)
+
+
+def unchanged_writes(group_members, group_outputs, checkpoints: Dict[int, dict], interval_s: float,
+                     stamps: Optional[dict] = None, elsewhere=frozenset(), now=None) -> Tuple[list, list]:
+    """The unchanged tables' bookkeeping, as (rows for the bulk advance, database stamps).
+
+    ``group_members`` and ``group_outputs`` are the detection groups and their ``detect_group``
+    results, in the same order; ``stamps`` the collection's current stamps
+    (``StateStore.get_database_checks``); ``elsewhere`` the ``database_keys`` of rows routed to work
+    before detection (seeds, pending appends, reseeds, other strategies).
+
+    A database is unchanged as a whole when detection planned nothing and nothing failed for it, and
+    no other row of it is routed elsewhere. Its tables that would only refresh their stamp are then
+    covered by ONE stamp per database at the captured version, written unless ``interval_s`` > 0 and
+    the current stamp is younger than that (and not from a higher version, as after a CT reset). Its
+    other unchanged rows (a position to move, a status to clear, something to record) are written per
+    table. Every other database's unchanged rows go through ``bulk_rows_to_write``, which reads a
+    vouching database stamp as their last success. Database stamps are
+    ``(source, src_database, cur, tables)``."""
+    stamps = stamps or {}
+    now = now or datetime.now(timezone.utc)
+    rows, database_stamps = [], []
+    for members, out in zip(group_members, group_outputs):
+        if not out["unchanged"]:
+            continue
+        key_of = {int(c["id"]): database_key(c) for c, _ in members}
+        whole = not out["plans"] and not out["failed"] and out["cur"] is not None and not (set(key_of.values()) & elsewhere)
+        if not whole:
+            rows.extend(bulk_rows_to_write(out["unchanged"], checkpoints, interval_s, now=now,
+                                           stamp_of=lambda cid, k=key_of: stamps.get(k.get(cid))))
+            continue
+        covered = set()
+        for row in out["unchanged"]:
+            cid = int(row[0])
+            if _refresh_only(row, checkpoints.get(cid) or {}):
+                covered.add(key_of[cid])
+            else:
+                rows.append(row)
+        tables = Counter(key_of.values())
+        for key in sorted(covered):
+            if not _stamp_is_fresh(stamps.get(key), out["cur"], interval_s, now):
+                database_stamps.append((key[0], key[1], int(out["cur"]), tables[key]))
+    return rows, database_stamps

@@ -530,3 +530,173 @@ def test_legacy_checkpoint_pointed_at_a_new_sink_is_caught_by_missing_sink():
     cfg = _ident_cfg(sink_table="moved")
     plans, _, _ = planner.route_tables([cfg], {1: _cp(5)}, existing_sinks={"main.bronze.a"})
     assert [(p["route"], p["reason"]) for p in plans] == [("reseed", "sink_missing")]
+
+
+# ---- per-database check stamps ------------------------------------------------------------------
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+_NOW = _dt(2026, 10, 22, 12, 0, tzinfo=_tz.utc)
+
+
+def _stamped(v, minutes_ago, **kw):
+    """A quiet table's checkpoint at version v, its own stamp ``minutes_ago`` old, its identity recorded."""
+    return {**_cp(v, begin=7), "last_success_at": _NOW - _td(minutes=minutes_ago), "source_identity": "src",
+            "sink_identity": "sink", "merge_key": "id", **kw}
+
+
+def _db(*tables, db="d1", host="h1"):
+    return [_cfg(cid, db, name, host=host) for cid, name in tables]
+
+
+def _state(cur, cfgs):
+    """database_state for these tables: CT on for each, min valid 1, begin version 7."""
+    return lambda c: (cur, {("dbo", c2["src_table"]): (1, 7) for c2 in cfgs})
+
+
+def test_a_database_stamp_vouches_only_for_ct_tables_at_or_past_its_version():
+    stamp = {"version": 100, "checked_at": _NOW}
+    assert planner.stamp_vouches(_cp(100), stamp) and planner.stamp_vouches(_cp(130), stamp)
+    assert not planner.stamp_vouches(_cp(99), stamp)                      # behind the checked version
+    assert not planner.stamp_vouches(_cp(None), stamp)
+    assert not planner.stamp_vouches(_cp(100, phase=ss.SEEDING), stamp)   # reseed queued since
+    assert not planner.stamp_vouches(_cp(100, strategy="cursor"), stamp)
+    assert not planner.stamp_vouches(_cp(100), None)
+    own = _NOW - _td(hours=3)
+    assert planner.last_success(dict(_cp(100), last_success_at=own), stamp) == _NOW
+    assert planner.last_success(dict(_cp(99), last_success_at=own), stamp) == own
+    assert planner.last_success(dict(_cp(100), last_success_at=None), None) is None
+    assert planner.last_success(dict(_cp(100), last_success_at=_NOW), {"version": 1, "checked_at": own}) == _NOW
+
+
+def test_a_whole_unchanged_database_writes_one_stamp_instead_of_a_row_per_table():
+    cfgs = _db((1, "a"), (2, "b"), (3, "c"))
+    cps = {1: _stamped(100, 5), 2: _stamped(100, 5), 3: _stamped(100, 5, status="failed")}
+    members = [(c, cps[c["id"]]) for c in cfgs]
+    out = planner.detect_group(members, None, None, database_state=_state(100, cfgs))
+    assert out["fast_exit"]
+    rows, stamps = planner.unchanged_writes([members], [out], cps, 0, now=_NOW)
+    assert [r[0] for r in rows] == [3]            # only the failed table has something of its own to record
+    assert stamps == [("h1|1433|k-d1", "d1", 100, 3)]
+    # freshness 3600: a fresh stamp at or below the version vouches for the database, so nothing is written
+    fresh = {("h1|1433|k-d1", "d1"): {"version": 100, "checked_at": _NOW - _td(minutes=10)}}
+    assert planner.unchanged_writes([members], [out], cps, 3600, stamps=fresh, now=_NOW) == (rows, [])
+    stale = {("h1|1433|k-d1", "d1"): {"version": 100, "checked_at": _NOW - _td(hours=2)}}
+    assert planner.unchanged_writes([members], [out], cps, 3600, stamps=stale, now=_NOW)[1] == stamps
+    # a stamp from before a change-tracking reset (higher version than now) vouches for nothing
+    reset = {("h1|1433|k-d1", "d1"): {"version": 900, "checked_at": _NOW - _td(minutes=10)}}
+    assert planner.unchanged_writes([members], [out], cps, 3600, stamps=reset, now=_NOW)[1] == stamps
+
+
+def test_a_table_whose_identity_is_not_recorded_yet_is_written_even_in_a_stamped_database():
+    # A checkpoint written before the identity backstop has no source, sink or key recorded. The bulk
+    # advance records them; a database stamp standing in for the row would leave the backstop off.
+    cfgs = _db((1, "a"), (2, "b"))
+    cps = {1: _stamped(100, 5), 2: _stamped(100, 5, source_identity=None, sink_identity=None, merge_key=None)}
+    members = [(c, cps[c["id"]]) for c in cfgs]
+    out = planner.detect_group(members, None, None, database_state=_state(100, cfgs))
+    rows, stamps = planner.unchanged_writes([members], [out], cps, 0, now=_NOW)
+    assert [r[0] for r in rows] == [2]
+    assert stamps == [("h1|1433|k-d1", "d1", 100, 2)]
+
+
+def test_a_database_that_changed_after_its_stamp_is_read_and_its_quiet_tables_advance():
+    # Stamped at version 100 ten minutes ago; since then table a changed (version 105).
+    cfgs = _db((1, "a"), (2, "b"), (3, "c"))
+    cps = {1: _stamped(100, 180), 2: _stamped(100, 180), 3: _stamped(105, 180)}   # c re-seeded at 105
+    stamps = {("h1|1433|k-d1", "d1"): {"version": 100, "checked_at": _NOW - _td(minutes=10)}}
+    members = [(c, cps[c["id"]]) for c in cfgs]
+    out = planner.detect_group(members, None, lambda c, items: ({1: (1, 1), 2: (1, 0), 3: (1, 0)}, [], 1),
+                               database_state=_state(105, cfgs))
+    assert not out["fast_exit"]
+    assert [(p["cfg"]["id"], p["route"], p["cur"]) for p in out["plans"]] == [(1, "merge", 105)]
+    rows, new_stamps = planner.unchanged_writes([members], [out], cps, 3600, stamps=stamps, now=_NOW)
+    # b must move to 105 whatever the stamp says; c is at 105 already and the fresh stamp vouches for it
+    assert [(r[0], r[1]) for r in rows] == [(2, 105)]
+    assert new_stamps == []                      # a database with a change is not stamped as a whole
+    # without the database stamp, c's own 3-hour-old stamp is due
+    assert [r[0] for r in planner.unchanged_writes([members], [out], cps, 3600, now=_NOW)[0]] == [2, 3]
+
+
+def test_a_database_with_work_elsewhere_or_a_failure_is_never_stamped_as_a_whole():
+    cfgs = _db((1, "a"), (2, "b"))
+    cps = {1: _stamped(100, 5), 2: _stamped(100, 5)}
+    members = [(c, cps[c["id"]]) for c in cfgs]
+    out = planner.detect_group(members, None, None, database_state=_state(100, cfgs))
+    # another row of this database is seeding, pending or reseeding: per table, as before
+    elsewhere = planner.database_keys([_cfg(9, "d1", "z")])
+    rows, stamps = planner.unchanged_writes([members], [out], cps, 0, elsewhere=elsewhere, now=_NOW)
+    assert [r[0] for r in rows] == [1, 2] and stamps == []
+    down = planner.detect_group(members, None, None, database_state=lambda c: (None, {}))
+    assert planner.unchanged_writes([members], [down], cps, 0, now=_NOW) == ([], [])
+
+
+def test_one_stamp_per_source_identity_in_a_detection_group():
+    a, b = _cfg(1, "d1", "a"), dict(_cfg(2, "d1", "b"), src_port=None)   # one group: a port and a blank port
+    cps = {1: _stamped(100, 5), 2: _stamped(100, 5)}
+    members = [(a, cps[1]), (b, cps[2])]
+    assert len(planner.group_by_source(members)) == 1
+    out = planner.detect_group(members, None, None, database_state=_state(100, [a, b]))
+    assert sorted(planner.unchanged_writes([members], [out], cps, 0, now=_NOW)[1]) == [
+        ("h1|1433|k-d1", "d1", 100, 2)]   # a blank port is the default port, so the two share one stamp
+
+
+def test_bulk_rows_to_write_reads_a_vouching_database_stamp_as_the_last_success():
+    cps = {1: _stamped(100, 180), 2: _stamped(99, 180)}
+    stamp = {"version": 100, "checked_at": _NOW - _td(minutes=10)}
+    rows = [(1, 100, None, 7), (2, 100, None, 7)]
+    assert [r[0] for r in planner.bulk_rows_to_write(rows, cps, 3600, now=_NOW, stamp_of=lambda cid: stamp)] == [2]
+    assert [r[0] for r in planner.bulk_rows_to_write(rows, cps, 3600, now=_NOW)] == [1, 2]
+
+
+def test_a_run_given_a_work_list_keeps_only_those_databases_of_its_collection():
+    cfgs = [_cfg(1, "d1", "a"), _cfg(2, "d2", "a"), _cfg(3, "d2", "b", host="h2")]
+    work = {planner.database_key(cfgs[1])}
+    assert [c["id"] for c in planner.select_work(cfgs, work)] == [2]   # same name on another server: not listed
+    assert planner.select_work(cfgs, None) == cfgs                      # no work list: the whole collection
+
+
+def test_a_work_list_that_matches_no_enabled_row_is_refused_not_ingested_as_nothing():
+    cfgs = [_cfg(1, "d1", "a"), _cfg(2, "d2", "a")]
+    gone = {("h9|1433|k-d9", "d9")}
+    with pytest.raises(ValueError, match="d9"):
+        planner.select_work(cfgs, gone)
+    with pytest.raises(ValueError):
+        planner.select_work(cfgs, set())
+    partly = {planner.database_key(cfgs[0]), ("h9|1433|k-d9", "d9")}
+    assert [c["id"] for c in planner.select_work(cfgs, partly)] == [1]
+    assert planner.work_without_rows(cfgs, partly) == [("h9|1433|k-d9", "d9")]
+
+
+def test_a_run_for_a_work_list_that_finds_its_collection_locked_fails_instead_of_skipping():
+    assert planner.locked_run_status("") == "skipped"
+    assert planner.locked_run_status("launch-1:c1") == "failed"
+
+
+def test_the_sink_lookup_covers_the_incremental_rows_only():
+    """The sweep and the check list the sinks of ct and cursor rows (the ones a missing sink reseeds);
+    full reloads have no checkpoint to protect."""
+    ct = _cfg(1, "d1", "a")
+    cursor = dict(_cfg(2, "d1", "b"), load_type="cursor")
+    full = dict(_cfg(3, "d1", "c"), load_type="full")
+    assert [c["id"] for c in planner.sink_checked_configs([ct, cursor, full])] == [1, 2]
+
+
+def _failed_row(database, table, error):
+    return ({"src_database": database, "src_schema": "dbo", "src_table": table}, error)
+
+
+def test_a_failure_message_names_up_to_five_tables_with_their_errors_and_the_job_page():
+    failed = [_failed_row("db", f"t{i}", f"boom {i}") for i in range(7)]
+    message = planner.failure_message(42, "cohort", failed, link="https://host/jobs/1/runs/2")
+    assert message.splitlines() == [
+        "7 table(s) failed in run 42 of cohort:",
+        "db.dbo.t0: boom 0", "db.dbo.t1: boom 1", "db.dbo.t2: boom 2", "db.dbo.t3: boom 3", "db.dbo.t4: boom 4",
+        "and 2 more",
+        "Job page: https://host/jobs/1/runs/2",
+    ]
+
+
+def test_a_failure_message_cuts_a_long_error_and_says_where_to_look_without_a_link():
+    message = planner.failure_message(7, "cohort", [_failed_row("db", "orders", "x" * 900)])
+    assert message.splitlines()[1] == "db.dbo.orders: " + "x" * 200
+    assert message.splitlines()[-1] == "See the run in the operations app or lakefed_ingest.ingest_event."

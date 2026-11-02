@@ -43,6 +43,8 @@ resources:
               db_name: "{{job.parameters.db_name}}"
               secret_scope: "{{job.parameters.secret_scope}}"
               trust_server_certificate: "{{job.parameters.trust_server_certificate}}"
+              discover_workers: "{{job.parameters.discover_workers}}"
+              max_queries_per_source: "{{job.parameters.max_queries_per_source}}"
           libraries:
             - pypi:
                 package: "psycopg[binary]"
@@ -66,3 +68,9 @@ resources:
           default: ${var.secret_scope}
         - name: trust_server_certificate
           default: "true"
+        # Databases read at once (the notebook's discovery.workers_for): each takes three catalog queries in turn, so
+        # this is the most queries at once on the source. max_queries_per_source, when set, caps it further.
+        - name: discover_workers
+          default: ${var.discover_workers}
+        - name: max_queries_per_source
+          default: ${var.max_queries_per_source}

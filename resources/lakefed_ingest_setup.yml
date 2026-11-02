@@ -39,6 +39,9 @@ resources:
     lakefed_ingest_setup:
       name: "lakefed_ingest_setup"
       description: "Apply / migrate the Lakebase schema (control, hot state, telemetry). Idempotent."
+      # The operations app starts this job when it finds the database behind (app/src/schema_upgrade.py); one run at
+      # a time is the second guard, after the app's own lock, against two app instances starting it.
+      max_concurrent_runs: 1
       # Serverless: the task only runs DDL against Lakebase (no source reads), so no cluster to wait for.
       tasks:
         - task_key: apply_lakebase_schema
