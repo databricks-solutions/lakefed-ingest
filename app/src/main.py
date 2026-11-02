@@ -839,6 +839,15 @@ def _selected_rows(kind: str, param, selection: Selection, whole_databases: Iter
         after = (last["server"], last["k_database"], last["line"], last["k_schema"], last["k_table"])
 
 
+def _no_tables_refusal(kind: str, param, selection: Selection) -> str:
+    """Why a selection takes no tables (new_job.no_tables_refusal): the source's servers are read only here, on the
+    refusal, to name its server keys when the selection names servers it doesn't have."""
+    named = [d.server for d in selection.databases] + [t.server for t in selection.tables]
+    if not named:
+        return nj.NO_TABLES
+    return nj.no_tables_refusal(named, [s["server"] for s in db.query(q.source_servers_sql(kind), (param, ""))])
+
+
 def _selected(selection: Selection) -> dict:
     """What a selection takes, read back from Lakebase: {"text": the CSV of its table rows, "rows": those rows (server,
     database, schema, table, line, fields), "columns": the header the CSV is written with, "lines": each row's line in
@@ -863,7 +872,7 @@ def _selected(selection: Selection) -> dict:
                                        line["database"]) for line in database_lines]
     rows = _selected_rows(kind, param, selection, whole_databases)
     if not rows and not database_lines:
-        raise HTTPException(422, {"errors": ["the selection takes no tables"]})
+        raise HTTPException(422, {"errors": [_no_tables_refusal(kind, param, selection)]})
     whole = ([s["server"] for s in db.query(q.source_servers_sql(kind), (param, selection.filter))]
              if selection.whole_server else [])
     covered = lambda server, database: (server.lower() in {w.lower() for w in whole}
@@ -1111,13 +1120,16 @@ OVERVIEW_JOBS_PAGE = 25
 
 def _rows_written_24h() -> dict:
     """The rows every group wrote in the last 24 hours ({rows, partial}: partial when some loads recorded no count),
-    their table loads' and their batched appends' together; shared like _states."""
+    their table loads' and their batched appends' together; shared like _states. The groups only deleted jobs hold
+    (_deleted_groups) are left out, as the Overview counts live jobs only."""
     def compute():
-        groups = sorted({s["task_collection"] for s in _states()})
+        deleted = _deleted_groups()
+        groups = sorted({s["task_collection"] for s in _states()} - deleted)
         if not groups:
             return {"rows": 0, "partial": False}
         loads = next(iter(db.query(q.rows_written_since_sql(), (groups, 24))), {})
-        batched = [q.batch_rows(r["detail"]) for r in db.query(q.run_batch_rows_sql(), (24,))]
+        batched = [q.batch_rows(r["detail"]) for r in db.query(q.run_batch_rows_sql(), (24,))
+                   if r.get("task_collection") not in deleted]
         return {"rows": int(loads.get("rows_written") or 0) + sum(rows for rows, _ in batched),
                 "partial": bool(loads.get("uncounted")) or any(unknown for _, unknown in batched)}
     return _shared("rows_written_24h", compute, ttl=STATES_CACHE_S)
@@ -1241,6 +1253,13 @@ def _deleted_groups() -> set:
     """The groups of deleted jobs kept for a Restore (queries.deleted_groups_sql), shared like _schedules: they stay
     with their job, under Deleted jobs, until the purge removes them."""
     return _shared("deleted_groups", lambda: {r["task_collection"] for r in db.query(q.deleted_groups_sql())})
+
+
+def _live_states() -> List[dict]:
+    """The shared table states (_states) without the groups only deleted jobs hold (_deleted_groups): the databases
+    and tables the pages count, since a deleted job's are shown under Deleted jobs only."""
+    deleted = _deleted_groups()
+    return [s for s in _states() if s["task_collection"] not in deleted]
 
 
 def _active(members: List[dict]) -> List[dict]:
@@ -1406,8 +1425,7 @@ def ingestion_jobs(filter: str = "all", search: str = "", offset: int = 0, limit
     audits = {s["id"]: _audit(s) for s in _schedules()[0]}
     needle = search.strip().lower()
     found = [{**j, **audits.get(j["id"], {})} for j in view["jobs"]
-             if not j.get("delete") and (not needle or needle in str(j["name"]).lower()
-                                         or any(needle in g.lower() for g in j["groups"]))]
+             if not needle or needle in str(j["name"]).lower() or any(needle in g.lower() for g in j["groups"])]
     counts = {f: sum(1 for j in found if _job_filter(j, f)) for f in JOB_FILTERS}
     rows = [j for j in found if _job_filter(j, filter)]
     if sort:
@@ -2765,11 +2783,13 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
     """Job runs of every job (or one, by id), running first, then newest first, `limit` a page before
     `before`, with outcome counts over the windows read. With an outcome filter, older windows are read until
     the page is full or JOB_RUNS_HISTORY is reached. job=none lists the group runs of the groups in no job
-    instead, with today's run columns."""
+    instead, with today's run columns. Every job means every live one: a deleted job's runs are listed and counted
+    only when it is asked for by id."""
     now = datetime.now(timezone.utc)
     end = _instant(before, "before") if before else now + timedelta(seconds=1)
     limit = max(1, min(int(limit), 100))
     schedules, members = _schedules()
+    live = [s for s in schedules if s.get("deleted_at") is None]
     if job == "none":
         unscheduled = sorted({s["task_collection"] for s in _states()} - {m["task_collection"] for m in _active(members)}
                              - _deleted_groups())
@@ -2777,7 +2797,7 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
         more = len(rows) > limit
         rows = rows[:limit]
         return {"group_runs": rows, "job_runs": [], "counts": {}, "next_before": rows[-1]["started_at"] if more else None}
-    chosen = [s for s in schedules if job is None or str(s["id"]) == str(job)]
+    chosen = live if job is None else [s for s in schedules if str(s["id"]) == str(job)]
     found, counts, start = [], {}, end
     while chosen:
         window_start = min(start - timedelta(minutes=int(s["cadence_minutes"]) * limit) for s in chosen)
@@ -2799,7 +2819,7 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
     more = len(found) > limit or (not outcome and len(found) >= limit)
     return {"job_runs": [{k: v for k, v in r.items() if k != "placed"} for r in running + rest],
             "counts": counts, "next_before": rest[-1]["slot"] if rest and more else None,
-            "jobs": [{"id": s["id"], "name": s["name"]} for s in schedules]}
+            "jobs": [{"id": s["id"], "name": s["name"]} for s in live]}
 
 
 # ---- sources and one database -------------------------------------------------------------------
@@ -2808,14 +2828,16 @@ def job_runs_across(job: Optional[str] = None, outcome: Optional[str] = None, be
 def sources():
     """Source instances (rollup.sources): how each is read, its ingestion jobs, its tables by state and the
     tables discovered on it with no control row yet, plus readable UC connections with nothing registered.
-    Shared like _states; a failure to list UC connections only drops the "nothing registered" rows."""
+    Shared like _states; a failure to list UC connections only drops the "nothing registered" rows. Deleted jobs, and
+    the groups and tables only they hold, are left out of every count."""
     def compute():
         schedules, members = _schedules()
         try:
             listed, listed_error = _connections(), None
         except Exception as e:
             listed, listed_error = [], str(e)
-        view = rollup.sources(_states(), listed, db.query(q.not_ingested_sql()), schedules, members, _deleted_groups())
+        live = [s for s in schedules if s.get("deleted_at") is None]
+        view = rollup.sources(_live_states(), listed, db.query(q.not_ingested_sql()), live, members, _deleted_groups())
         for instance in view["instances"]:
             for j in instance["jobs"]:
                 if j.get("cadence_minutes"):
@@ -4507,7 +4529,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
         errors.insert(0, "name the job")
     servers = db.query(q.selected_servers_sql(kind), (param, *rest))
     if not servers:
-        errors.append("the selection takes no tables")
+        errors.append(_no_tables_refusal(kind, param, selection))
     groups_of = by_database.groups_by_server(servers, _sizing(body))
     all_groups = [g for s in servers for g in nj.group_names(name or PREVIEW_NAME, s["server"], groups_of[s["server"]])]
     timezone_ = sch.timezone_for(run.cadence_minutes, run.timezone)
@@ -5365,7 +5387,8 @@ def timeline(hours: int = 24):
     """The last `hours` as the Jobs UI's run timeline, one lane per ingestion job: its job runs (each with its span,
     outcome and groups; a paused job's triggers that did not run left out), its planned triggers (the current
     schedule, since it or the group last changed) and the triggers Databricks skipped because the previous run was
-    still going (from the wrapper jobs' runs). The group runs of groups in no job make one more lane."""
+    still going (from the wrapper jobs' runs). The group runs of groups in no job make one more lane. Deleted jobs, and
+    the groups only they hold, have no lane."""
     hours = max(1, min(int(hours), 168))
     end = datetime.now(timezone.utc)
     start = end - timedelta(hours=hours)
@@ -5373,7 +5396,7 @@ def timeline(hours: int = 24):
     active = _active(members)
     client = None
     lanes = []
-    for s in sorted(schedules, key=lambda s: str(s["name"]).lower()):
+    for s in sorted((s for s in schedules if s.get("deleted_at") is None), key=lambda s: str(s["name"]).lower()):
         planned, skipped = set(), []
         for m in (m for m in active if m["schedule_id"] == s["id"]):
             if not s["paused"]:
@@ -5389,7 +5412,7 @@ def timeline(hours: int = 24):
                       "runs": [_timeline_run(jr, end) for jr in _job_runs_of(s, start, end, end)
                                if not (jr["outcome"]["label"] == "Not run" and jr["outcome"].get("paused"))],
                       "planned": sorted(planned), "skipped": sorted(skipped)})
-    unscheduled = sorted({st["task_collection"] for st in _states()} - {m["task_collection"] for m in active})
+    unscheduled = sorted({st["task_collection"] for st in _live_states()} - {m["task_collection"] for m in active})
     group_runs = [{k: r.get(k) for k in ("run_id", "task_collection", "status", "started_at", "finished_at")}
                   for r in _group_runs(unscheduled, start, end)] if unscheduled else []
     return {"start": start.isoformat(), "end": end.isoformat(), "jobs": lanes,

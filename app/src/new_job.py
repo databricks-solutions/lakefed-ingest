@@ -434,3 +434,20 @@ def csv_of(columns: List[str], rows: List[dict]) -> str:
 
 DISCOVERY_COLUMNS = ("src_connection", "src_host", "src_port", "secret_key", "src_database", "src_schema", "src_table",
                      "select_list", "primary_key", "cursor_column", "load_type")
+
+
+NO_TABLES = "the selection takes no tables"
+
+
+def no_tables_refusal(named_servers: List[str], source_servers: List[str]) -> str:
+    """Why a selection takes no tables, for an API caller. When it names servers the source doesn't have, it says so
+    and lists the source's server keys: a discovery through a JDBC host keys its server by the bare host, so a caller
+    who sends host:port (as job groups spell it) learns the key to send. Otherwise the plain refusal. Names are
+    compared without case, as the selection is matched."""
+    have = {str(server).lower() for server in source_servers}
+    unknown = list(dict.fromkeys(server for server in named_servers if str(server).lower() not in have))
+    if not unknown:
+        return NO_TABLES
+    servers = ", ".join(sorted(source_servers, key=str.lower)) if source_servers else "none"
+    return (f"{NO_TABLES}: no table matches {plural(len(unknown), 'server')} {', '.join(unknown)}: "
+            f"this source's {plural(len(source_servers), 'server')} {'is' if len(source_servers) == 1 else 'are'} {servers}")

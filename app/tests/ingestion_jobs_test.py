@@ -80,6 +80,34 @@ def test_a_paused_job_with_late_tables_needs_no_attention_and_a_group_in_no_job_
         {"jobs": 2, "running_jobs": 1, "failing_jobs": 1, "late_jobs": 1}
 
 
+def test_a_kept_deleted_job_with_its_groups_and_tables_adds_nothing_to_the_overview():
+    # Deleted at 13:00, kept for a Restore: its members were removed with it, its group d1 (only it holds) keeps its
+    # tables, failing and late ones too, and a failed group run from before the Delete.
+    deleted_at = datetime(2026, 10, 26, 13, 0, tzinfo=UTC)
+    gone = dict(id=9, name="Old nightly", cadence_minutes=60, timezone="UTC", paused=True, updated_at=ADDED,
+                deleted_at=deleted_at, delete={"state": ij.KEPT, "days_left": 6})
+    members = MEMBERS + [dict(schedule_id=9, task_collection="d1", offset_minutes=0, added_at=ADDED, removed_at=deleted_at)]
+    states = STATES + [state("d1", 1000, current=1, late=3, failing=2, server="srv9"), state("d1", 4, server="srv9",
+                                                                                              database="d1_other")]
+    runs = RUNS + [run(30, "d1", datetime(2026, 10, 26, 12, 0, 20, tzinfo=UTC), status="failed", failed=2)]
+    with_deleted = ij.jobs_view(SCHEDULES + [gone], members, states, RUNNING, runs, STATS, NOW, deleting={"d1"})
+    without = ij.jobs_view(SCHEDULES, MEMBERS, STATES, RUNNING, RUNS, STATS, NOW)
+    assert with_deleted["totals"] == without["totals"]
+    assert [j["name"] for j in with_deleted["jobs"]] == ["East hourly", "Nightly"]
+    assert [j["name"] for j in with_deleted["attention"]] == [j["name"] for j in without["attention"]]
+    assert len(with_deleted["running_job_runs"]) == len(without["running_job_runs"])
+    assert with_deleted["not_in_job"]["groups"] == ["c4"] and with_deleted["running_not_in_job"] == without["running_not_in_job"]
+    # The Overview's paused count and next triggers come from these jobs: the paused deleted job is in neither.
+    assert sum(1 for j in with_deleted["jobs"] if j.get("paused")) == 1
+    # With only the deleted job left, nothing counts at all.
+    alone = ij.jobs_view([gone], members[-1:], states[-2:], [], runs[-1:], {}, NOW, deleting={"d1"})
+    assert alone["jobs"] == [] and alone["not_in_job"] is None
+    assert {k: alone["totals"][k] for k in ("jobs", "databases", "servers", "enabled_tables", "state_loaded",
+                                            "state_first_load", "state_failing", "late_databases", "groups")} == \
+        dict.fromkeys(("jobs", "databases", "servers", "enabled_tables", "state_loaded", "state_first_load",
+                       "state_failing", "late_databases", "groups"), 0)
+
+
 def test_a_jobs_runs_in_a_row_with_failed_tables():
     assert ij.consecutive_failed([dict(outcome={"label": "Running"}, failed_tables=0),
                                   dict(outcome={"label": "Succeeded with failures"}, failed_tables=3),

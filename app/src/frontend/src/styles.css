@@ -338,6 +338,9 @@ details.advanced .compute { margin-top: var(--db-space-4); }
 /* Fields stay inside their card: inputs fill their grid cell and never push past it. */
 .form-grid input, .form-grid select { width: 100%; min-width: 0; box-sizing: border-box; }
 .form-grid label.checkbox input { width: auto; }
+/* A checkbox among labelled fields, as Databricks forms set one: the box and its label on the inputs' row, level with
+   the input boxes beside it, not with their labels above them. */
+.form-grid label.checkbox.input-row { align-self: end; min-height: 32px; }
 .form-grid .emails { max-width: 640px; }
 label.checkbox .help { display: inline; }
 /* Identity columns: as wide as its fields, the action next to them, every cell aligned to the top. */
@@ -375,7 +378,10 @@ details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }
 .empty-drop { border: 1px dashed var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4); text-align: center; color: var(--muted); margin: 0; }
 .drop-zone { border: 1px dashed var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4); text-align: center; display: grid; justify-items: center; gap: var(--db-space-2); }
 .drop-zone.over { border-color: var(--db-color-action-primary-background-default, #2272b4); }
-.empty-choices { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--db-space-2); margin-top: var(--db-space-3); }
+/* An empty state that is itself a menu's button: the whole box opens the menu, which drops below its middle. */
+.menu:has(> button.empty-drop) { display: flex; }
+button.empty-drop { width: 100%; height: auto; background: transparent; cursor: pointer; }
+.menu:has(> button.empty-drop) > .menu-items { left: 50%; right: auto; transform: translateX(-50%); }
 .menu-note { padding: 6px 12px; overflow-wrap: anywhere; }
 .menu-note + .menu-note { border-top: 1px solid var(--border); }
 button.avatar { width: 32px; height: 32px; padding: 0; border-radius: 50%; border: 0; background: var(--db-color-action-primary-background-default, #2272b4);

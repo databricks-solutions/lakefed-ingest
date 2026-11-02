@@ -41,3 +41,14 @@ def test_the_pickers_helpers_pass_their_node_tests():
     tests = pathlib.Path(__file__).resolve().parent / "js" / "pick_state.test.mjs"
     result = subprocess.run(["node", "--test", str(tests)], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
+
+
+def test_nothing_spins_under_chosen_while_tables_are_counted_or_access_checked_in_the_background():
+    discover = (PICK_STATE.parent / "Discover.tsx").read_text()
+    counts_line = discover[discover.index('<p className="pick-counts">'):]
+    counts_line = counts_line[:counts_line.index("</p>")]
+    assert "countsText(counts, total)" in counts_line
+    assert "Spinner" not in counts_line and "Busy" not in counts_line
+    # The access check still runs, out of sight: no state of its own for the page to draw.
+    assert "/access${qs({ connection })}" in discover and "setChecking" not in discover
+    assert "Spinner" not in discover

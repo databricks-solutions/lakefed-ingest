@@ -369,7 +369,14 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
     the grouped failures (queries.group_errors) of each job's last job run with failed tables;
     `earlier_last_by_job` the last job run that ran of each job none of whose recent triggers ran, found before
     the window (main._last_ran). Running group runs of groups in no job are listed apart, as they belong to no
-    job run."""
+    job run.
+
+    Only live jobs count. A deleted job (kept for a Restore, deleting, or whose delete failed: any schedule with
+    deleted_at set) and `deleting`, the groups only such jobs hold, with their databases and tables, add nothing to any
+    list or total here: they are shown under Deleted jobs instead."""
+    deleting = set(deleting)
+    schedules = [s for s in schedules if s.get("deleted_at") is None]
+    states = [s for s in states if s["task_collection"] not in deleting]
     causes_by_job, earlier_last_by_job = causes_by_job or {}, earlier_last_by_job or {}
     p50_by_group = {g: st.get("p50_s") for g, st in stats_by_group.items()}
     job_sums, not_in_job = rollup.jobs(states, schedules, members, deleting)
@@ -401,8 +408,6 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
                                    else last.get("failed_in_a_row", 0)),
                "causes": causes[:3]}
         row["status"] = status(row, current, last, causes[0]["label"] if causes else None, warnings)
-        if s.get("delete"):
-            row.update(status=delete_status(s["delete"]), next_start=None, delete=s["delete"])
         rows.append(row)
         running_job_runs += [x for x in summaries if x["outcome"]["label"] in q.RUNNING_OUTCOMES]
     rows.sort(key=lambda j: (-1 if j["running_job_run"] and j["state_failing"] else 0 if j["state_failing"] else

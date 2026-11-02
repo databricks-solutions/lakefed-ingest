@@ -688,3 +688,31 @@ def test_a_preview_by_lines_needs_no_name_but_its_create_does(client):
     assert r.status_code == 200 and r.json()["summary"]["tables"] and r.json()["name_missing"] is True
     r = _create(client, dry_run=False, name="", settings={**FAN_IN, "sink_catalog": ""})
     assert r.status_code == 422 and r.json()["detail"]["errors"][:2] == ["name the job", "set the target catalog"]
+
+
+def test_a_selection_naming_a_server_the_source_lacks_says_so_and_lists_the_sources_server_keys():
+    # A JDBC discovery keys its server by the bare host; job groups spell it host:port.
+    assert nj.no_tables_refusal(["sql1.example.com:1433"], ["sql1.example.com"]) == (
+        "the selection takes no tables: no table matches server sql1.example.com:1433: "
+        "this source's server is sql1.example.com")
+    assert nj.no_tables_refusal(["x", "y", "x"], ["B", "a"]) == (
+        "the selection takes no tables: no table matches servers x, y: this source's servers are a, B")
+    assert nj.no_tables_refusal(["x"], []).endswith("this source's servers are none")
+
+
+def test_a_selection_whose_servers_the_source_has_keeps_the_plain_refusal():
+    assert nj.no_tables_refusal(["SQL1.example.com"], ["sql1.example.com"]) == nj.NO_TABLES == "the selection takes no tables"
+    assert nj.no_tables_refusal([], ["sql1.example.com"]) == nj.NO_TABLES
+
+
+def test_the_refusal_reads_the_sources_servers_only_when_the_selection_names_servers(monkeypatch):
+    pytest.importorskip("fastapi")
+    import main
+    reads = []
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): reads.append((sql, params)) or [{"server": "sql1.example.com"}])
+    named = main.Selection(discovery_ids=["d1"], databases=[{"server": "sql1.example.com:1433", "database": "eng_001"}])
+    assert main._no_tables_refusal("discovery", ["d1"], named).endswith(
+        "no table matches server sql1.example.com:1433: this source's server is sql1.example.com")
+    assert reads == [(q.source_servers_sql("discovery"), (["d1"], ""))]
+    whole = main.Selection(discovery_ids=["d1"], whole_server=True, filter="nothing")
+    assert main._no_tables_refusal("discovery", ["d1"], whole) == nj.NO_TABLES and len(reads) == 1

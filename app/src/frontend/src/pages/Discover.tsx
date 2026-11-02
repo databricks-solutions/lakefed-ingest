@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { Busy, ErrorBox, Info, Modal, Notice, Pager, Spinner, Tag, Tip, fmtInt, plural, Twisty, useNow } from "../components";
+import { Busy, ErrorBox, Info, Modal, Notice, Pager, Tag, Tip, fmtInt, plural, Twisty, useNow } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
 import { CreateConnectionChoices } from "./CreateConnectionChoices";
@@ -293,15 +293,14 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
   }, [listing.data]);
   const closed = (d: string) => accessOf(seen[d]) === "closed";
   // Through the SQL warehouse, the databases the page shows are checked, and only those: another page or filter checks
-  // its own. The answers stay on the listing in Lakebase, so a database is checked once.
+  // its own. The answers stay on the listing in Lakebase, so a database is checked once. The check runs out of sight:
+  // nothing on the page spins for it while the user chooses.
   const qc = useQueryClient();
-  const [checking, setChecking] = useState(false);
   const shownKey = shown.join("\n");
   useEffect(() => {
     if (!checksOn || discoveryId == null) return;
     let stopped = false;
     (async () => {
-      setChecking(true);
       try {
         for (;;) {
           const step = await api.post<Row>(`/discoveries/${encodeURIComponent(discoveryId)}/access${qs({ connection })}`,
@@ -313,7 +312,7 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
           await wait(1500);
           if (stopped) return;
         }
-      } catch (e) { if (!stopped) setError(e); } finally { if (!stopped) setChecking(false); }
+      } catch (e) { if (!stopped) setError(e); }
     })();
     return () => { stopped = true; };
   }, [checksOn, discoveryId, connection, shownKey, qc]);
@@ -391,10 +390,9 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
     <>
       <p className="muted">Tick the whole server, whole databases, or open a database for its tables.
         {checksOn && <>{" "}<Info>A database the connection's login can't open is greyed out; hover on it for why.</Info></>}</p>
-      <p className="pick-counts"><b>{countsText(counts, total)}</b>{counts.counting && <> <Spinner label="Counting tables" /></>}
+      <p className="pick-counts"><b>{countsText(counts, total)}</b>
         {counts.leftOut > 0 && <span className="muted"> · the whole server leaves out {fmtInt(counts.leftOut)} {plural(counts.leftOut, "database")} the
-          login can't open</span>}
-        {checking && <> <Spinner label="Checking access" /></>}</p>
+          login can't open</span>}</p>
       <div className="toolbar"><input className="search" placeholder="Filter databases, e.g. eng_0" value={filter}
         onChange={(e) => { setFilter(e.target.value); setOffset(0); }} />
         <button className="ghost" onClick={() => setAll(shown.filter((d) => !covered(d) && !closed(d)), "all")}>Select all shown</button></div>
@@ -464,7 +462,8 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
   const [read, setRead] = useState<Record<string, string>>({});
   const [failed, setFailed] = useState<[string, string][]>([]);
   const [error, setError] = useState<unknown>(null);
-  // What a discovery run the dialog waits on is doing, and since when: the connection test, or the reading on Add.
+  // What a discovery run the dialog waits on is doing, and since when: the connection test, or the reading on Add. Its
+  // Busy line (a spinner and the label) is the one place the wait is said: the dialog's action stays off meanwhile.
   const [waiting, setWaiting] = useState<DialogWait | null>(null);
   const now = useNow(waiting !== null);
   const waitText = waiting ? waitLine(waiting.reading, waiting.asked, now) : null;
@@ -535,7 +534,9 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
   };
   const wholeKey = whole.join("\n");
   useEffect(() => { if (drafting) syncDrafts(); }, [drafting, wholeKey, wholeServer.on, wholeServer.filter]);
-  const draftSteps = useDraftReads(connection, draftIds, draftGeneration);
+  // The drafts' reads start as the choice is made and go on out of sight while the user chooses: their progress shows
+  // only once Add the tables chosen hands them to New job, whose page shows it.
+  useDraftReads(connection, draftIds, draftGeneration);
   const allDrafts = () => [draftState.current.server?.id, draftState.current.named].filter((id): id is string => Boolean(id));
   // Leaving the page with the dialog open, or closing it any way but Add, discards what it started reading.
   useEffect(() => {
@@ -543,10 +544,6 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
     window.addEventListener("pagehide", leave);
     return () => { window.removeEventListener("pagehide", leave); leave(); };
   }, []);
-  const draftProgress = Object.values(draftSteps).reduce((sum: Row, step: Row) => ({
-    databases: sum.databases + Number(step.databases ?? 0), done: sum.done + Number(step.done ?? 0),
-    failed: sum.failed + Number(step.failed ?? 0), tables: sum.tables + Number(step.tables ?? 0),
-    pending: sum.pending + Number(step.pending ?? 0) }), { databases: 0, done: 0, failed: 0, tables: 0, pending: 0 });
   const label = () => (wholeServer.on ? `${connection}, ${chosenWords}` : `${chosenWords} on ${connection}`)
     + (counts ? ` (${countsLine.replace(/^Chosen: /, "")})` : "");
   const finish = async () => {
@@ -603,7 +600,8 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
     : step === 3 ? waitText ?? "Reading tables" : chosen ? undefined : "Choose the server, databases or tables first";
   return (
     <Modal title={title} action={step === 1 ? connectionNextLabel(testing) : step === 3 ? "Reading…" : "Add the tables chosen"}
-      actionDisabled={blocked} actionNote={step === 1 && testError != null ? testFailedNote(testError) : undefined} onClose={(ok) => {
+      actionDisabled={blocked} actionNote={step === 1 && testError != null ? testFailedNote(testError) : undefined}
+      busy={waiting !== null} onClose={(ok) => {
         if (!ok) return onClose(null);
         if (step === 1) return testThenNext();
         finish();
@@ -617,7 +615,6 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
           failed={failed} setFailed={setFailed} onCounts={setCounts} />}
         {waiting && <Busy label={waiting.reading} since={waiting.asked} done={waiting.done} total={waiting.total} />}
         {step === 2 && chosen > 0 && <p className="muted">{chosenWords} chosen. {countsLine}.</p>}
-        {step === 2 && drafting && draftProgress.pending > 0 && <Busy label="Reading tables" {...readsDone(draftProgress)} />}
         <ErrorBox error={error} />
       </div>
     </Modal>

@@ -57,8 +57,8 @@ export function selectionCounts(server: ServerCount | null, wholeTables: (number
 
 const n = (value: number) => value.toLocaleString("en-US");
 
-/** "Chosen: 3 of 201 databases, 3,000 tables", or just the databases while some tables aren't counted yet (the page
- *  shows a spinner for those). */
+/** "Chosen: 3 of 201 databases, 3,000 tables", or just the databases while some tables aren't counted yet (they are
+ *  counted out of sight, with no spinner, while the user chooses). */
 export function countsText(counts: { databases: number; tables: number; counting: boolean }, listed: number): string {
   const tables = counts.counting ? null : `${n(counts.tables)} ${counts.tables === 1 ? "table" : "tables"}`;
   return `Chosen: ${n(counts.databases)} of ${n(listed)} ${listed === 1 ? "database" : "databases"}${tables ? `, ${tables}` : ""}`;

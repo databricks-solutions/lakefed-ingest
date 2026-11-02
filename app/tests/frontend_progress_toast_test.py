@@ -51,3 +51,12 @@ def test_a_new_identity_column_starts_empty_and_is_saved_only_with_a_name_and_a_
     assert "<th>Column<Required /></th><th>Value<Required />" in form
     assert "identity.filter(([n, t]) => n.trim() && t.trim())" in NEW_JOB
     assert "[...typed, ...identity].filter(([n, t]) => n.trim() && t.trim())" in EDIT
+
+
+def test_the_connection_test_reads_once_a_spinner_with_its_label_and_no_second_line_beside_next():
+    # The dialog's Busy line says what runs ("Testing the connection", or "Reading tables" after Add): while it shows,
+    # the Modal keeps its action off and says nothing beside it, so the wait is never said twice.
+    assert "{waiting && <Busy label={waiting.reading} since={waiting.asked} done={waiting.done} total={waiting.total} />}" in DISCOVER
+    assert "busy={waiting !== null} onClose={(ok) => {" in DISCOVER
+    assert '{busy ? null : actionDisabled ? <span className="modal-why muted" role="status">{actionDisabled}</span>' in COMPONENTS
+    assert 'disabled={busy || !!actionDisabled}' in COMPONENTS
