@@ -82,7 +82,7 @@ databricks bundle run lakefed_ingest_app_grants -t <target> -p <profile>   # giv
 ```
 
 Then grant `CAN_USE` on the app to the people who run ingestion, and open the URL `bundle run` printed. The app's
-own settings (job ids, who manages it) are in [the operations app's deploy steps](app/README.md#deploy).
+own settings (job ids, who manages it, its SQL warehouse) are in [the operations app's deploy steps](app/README.md#deploy).
 
 Upgrades are deploy only: pull, deploy both bundles, and the Lakebase schema migrates itself on the next run (see
 [Upgrading](docs/deploy.md#upgrading)).
@@ -95,9 +95,9 @@ Upgrades are deploy only: pull, deploy both bundles, and the Lakebase schema mig
    rest of the page. **Import a CSV** is the other way in, for a list of tables you already have.
 2. **How it writes** and **When it runs.** Name the target catalog, schema and table pattern, and the cadence. The
    preview counts the tables and groups, and says how far the read is.
-3. **Create.** Up to 5,000 tables, all read, are written before Create answers. A bigger job, or one whose tables are
-   still being read, is written by a background task whose progress the page shows (reading the chosen databases'
-   tables first, then writing); a database that couldn't be read stops it by name before anything is written.
+3. **Create.** Up to 5,000 tables are written before Create answers and the job is Ready. A bigger job, or one whose
+   tables are still being read, is recorded at once: its page shows it **Preparing** (reading, writing, syncing) and
+   then Ready. A database that can't be taken is set aside with the reason, and the rest go ahead.
 4. **Turn it on.** A new job starts paused: **Paused** under When it runs is ticked by default. Untick it before
    Create, or later with **Edit**, or start one run with **Run now**. Its runs, failures and late tables show on
    **Overview**, the job's page and **Runs**.
@@ -125,7 +125,7 @@ and starts an ingest only where something changed. Both jobs ship with paused sc
 |---|---|
 | [Deployment guide](docs/deploy.md) | Every deploy step and setting, compute choices, steps outside the bundle, the first run, upgrades and schema changes |
 | [How a run works](docs/how-it-works.md) | The two implementations compared, load types, change detection, shared and append tables, concurrency, table retries, settings for large estates, control rows |
-| [Operations app](app/README.md) | The app's pages, discovery through the SQL warehouse, JDBC connections, re-discovery, the security model |
+| [Operations app](app/README.md) | The app's pages, discovery through the SQL warehouse, JDBC connections, re-discovery, a new job's preparation, the security model |
 | [Monitoring](docs/monitoring.md) | The telemetry tables and ready queries for failures, freshness and run history |
 | [Lakebase schema](docs/lakebase_schema.md) | Every Lakebase table and column, removing tables and old history, changing the schema |
 | [Scale study](docs/scale.md) | A dated simulation report of the app's paths at 100,000 and 5.28 million tables; its figures are estimates, not current guidance |
