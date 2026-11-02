@@ -9,6 +9,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
 
+import preparing
 import queries as q
 import rollup
 import schedules as sch
@@ -353,9 +354,11 @@ def consecutive_failed(summaries: List[dict]) -> int:
 
 
 def needs_attention(job: dict) -> bool:
-    """Whether a job needs a look: tables failing now, or its last ingestion run ended without finishing."""
+    """Whether a job needs a look: tables failing now, its last ingestion run ended without finishing, or it is waiting
+    for someone's choice on databases set aside while it was prepared (preparing.NEEDS_YOU)."""
     last = job["last_job_run"]
-    return bool(job["state_failing"]) or bool(last and last["outcome"]["label"] == "Ended without finishing")
+    return (bool(job["state_failing"]) or bool(last and last["outcome"]["label"] == "Ended without finishing")
+            or job.get("prepare_state") == preparing.NEEDS_YOU)
 
 
 def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], running: List[dict],
@@ -408,6 +411,10 @@ def jobs_view(schedules: List[dict], members: List[dict], states: List[dict], ru
                                    else last.get("failed_in_a_row", 0)),
                "causes": causes[:3]}
         row["status"] = status(row, current, last, causes[0]["label"] if causes else None, warnings)
+        # A job that isn't Ready yet says where its preparation stands instead: it has no runs to report.
+        options = sch.options_of(s)
+        row["prepare_state"] = preparing.state_of(options)
+        row["status"] = preparing.status_cell(options) or row["status"]
         rows.append(row)
         running_job_runs += [x for x in summaries if x["outcome"]["label"] in q.RUNNING_OUTCOMES]
     rows.sort(key=lambda j: (-1 if j["running_job_run"] and j["state_failing"] else 0 if j["state_failing"] else

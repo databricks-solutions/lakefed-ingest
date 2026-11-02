@@ -5,6 +5,8 @@ import { api, qs, type ApiError, type Row } from "../api";
 import { Refused } from "../permissions";
 import { changeInProgress, deleteNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, runButton, runTimeoutNotice,
   type RediscoveryProgress } from "../pending";
+import { AVAILABLE_WHEN_READY, preparingBar, preparingLine, scheduleWhenReady, setAsideWhy, type PrepareView,
+  type SetAside } from "../preparing";
 import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { FailingTables } from "./FailingTables";
@@ -170,6 +172,109 @@ function RunningNow({ live }: { live: Row }) {
   );
 }
 
+/** Where a job that isn't Ready stands (GET /prepare, asked every few seconds while it prepares): one line with its bar,
+ * Run now and the schedule available when it is ready, and, when it needs you, the databases set aside with why and
+ * what can be done: Read them again, Leave them out, Change the job's target names, or Delete the job. Each action is
+ * refused with the reason the server gives (the user's permission on the job), shown on its button. */
+function Preparation({ jobId, deleteRefusal, onDelete }: { jobId: string; deleteRefusal?: string | null; onDelete: () => void }) {
+  const qc = useQueryClient();
+  const confirm = useConfirm();
+  const prepare = useQuery({ queryKey: ["ingestion-job-prepare", jobId],
+    queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(jobId)}/prepare`),
+    refetchInterval: (q) => ((q.state.data as Row | undefined)?.state === "preparing" ? 3_000 : 15_000) });
+  const act = useMutation({
+    mutationFn: ({ action, body }: { action: string; body: Row }) =>
+      api.post<Row>(`/ingestion-jobs/${encodeURIComponent(jobId)}/prepare/${action}`, body),
+    onSuccess: () => ["ingestion-job-prepare", "ingestion-job"].forEach((k) => qc.invalidateQueries({ queryKey: [k, jobId] })),
+  });
+  const [renaming, setRenaming] = useState(false);
+  const p = prepare.data as (PrepareView & Row) | undefined;
+  if (!p || p.state === "ready") return <ErrorBox error={prepare.error} />;
+  const bar = preparingBar(p);
+  const line = preparingLine(p);
+  const counts: Row = p.counts ?? {};
+  const actions: Row = p.actions ?? {};
+  const listed: SetAside[] = p.set_aside ?? [];
+  const busy = act.isPending;
+  const leaveOut = () => confirm.ask({ title: "Leave them out?", action: "Leave them out", danger: true,
+    body: <p>The {fmtInt(counts.waiting)} {plural(counts.waiting, "database")} set aside come out of what this job ingests, and it
+      goes on without them. Add them later with Add tables once the job is ready.</p> })
+    .then((ok) => ok && act.mutate({ action: "leave-out", body: {} }));
+  const stopPreparing = () => confirm.ask({ title: "Stop preparing?", action: "Stop preparing",
+    body: <p>The reads going are stopped and nothing more is written. The job stays paused with its choice and what was read;
+      Prepare again goes on from where it stopped.</p> })
+    .then((ok) => ok && act.mutate({ action: "stop", body: {} }));
+  const stopped = Boolean(p.stopped);
+  return (
+    <Section title={stopped ? "Stopped" : p.state === "needs_you" ? "Needs you" : "Preparing"}
+      note="Its tables are read, then written, then its Databricks jobs are made. It runs once it is ready.">
+      {confirm.dialog}
+      {p.state === "preparing" && !stopped
+        ? <Busy label={line} done={bar?.done} total={bar?.total} />
+        : <Notice tone="warn">{line}</Notice>}
+      {p.state === "needs_you" && bar && <progress className="busy-progress" max={bar.total} value={Math.min(bar.done, bar.total)}
+        aria-label={`${line}: ${fmtInt(bar.done)} of ${fmtInt(bar.total)}`} />}
+      <p className="muted small">Run now: {AVAILABLE_WHEN_READY}. {scheduleWhenReady(p)}.</p>
+      <ErrorBox error={prepare.error || act.error} />
+      {listed.length > 0 && <>
+        <div className="table-wrap"><table className="data dense">
+          <thead><tr><th>Server</th><th>Database</th><th>Why it was set aside</th></tr></thead>
+          <tbody>{listed.map((e) => (
+            <tr key={`${e.server}/${e.database}`}><td>{e.server}</td><td className="name">{e.database}</td><td>{setAsideWhy(e)}</td></tr>
+          ))}</tbody>
+        </table></div>
+        {Number(counts.set_aside) > listed.length && <p className="muted small">The first {fmtInt(listed.length)} of{" "}
+          {fmtInt(counts.set_aside)} are listed.</p>}
+      </>}
+      {Number(counts.left_out) > 0 && <p className="muted small">Left out: {fmtInt(counts.left_out)} {plural(counts.left_out, "database")}.</p>}
+      {p.state === "preparing" && !stopped && <div className="toolbar">
+        <button disabled={busy || !!actions.stop} title={actions.stop ?? undefined} onClick={stopPreparing}>Stop preparing</button>
+      </div>}
+      {stopped && <div className="toolbar">
+        <button disabled={busy || !!actions.again} title={actions.again ?? undefined}
+          onClick={() => act.mutate({ action: "again", body: {} })}>Prepare again</button>
+        <button className="danger" disabled={!!deleteRefusal} title={deleteRefusal ?? undefined} onClick={onDelete}>Delete the job</button>
+      </div>}
+      {p.state === "needs_you" && !stopped && <div className="toolbar">
+        {Number(counts.waiting_unreadable) > 0 && <button disabled={busy || !!actions.read_again} title={actions.read_again ?? undefined}
+          onClick={() => act.mutate({ action: "read-again", body: {} })}>Read them again</button>}
+        <button disabled={busy || !!actions.leave_out} title={actions.leave_out ?? undefined} onClick={leaveOut}>Leave them out</button>
+        {Number(counts.waiting_clash) > 0 && <button disabled={busy || !!actions.targets} title={actions.targets ?? undefined}
+          onClick={() => setRenaming(true)}>Change the job's target names</button>}
+        <button className="danger" disabled={!!deleteRefusal} title={deleteRefusal ?? undefined} onClick={onDelete}>Delete the job</button>
+      </div>}
+      {renaming && <TargetNames jobId={jobId} stored={p.targets ?? {}} onClose={() => { setRenaming(false);
+        ["ingestion-job-prepare", "ingestion-job"].forEach((k) => qc.invalidateQueries({ queryKey: [k, jobId] })); }} />}
+    </Section>
+  );
+}
+
+/** Change the job's target names: the three templates, checked first (how many set-aside databases are planned again
+ *  with them), then stored on the job. Only the templates change; the job's other settings stay as Create was asked. */
+function TargetNames({ jobId, stored, onClose }: { jobId: string; stored: Row; onClose: () => void }) {
+  const [names, setNames] = useState<Row>({ sink_catalog: stored.sink_catalog ?? "", sink_schema: stored.sink_schema ?? "",
+                                            sink_table: stored.sink_table ?? "" });
+  const send = (dryRun: boolean) => api.post<Row>(`/ingestion-jobs/${encodeURIComponent(jobId)}/prepare/targets`,
+                                                  { ...names, dry_run: dryRun });
+  const check = useMutation({ mutationFn: () => send(true) });
+  const apply = useMutation({ mutationFn: () => send(false), onSuccess: () => { toast("Target names changed"); onClose(); } });
+  return (
+    <Modal title="Change the job's target names" action="Change the target names"
+      actionDisabled={!check.data ? "Check the names first" : undefined} busy={apply.isPending}
+      onClose={(ok) => (ok ? apply.mutate() : onClose())}>
+      <div className="form-grid">
+        {([["sink_catalog", "Target catalog"], ["sink_schema", "Target schema"], ["sink_table", "Target table"]] as const).map(([key, label]) => (
+          <label key={key}>{label}<input value={names[key]} onChange={(e) => { check.reset(); setNames({ ...names, [key]: e.target.value }); }} /></label>
+        ))}
+      </div>
+      <div className="toolbar"><button onClick={() => check.mutate()} disabled={check.isPending}>Check the names</button></div>
+      {check.data && <p className="muted small">{fmtInt(check.data.replan)} {plural(check.data.replan, "database")} set aside for a clash
+        {Number(check.data.replan) === 1 ? " is" : " are"} planned again with these names.</p>}
+      <ErrorBox error={check.error || apply.error} />
+    </Modal>
+  );
+}
+
 export default function IngestionJob() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
@@ -230,7 +335,9 @@ export default function IngestionJob() {
   return (
     <>
       <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"]]} />} tab={j?.name}
-        title={j ? <>{j.name} {j.paused && <Badge value="Paused" />}</> : "Ingestion job"}
+        title={j ? <>{j.name} {j.prepare && j.prepare.state !== "ready"
+          ? <Badge value={j.prepare.state === "needs_you" ? "Needs you" : "Preparing"} />
+          : j.paused && <Badge value="Paused" />}</> : "Ingestion job"}
         lead={!j ? (job.error ? undefined : <span className="muted">Loading…</span>) : <>{j.description}{j.stagger_to ? `, its groups starting up to ${j.stagger_to} minutes after that` : ""};{" "}
           <strong>{fmtInt(j.groups?.length)}</strong> {plural(j.groups?.length, "ingestion group")}, <strong>{fmtInt(j.databases)}</strong>{" "}
           {plural(j.databases, "database")}, <strong>{fmtInt(j.enabled_tables)}</strong> {plural(j.enabled_tables, "table")} on{" "}
@@ -265,6 +372,8 @@ export default function IngestionJob() {
         Last updated by {j.updated_by ?? "unknown"}{j.updated_at ? `, ${fmtTime(j.updated_at)}` : ""}</p>}
       {confirm.dialog}
       <RunningTasks jobId={id} />
+      {j?.prepare && j.prepare.state !== "ready" && !j.delete
+        && <Preparation jobId={id} deleteRefusal={j.delete_blocked} onDelete={() => setDeleting(true)} />}
       {deleting && j && <DeleteJobDialog job={j} onClose={(drop) => { setDeleting(false); if (drop !== null) remove.mutate(drop); }} />}
       {deletion && (j?.delete?.state === "deleting" ? <Busy label={deletion.text} />
         : <Notice tone={deletion.tone}>{j?.deleted_at && `Deleted on ${fmtShort(j.deleted_at)}. `}{deletion.text}

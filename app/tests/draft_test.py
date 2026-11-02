@@ -1,6 +1,6 @@
 """A draft: the tables of the databases chosen are read through the warehouse as they are chosen, before the job
 exists, and Create takes them (main._draft_reading, create_ingestion_job, _create_after_reading, discard_draft,
-_keep_selection). Lakebase, the warehouse and the write are faked; the statements themselves run against Postgres as
+drop_from_draft, _keep_selection). Lakebase, the warehouse and the write are faked; the statements themselves run against Postgres as
 the app's own role in app_role_pg_test.py."""
 import pytest
 
@@ -70,8 +70,11 @@ def test_a_discarded_draft_cant_be_created_from(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_database_lines(monkeypatch):
-    """A choice by reference to discoveries has no CSV lines naming only a database (they would be read by name)."""
+    """A choice by reference to discoveries has no CSV lines naming only a database (they would be read by name). The
+    Create here is the earlier one, which waits for the read in a task of its own (PREPARE_CREATES=0, the rollback);
+    the one that records the job at once is prepare_task_test's."""
     monkeypatch.setattr(main, "_has_database_lines", lambda source: False)
+    monkeypatch.setattr(main, "PREPARE_CREATES", False)
 
 
 def _body(dry_run):
@@ -91,8 +94,33 @@ def test_create_stops_before_anything_is_written_when_a_database_couldnt_be_read
 def test_a_preview_counts_what_is_read_so_far_and_says_how_far_the_read_is(monkeypatch):
     reading = {**_reads(pending=4, done=6, tables=600), "left_out": 0, "failed_databases": []}
     monkeypatch.setattr(main, "_draft_reading", lambda selection, advance=True: reading)
+    monkeypatch.setattr(main, "_selected_tables", lambda selection: 600)
     monkeypatch.setattr(main, "_create_now", lambda body, request, inline=None: {"summary": {"tables": 600}})
     assert main.create_ingestion_job(_body(True), request=None) == {"summary": {"tables": 600}, "reading": reading}
+
+
+def test_a_preview_with_nothing_chosen_read_yet_says_it_is_reading_and_is_asked_again(monkeypatch):
+    """Regression: before any chosen database was read, the preview answered 422 "the selection takes no tables", and
+    New job showed that error and stopped asking (NewJob.tsx asks again only while reading.pending), though the reads
+    going would bring the tables. It now says it is reading, with no summary, after the source's own checks; once the
+    reads end with still no table, the refusal is Create's as before."""
+    reading = {**_reads(pending=3, done=0, tables=0), "left_out": 0, "failed_databases": []}
+    readings = [reading, None]
+    checked = []
+    monkeypatch.setattr(main, "_draft_reading", lambda selection, advance=True: readings.pop(0))
+    monkeypatch.setattr(main, "_selected_tables", lambda selection: 0)
+    monkeypatch.setattr(main, "_new_job_source", lambda run, source, user, applying: checked.append(applying))
+
+    def refused(body, request, inline=None):
+        raise HTTPException(422, {"errors": ["the selection takes no tables"]})
+
+    monkeypatch.setattr(main, "_create_now", refused)
+    answer = main.create_ingestion_job(_body(True), request=None)
+    assert answer == {"summary": None, "settings": {}, "created": False, "reading": reading}
+    assert answer["reading"]["pending"] == 3 and checked == [False]
+    with pytest.raises(HTTPException) as no_tables:
+        main.create_ingestion_job(_body(True), request=None)
+    assert no_tables.value.status_code == 422
 
 
 def test_create_waits_for_the_read_in_a_task_then_writes_in_it(monkeypatch):
@@ -146,3 +174,63 @@ def test_the_drafts_statements_take_the_parameters_passed():
     assert marks(q.draft_of_sql()) == 1 and marks(q.draft_touch_sql()) == 2 and marks(q.draft_discard_sql()) == 1
     assert marks(q.draft_claim_sql()) == 2 and marks(q.draft_reads_sql()) == 1 and marks(q.draft_failed_sql()) == 1
     assert "not (coalesce(listing, '{}'::jsonb) ? 'discarded')" in q.warehouse_claim_sql("read")
+
+
+def test_with_the_background_reader_running_a_wait_only_keeps_the_draft_wanted_and_wakes_it(monkeypatch):
+    advanced, written = _lakebase(monkeypatch, [_reads(pending=3, done=1)])
+    woken = []
+    monkeypatch.setattr(main.READER, "running", lambda: True)
+    monkeypatch.setattr(main.READER, "wake", lambda: woken.append(True))
+    reading = main._draft_reading(SELECTION)
+    assert advanced == [] and woken == [True] and written == [(q.draft_touch_sql(), ("d1", "d1"))]
+    assert reading["pending"] == 3
+
+
+# ---- dropping un-ticked databases from a draft -----------------------------------------------------------------------
+
+@pytest.fixture
+def client(monkeypatch):
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+    calls = {"queries": [], "cancelled": []}
+    answers = {q.draft_of_sql(): [{"src_connection": "sql_a", "draft_by": "op@example.com"}],
+               q.draft_drop_sql(): [{"src_database": "eng_002", "statement_id": "s-2"},
+                                    {"src_database": "eng_003", "statement_id": None}]}
+
+    def query(sql, params=()):
+        calls["queries"].append((sql, params))
+        return answers[sql]
+
+    def cancel(statement_id):
+        calls["cancelled"].append(statement_id)
+        raise RuntimeError("it ended meanwhile")
+    monkeypatch.setattr(main.db, "query", query)
+    monkeypatch.setattr(main.warehouse, "cancel", cancel)
+    c = TestClient(main.app, headers={"X-Forwarded-Email": "op@example.com"})
+    c.calls, c.answers = calls, answers
+    return c
+
+
+def test_dropping_un_ticked_databases_marks_them_and_cancels_their_statements_going(client):
+    body = client.post("/api/discoveries/d1/drop", json={"databases": ["eng_002", " eng_003 ", "eng_002", " "]}).json()
+    assert body == {"discovery_id": "d1", "dropped": 2, "cancelled": 1}
+    assert client.calls["queries"][1] == (q.draft_drop_sql(), ("d1", ["eng_002", "eng_003"], "d1"))
+    assert client.calls["cancelled"] == ["s-2"]
+
+
+def test_only_the_person_who_started_an_open_draft_drops_from_it(client):
+    other = client.post("/api/discoveries/d1/drop", json={"databases": ["eng_002"]},
+                        headers={"X-Forwarded-Email": "someone@example.com"})
+    assert other.status_code == 403 and "op@example.com" in other.json()["detail"]
+    client.answers[q.draft_of_sql()] = []
+    closed = client.post("/api/discoveries/d1/drop", json={"databases": ["eng_002"]})
+    assert closed.status_code == 409 and "not an open draft" in closed.json()["detail"]
+    assert client.post("/api/discoveries/d1/drop", json={"databases": []}).status_code == 422
+    assert [sql for sql, _ in client.calls["queries"]] == [q.draft_of_sql(), q.draft_of_sql()]
+    assert client.calls["cancelled"] == []
+
+
+def test_a_drop_needs_a_signed_in_user(client):
+    from fastapi.testclient import TestClient
+    assert TestClient(main.app).post("/api/discoveries/d1/drop", json={"databases": ["eng_002"]}).status_code == 403
+    assert client.calls["queries"] == []

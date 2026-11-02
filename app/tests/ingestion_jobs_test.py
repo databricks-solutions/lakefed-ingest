@@ -289,3 +289,21 @@ def test_a_check_started_run_counts_the_tables_its_check_found_unchanged_and_a_g
     assert (got["total"], got["unchanged"] + got["loaded"], got["not_run"]) == (13, 13, 0)
     assert ij._progress({"state": "no run"}, {}, 13) == {"total": 13, "unchanged": 0, "loaded": 0, "in_flight": 0,
                                                          "failed": 0, "not_run": 13}
+
+
+def test_a_job_that_isnt_ready_says_so_in_its_status_and_one_that_needs_you_needs_attention():
+    import preparing as p
+    record = p.moved(p.new_record("ann", {}, {}, {}, {}, turn_on=True, state=p.PREPARING, stage=p.READING),
+                     progress={"percent": 41, "minutes_left": 12})
+    waiting = p.with_set_aside(dict(record, stage=p.WRITING),
+                               [p.entry("srv1", "c3_db", p.UNREADABLE, "Login failed")])
+    schedules = [dict(SCHEDULES[0], paused=True, options=json.dumps({p.OPTION: record})),
+                 dict(SCHEDULES[1], options={p.OPTION: waiting})]
+    v = ij.jobs_view(schedules, MEMBERS, STATES, [], [], STATS, NOW)
+    east, nightly = sorted(v["jobs"], key=lambda j: j["name"])
+    assert east["status"] == {"label": "Preparing", "tone": "run", "cause": None,
+                              "detail": ["reading tables", "41%", "about 12 min left"]}
+    assert nightly["status"]["label"] == "Needs you" and nightly["status"]["detail"] == ["1 database set aside"]
+    assert [j["name"] for j in v["attention"]] == ["East hourly", "Nightly"]   # East's failing tables, Nightly's choice
+    assert ij.needs_attention(dict(state_failing=0, last_job_run=None, prepare_state=p.NEEDS_YOU))
+    assert not ij.needs_attention(dict(state_failing=0, last_job_run=None, prepare_state=p.PREPARING))

@@ -129,3 +129,102 @@ def test_unit_tests_never_reach_a_workspace_through_the_warehouse_client(monkeyp
     monkeypatch.setattr(warehouse, "WAREHOUSE_ID", "wh1")
     with pytest.raises(RuntimeError, match="never reach a Databricks workspace"):
         warehouse.start("SELECT 1", [])
+
+
+# ---- which warehouse the app's queries run on, and what Manage says of it ------------------------------------------
+
+def test_app_warehouse_id_wins_over_the_bundles_own_warehouse_when_it_is_set():
+    assert warehouse.chosen_warehouse({"APP_WAREHOUSE_ID": " mine ", "WAREHOUSE_ID": "own"}) == (
+        "mine", "app_warehouse_id")
+
+
+def test_the_bundles_own_warehouse_is_used_when_app_warehouse_id_is_unset_or_blank():
+    assert warehouse.chosen_warehouse({"WAREHOUSE_ID": "own"}) == ("own", "the bundle's own")
+    assert warehouse.chosen_warehouse({"APP_WAREHOUSE_ID": "", "WAREHOUSE_ID": "own"}) == ("own", "the bundle's own")
+    assert warehouse.chosen_warehouse({"APP_WAREHOUSE_ID": "   ", "WAREHOUSE_ID": "own"}) == ("own", "the bundle's own")
+    assert warehouse.chosen_warehouse({}) == ("", "the bundle's own")
+
+
+def test_the_bundles_id_prefix_is_read_as_the_setting_and_a_bare_prefix_as_unset():
+    # The bundle always sends "id:<app_warehouse_id>", since Databricks Apps refuses a blank env value (1 Nov deploy).
+    assert warehouse.chosen_warehouse({"APP_WAREHOUSE_ID": "id:", "WAREHOUSE_ID": "own"}) == ("own", "the bundle's own")
+    assert warehouse.chosen_warehouse({"APP_WAREHOUSE_ID": "id:  ", "WAREHOUSE_ID": "own"}) == (
+        "own", "the bundle's own")
+    assert warehouse.chosen_warehouse({"APP_WAREHOUSE_ID": "id:4a07038bb7c29b51", "WAREHOUSE_ID": "own"}) == (
+        "4a07038bb7c29b51", "app_warehouse_id")
+
+
+def test_every_statement_goes_to_the_chosen_warehouse(workspace, monkeypatch):
+    client = workspace(_Statements([_answer(StatementState.PENDING)]))
+    monkeypatch.setattr(warehouse, "WAREHOUSE_ID", warehouse.chosen_warehouse(
+        {"APP_WAREHOUSE_ID": "mine", "WAREHOUSE_ID": "own"})[0])
+    warehouse.start("SELECT 1", [])
+    assert client.statement_execution.sent[0]["warehouse_id"] == "mine"
+
+
+class _Described:
+    """The Warehouses API's get, answering one warehouse as GetWarehouseResponse, or refusing."""
+
+    def __init__(self, found=None, error=None):
+        self.found, self.error, self.asked = found, error, []
+
+    def get(self, id):
+        self.asked.append(id)
+        if self.error:
+            raise self.error
+        return self.found
+
+
+def _describe(monkeypatch, warehouses, chosen_by="app_warehouse_id"):
+    from types import SimpleNamespace
+    monkeypatch.setattr(warehouse, "workspace", lambda: SimpleNamespace(warehouses=warehouses))
+    monkeypatch.setattr(warehouse, "WAREHOUSE_ID", "wh1")
+    monkeypatch.setattr(warehouse, "CHOSEN_BY", chosen_by)
+    return warehouse.description()
+
+
+def _found(warehouse_type, serverless, state="RUNNING", name="ops warehouse"):
+    from databricks.sdk.service.sql import GetWarehouseResponse
+    return GetWarehouseResponse.from_dict({"id": "wh1", "name": name, "warehouse_type": warehouse_type,
+                                           "enable_serverless_compute": serverless, "state": state})
+
+
+def test_a_pro_serverless_warehouse_is_described_with_no_problem(monkeypatch):
+    warehouses = _Described(_found("PRO", True, name="lakefed_ingest discovery"))
+    assert _describe(monkeypatch, warehouses, "the bundle's own") == {
+        "id": "wh1", "chosen_by": "the bundle's own", "name": "lakefed_ingest discovery", "type": "PRO",
+        "serverless": True, "state": "RUNNING", "problem": None}
+    assert warehouses.asked == ["wh1"]
+
+
+def test_a_pro_warehouse_on_the_customers_network_is_described_with_no_problem(monkeypatch):
+    assert _describe(monkeypatch, _Described(_found("PRO", False, state="STOPPED"))) == {
+        "id": "wh1", "chosen_by": "app_warehouse_id", "name": "ops warehouse", "type": "PRO", "serverless": False,
+        "state": "STOPPED", "problem": None}
+
+
+def test_a_classic_warehouse_is_described_with_a_plain_problem_line_and_nothing_refuses_it(monkeypatch):
+    described = _describe(monkeypatch, _Described(_found("CLASSIC", False)))
+    assert (described["type"], described["serverless"], described["state"]) == ("CLASSIC", False, "RUNNING")
+    assert described["problem"] == ("This is a Classic warehouse, and remote_query doesn't run on one: set "
+                                    "app_warehouse_id to a Pro or serverless warehouse on version 2025.35 or above.")
+    assert warehouse.configured() is True
+
+
+def test_an_unreadable_warehouse_says_why_and_names_the_grants_job_for_one_of_your_own(monkeypatch):
+    refused = _Described(error=PermissionError("PERMISSION_DENIED: no access to warehouse wh1.\ntrace"))
+    described = _describe(monkeypatch, refused)
+    assert {k: described[k] for k in ("id", "chosen_by", "name", "type", "serverless", "state")} == {
+        "id": "wh1", "chosen_by": "app_warehouse_id", "name": None, "type": None, "serverless": None, "state": None}
+    assert described["problem"] == ("The warehouse can't be read: PERMISSION_DENIED: no access to warehouse wh1. The "
+                                    "grants job (lakefed_ingest_app_grants) gives the app CAN_USE on it.")
+    assert _describe(monkeypatch, refused, "the bundle's own")["problem"] == (
+        "The warehouse can't be read: PERMISSION_DENIED: no access to warehouse wh1.")
+
+
+def test_no_warehouse_at_all_is_described_without_asking_databricks(monkeypatch):
+    monkeypatch.setattr(warehouse, "WAREHOUSE_ID", "")
+    monkeypatch.setattr(warehouse, "CHOSEN_BY", "the bundle's own")
+    described = warehouse.description()
+    assert described["id"] is None and described["name"] is None
+    assert described["problem"].startswith("No SQL warehouse is set")

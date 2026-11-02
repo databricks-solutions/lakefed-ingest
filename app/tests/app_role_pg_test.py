@@ -429,3 +429,54 @@ def _seed_job(conn, name, group):
         conn.execute("insert into lakefed_ingest.schedule_member (schedule_id, task_collection) values (%s, %s)",
                      (sid, group))
     return sid
+
+
+def test_create_at_once_records_the_job_and_its_prepare_task_then_the_task_makes_it_ready_as_the_apps_role(
+        client, monkeypatch):
+    """Create records the job, its choice, its claimed draft and its prepare task in one transaction and answers;
+    the task, run after (as its thread would), reads, writes and makes the job Ready, every statement as the app's
+    role: the claim (FOR UPDATE SKIP LOCKED), the heartbeat, the fence in each write, the record."""
+    monkeypatch.setattr(main, "PREPARE_POLL_S", 0)
+    monkeypatch.setattr(main, "BACKGROUND_ROWS", 1)          # past it, Create records the job whatever the reads
+    started = []
+    monkeypatch.setattr(main, "_start_background", started.append)
+    did = _draft(client, ["eng_001", "eng_002"])
+    selection = {"discovery_id": did, "databases": [{"server": "sql_a", "database": d} for d in ("eng_001", "eng_002")]}
+    made = client.post("/api/ingestion-jobs", json={"name": "At once", "settings": SETTINGS, "dry_run": False,
+                                                    "request_id": "at-once-1", "source": selection})
+    assert made.status_code == 200 and made.json()["prepare"]["state"] == "preparing", made.text
+    sid = made.json()["id"]
+    assert client.sql("select paused, options -> 'prepare' ->> 'state' from lakefed_ingest.schedule where id = %s",
+                      (sid,)) == [(True, "preparing")]
+    assert client.sql("select kind, status from lakefed_ingest.app_task where job_id = %s", (sid,)) == [
+        ("prepare", "running")]
+    assert client.sql("select count(*) from lakefed_ingest.control") == [(0,)] and len(started) == 1
+    started.pop()()
+    assert client.sql("select options -> 'prepare' ->> 'state' from lakefed_ingest.schedule where id = %s",
+                      (sid,)) == [("ready",)]
+    assert client.sql("select count(*), count(distinct src_database) from lakefed_ingest.control") == [(4, 2)]
+    assert client.sql("select status from lakefed_ingest.app_task where job_id = %s", (sid,)) == [("succeeded",)]
+
+
+def test_stop_preparing_and_prepare_again_run_as_the_apps_role(client, monkeypatch):
+    monkeypatch.setattr(main, "PREPARE_POLL_S", 0)
+    monkeypatch.setattr(main, "BACKGROUND_ROWS", 1)
+    started, cancelled = [], []
+    monkeypatch.setattr(main, "_start_background", started.append)
+    monkeypatch.setattr(main.warehouse, "cancel", cancelled.append)
+    did = _draft(client, ["eng_001", "eng_002", "eng_003"])
+    selection = {"discovery_id": did, "databases": [{"server": "sql_a", "database": d}
+                                                    for d in ("eng_001", "eng_002", "eng_003")]}
+    sid = client.post("/api/ingestion-jobs", json={"name": "Stopped", "settings": SETTINGS, "dry_run": False,
+                                                   "request_id": "stopped-1", "source": selection}).json()["id"]
+    stopped = client.post(f"/api/ingestion-jobs/{sid}/prepare/stop")
+    assert stopped.status_code == 200 and stopped.json()["stopped"] is True, stopped.text
+    assert client.sql("select status from lakefed_ingest.app_task where job_id = %s", (sid,)) == [("failed",)]
+    started.pop()()                                            # the thread sees it stopped: nothing written
+    assert client.sql("select count(*) from lakefed_ingest.control") == [(0,)]
+    again = client.post(f"/api/ingestion-jobs/{sid}/prepare/again")
+    assert again.status_code == 200 and again.json()["started"] is True, again.text
+    started.pop()()
+    assert client.sql("select options -> 'prepare' ->> 'state' from lakefed_ingest.schedule where id = %s",
+                      (sid,)) == [("ready",)]
+    assert client.sql("select count(distinct src_database) from lakefed_ingest.control") == [(3,)]

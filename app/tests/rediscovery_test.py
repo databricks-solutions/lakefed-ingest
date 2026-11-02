@@ -447,7 +447,7 @@ def test_a_run_records_each_phase_as_it_starts_and_its_outcome_last(monkeypatch)
 def test_run_now_starts_a_re_discovery_unless_one_holds_the_job(monkeypatch):
     from fastapi.testclient import TestClient
     started = []
-    monkeypatch.setattr(main, "_load_schedule", lambda sid, cur=None: ([{"id": 7, "options": {}}], []))
+    monkeypatch.setattr(main, "_load_schedule", lambda sid, cur=None: ({"id": 7, "options": {}}, []))
     monkeypatch.setattr(main, "_job_permission_refusals", lambda s, user: {"change": None})
     monkeypatch.setattr(main, "_start_background", lambda work: work())
     monkeypatch.setattr(main, "_run_rediscovery", lambda sid, when: started.append(sid))
@@ -464,7 +464,7 @@ def test_run_now_starts_a_re_discovery_unless_one_holds_the_job(monkeypatch):
 
 def test_run_now_is_refused_when_the_job_cannot_change(monkeypatch):
     from fastapi.testclient import TestClient
-    monkeypatch.setattr(main, "_load_schedule", lambda sid, cur=None: ([{"id": 7, "options": {}}], []))
+    monkeypatch.setattr(main, "_load_schedule", lambda sid, cur=None: ({"id": 7, "options": {}}, []))
     monkeypatch.setattr(main, "_job_permission_refusals", lambda s, user: {"change": "the job is being deleted"})
     claims = []
     monkeypatch.setattr(main.db, "query", lambda sql, params=(): claims.append(sql) or [{"id": 7}])

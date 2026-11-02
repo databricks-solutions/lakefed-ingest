@@ -391,6 +391,9 @@ def big(monkeypatch):
 def _big_client(monkeypatch):
     source = Source({("sql_a", f"eng_{i:03d}"): [f"t{t}" for t in range(5)] for i in range(30)})
     store, tasks, fake = Store(), ByDatabaseTasks(), FakeDB()
+    # The earlier Create, a big one written in a task of its own (PREPARE_CREATES=0, the rollback); the Create that
+    # records the job at once and prepares it after is prepare_task_test's.
+    monkeypatch.setattr(main, "PREPARE_CREATES", False)
 
     def query(sql, params=()):
         if sql == q.selected_count_sql("upload"):
@@ -822,3 +825,17 @@ def test_create_with_no_name_and_no_target_is_refused_naming_both(big):
     assert answer.status_code == 422
     assert answer.json()["detail"]["errors"] == ["name the job", "set the target catalog", "set the target schema"]
     assert big.store.controls == [] and big.store.schedules == []
+
+
+def test_two_databases_whose_tables_take_one_target_refuse_the_write_and_none_is_dropped_silently(big):
+    """Each database is planned alone, so two of them writing one target meet first in one insert, where Postgres
+    skips the second as a conflict with the first: the second must refuse the write, not go missing."""
+    r = big.post("/api/ingestion-jobs", json={"name": "Big job", "dry_run": False, "request_id": "big-1",
+                                              "settings": {"fan_in": False, "sink_catalog": "main",
+                                                           "sink_schema": "bronze", "sink_table": "{table}"},
+                                              "source": {"upload_id": "u1", "whole_server": True}})
+    assert r.status_code == 202
+    big.tasks.run()
+    failed = big.get("/api/tasks/1").json()
+    assert failed["status"] == "failed" and "another table already writes main.bronze.t0" in failed["error"]
+    assert big.store.controls == []

@@ -5,16 +5,38 @@ The app can't open a SQL Server connection itself: Unity Catalog keeps the conne
 Databricks compute, a pro or serverless SQL warehouse or a cluster. The work is plain SQL (remote_query sends a query
 in SQL Server's own language through the connection), so a small serverless warehouse, which starts in seconds, does
 it without a cluster or a notebook. The app runs the statements as its own service principal, which has CAN_USE on
-the warehouse (an app resource) and USE CONNECTION on the connections (the grants job).
+the warehouse and USE CONNECTION on the connections (the grants job).
+
+The warehouse is the bundle's own (WAREHOUSE_ID, from the app resource), unless the bundle's app_warehouse_id names one
+of the customer's own (APP_WAREHOUSE_ID), say one that runs in their network and reaches sources serverless can't. That
+one must be Pro or serverless, on version 2025.35 or above, since remote_query doesn't run on a Classic warehouse; the
+grants job gives the app CAN_USE on it. Manage shows which is in use (description).
 
 A statement waits START_WAIT_S on the warehouse, then carries on there; the page asks again (read) until it ends, so
 no request waits long and any app instance can answer."""
 import os
-from typing import List, Optional
+from typing import List, Mapping, Optional, Tuple
 
 from lakebase import workspace
 
-WAREHOUSE_ID = os.environ.get("WAREHOUSE_ID", "").strip()
+BUNDLES_OWN = "the bundle's own"
+APP_WAREHOUSE_SETTING = "app_warehouse_id"
+
+
+def chosen_warehouse(environ: Mapping[str, str]) -> Tuple[str, str]:
+    """The warehouse the app's queries run on, and which setting chose it: APP_WAREHOUSE_ID (the bundle's
+    app_warehouse_id) when it is set, else WAREHOUSE_ID (the bundle's own warehouse). The bundle sends it as
+    "id:<app_warehouse_id>", since Databricks Apps refuses a blank env value, so "id:" alone, blank or missing all
+    count as unset."""
+    own = (environ.get("APP_WAREHOUSE_ID") or "").strip()
+    if own.startswith("id:"):
+        own = own[len("id:"):].strip()
+    if own:
+        return own, APP_WAREHOUSE_SETTING
+    return (environ.get("WAREHOUSE_ID") or "").strip(), BUNDLES_OWN
+
+
+WAREHOUSE_ID, CHOSEN_BY = chosen_warehouse(os.environ)
 START_WAIT_S = 10       # the Statement Execution API takes 0, or 5 to 50 seconds
 ENDED = ("SUCCEEDED", "FAILED", "CANCELED", "CLOSED")
 
@@ -67,6 +89,32 @@ def warehouse_state() -> str:
         return getattr(state, "value", state) or ""
     except Exception:
         return ""
+
+
+def description() -> dict:
+    """The warehouse the app's queries run on, for Manage to show: its id, name, type (PRO, CLASSIC), whether it is
+    serverless, its state, which setting chose it, and a plain problem line when remote_query can't run on it (a
+    Classic warehouse) or it can't be read. Read only: the app starts and runs whatever this says."""
+    out = {"id": WAREHOUSE_ID or None, "chosen_by": CHOSEN_BY, "name": None, "type": None, "serverless": None,
+           "state": None, "problem": None}
+    if not WAREHOUSE_ID:
+        out["problem"] = "No SQL warehouse is set (WAREHOUSE_ID is empty), so Discover runs the discovery job instead."
+        return out
+    try:
+        found = workspace().warehouses.get(WAREHOUSE_ID)
+    except Exception as e:
+        reason = str(e).strip().split("\n")[0][:300].rstrip(".")
+        grant = (" The grants job (lakefed_ingest_app_grants) gives the app CAN_USE on it."
+                 if CHOSEN_BY == APP_WAREHOUSE_SETTING else "")
+        out["problem"] = f"The warehouse can't be read: {reason}.{grant}"
+        return out
+    kind = getattr(found.warehouse_type, "value", found.warehouse_type) or None
+    state = getattr(found.state, "value", found.state) or None
+    out.update(name=found.name, type=kind, serverless=bool(found.enable_serverless_compute), state=state)
+    if kind == "CLASSIC":
+        out["problem"] = ("This is a Classic warehouse, and remote_query doesn't run on one: set app_warehouse_id to a "
+                          "Pro or serverless warehouse on version 2025.35 or above.")
+    return out
 
 
 def _view(answer) -> dict:

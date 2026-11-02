@@ -200,6 +200,7 @@ def test_the_tables_page_checks_permission_before_it_locks_rows(monkeypatch, pat
 def test_a_row_moved_between_the_check_and_its_lock_is_checked_again(monkeypatch):
     seen = []
     monkeypatch.setattr(main, "_groups_refusal", lambda groups, user: seen.append(sorted(groups)) or None)
+    monkeypatch.setattr(main, "_refuse_unready_groups", lambda groups, refusal_of: None)
     request = SimpleNamespace(headers={"X-Forwarded-Email": "ops@example.com"})
     main._recheck_locked_rows([{"task_collection": "c1"}, {"task_collection": "c9"}], {"c1"}, request)
     assert seen == [["c9"]]

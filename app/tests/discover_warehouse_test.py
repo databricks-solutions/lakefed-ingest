@@ -211,11 +211,15 @@ def test_the_page_checks_access_for_the_databases_it_shows_and_hears_how_many_of
     calls = _advance_recorded(monkeypatch, {"databases": 2, "pending": 1, "open": 1, "closed": 0, "tables": 5,
                                             "state": "RUNNING", "warehouse": "RUNNING"})
     asked = []
-    monkeypatch.setattr(main.db, "query", lambda sql, params=(): asked.append((sql, params)) or [{"unchecked": 0}])
+
+    def query(sql, params=()):
+        asked.append((sql, params))
+        return [{"src_connection": "sql_a"}] if sql == q.discovery_connection_sql() else [{"unchecked": 0}]
+    monkeypatch.setattr(main.db, "query", query)
     body = client.post("/api/discoveries/abc123/access?connection=sql_a", json={"first": ["eng_001"]}).json()
     assert body["pending"] == 1 and body["pending_shown"] == 0           # the rest of the server isn't the page's
     assert calls == [("check", "abc123", "sql_a", ["eng_001"])]
-    assert asked == [(q.warehouse_unchecked_sql(), ("abc123", ["eng_001"]))]
+    assert asked == [(q.discovery_connection_sql(), ("abc123",)), (q.warehouse_unchecked_sql(), ("abc123", ["eng_001"]))]
     assert client.post("/api/discoveries/abc123/access?connection=sql_other", json={}).status_code == 404
 
 
@@ -223,8 +227,41 @@ def test_the_page_asks_for_the_reads_until_they_end(client, monkeypatch):
     client.use([_answer("SUCCEEDED", rows=[])])
     calls = _advance_recorded(monkeypatch, {"databases": 1, "pending": 0, "done": 1, "failed": 0, "tables": 3,
                                             "state": "SUCCEEDED", "warehouse": "RUNNING"})
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): [{"src_connection": "sql_a"}])
     body = client.get("/api/discoveries/abc123/reads?connection=sql_a").json()
     assert body["state"] == "SUCCEEDED" and body["via"] == "warehouse" and calls == [("read", "abc123", "sql_a", [])]
+
+
+def test_a_discoverys_statements_go_only_through_its_own_connection(client, monkeypatch):
+    client.use([_answer("SUCCEEDED", rows=[])])
+    calls = _advance_recorded(monkeypatch)
+    monkeypatch.setattr(main, "connections", lambda: {"connections": [{"name": "sql_a"}, {"name": "sql_b"}],
+                                                      "error": None})
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): [{"src_connection": "sql_a"}]
+                        if sql == q.discovery_connection_sql() else [{"unchecked": 0}])
+    assert client.get("/api/discoveries/abc123/reads?connection=sql_b").status_code == 409
+    assert client.post("/api/discoveries/abc123/access?connection=sql_b", json={}).status_code == 409
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): [])
+    assert client.get("/api/discoveries/gone/reads?connection=sql_a").status_code == 404
+    assert calls == []
+
+
+def test_with_the_background_reader_running_the_page_only_hears_where_the_reads_stand(client, monkeypatch):
+    fake = client.use([_answer("SUCCEEDED", rows=[])], state="STARTING")
+    monkeypatch.setattr(main.warehouse_reads, "advance", lambda *a, **k: pytest.fail("the page took a step"))
+    woken = []
+    monkeypatch.setattr(main.READER, "running", lambda: True)
+    monkeypatch.setattr(main.READER, "wake", lambda: woken.append(True))
+    monkeypatch.setattr(main.READER, "recent_error", lambda discovery_id: None)
+    progress = {"databases": 3, "pending": 2, "done": 1, "failed": 0, "tables": 4}
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): [{"src_connection": "sql_a"}]
+                        if sql == q.discovery_connection_sql() else [progress])
+    body = client.get("/api/discoveries/abc123/reads?connection=sql_a").json()
+    assert body == {"discovery_id": "abc123", "via": "warehouse", **progress, "state": "RUNNING", "warehouse": "STARTING"}
+    assert woken == [True] and fake.sent == []
+    monkeypatch.setattr(main.READER, "recent_error",
+                        lambda discovery_id: "the warehouse was deleted" if discovery_id == "abc123" else None)
+    assert client.get("/api/discoveries/abc123/reads?connection=sql_a").json()["error"] == "the warehouse was deleted"
 
 
 def test_rediscovery_reads_a_connections_server_through_the_warehouse_not_the_job(client, monkeypatch):
@@ -238,7 +275,8 @@ def test_rediscovery_reads_a_connections_server_through_the_warehouse_not_the_jo
     assert main._discover_through_warehouse({"src_connection": "sql_a", "databases": "*", "pattern": "eng%",
                                              "requested_by": "re-discovery"}, "d7") is None
     sql, params = client.written[0]
-    assert params == ("d7", "sql_a", "eng_001", "re-discovery", "d7", "sql_a", "eng_002", "re-discovery")
+    assert params == ("d7", "sql_a", "eng_001", "re-discovery", "{}", "d7", "sql_a", "eng_002", "re-discovery", "{}")
+    assert sql == q.warehouse_named_rows_sql(2)
 
 
 def test_rediscovery_through_the_warehouse_says_why_a_listing_failed(client, monkeypatch):

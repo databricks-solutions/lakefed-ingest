@@ -7,6 +7,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 
 @pytest.fixture(autouse=True)
+def _empty_lakebase_pool():
+    """Lakebase's pool of idle connections starts and ends every test empty, so no test's (fake) connection is handed
+    to the next."""
+    import lakebase
+    lakebase.close_idle()
+    yield
+    lakebase.close_idle()
+
+
+@pytest.fixture(autouse=True)
 def _no_shared_reads_between_tests():
     """The app shares monitoring reads for a few seconds (main._shared); one test's answers must not
     reach the next."""

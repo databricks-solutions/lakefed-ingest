@@ -13,6 +13,9 @@
 #     deployer and makes the copies of the ingestion job (each gives the app CAN_MANAGE on it);
 #   - the discovery warehouse below: CAN_USE through an app resource, to run discovery's catalog queries through the
 #     Unity Catalog connections (remote_query; app/src/warehouse.py says why the app can't open them itself);
+#   - with app_warehouse_id set, a SQL warehouse of your own: CAN_USE from the lakefed_ingest_app_grants job below (an
+#     additive update of its access list), and the app runs those queries there instead (APP_WAREHOUSE_ID). An app
+#     resource can't be switched by a variable, so the discovery warehouse stays an app resource either way;
 #   - Lakebase: granted by the lakefed_ingest_app_grants job below (run once after the first deploy,
 #     as the instance manager / tables' owner): CAN_USE on the instance, a Postgres role, and
 #     SELECT / INSERT / UPDATE on the lakefed_ingest tables. The app has no `database` resource:
@@ -47,6 +50,14 @@ resources:
             value: ${var.deleted_job_retention_days}
           - name: WAREHOUSE_ID
             value_from: discovery-warehouse
+          # Always a value: Databricks Apps refuses an env entry whose value is blank ("Must specify environment
+          # variable source"), so a blank app_warehouse_id arrives as "id:" and warehouse.py reads it as unset.
+          - name: APP_WAREHOUSE_ID
+            value: id:${var.app_warehouse_id}
+          - name: READS_START_CAP
+            value: ${var.reads_start_cap}
+          - name: READS_MAX_CAP
+            value: ${var.reads_max_cap}
           - name: APP_VERSION
             value: ${var.app_version}
           - name: APP_MANAGERS
@@ -120,7 +131,7 @@ resources:
   jobs:
     lakefed_ingest_app_grants:
       name: "lakefed_ingest_app_grants"
-      description: "Grant the operations app's service principal access to the lakefed_ingest Lakebase tables, USE CONNECTION on the source_connections, and WRITE on the JDBC login scope. Run as the deployer, who owns the tables and created the scope; idempotent."
+      description: "Grant the operations app's service principal access to the lakefed_ingest Lakebase tables, USE CONNECTION on the source_connections, WRITE on the JDBC login scope, and CAN_USE on app_warehouse_id when it is set. Run as the deployer, who owns the tables and created the scope; idempotent."
       # Serverless: the task only talks to the Lakebase instance and the workspace APIs.
       tasks:
         - task_key: grant_app_access
@@ -133,6 +144,7 @@ resources:
               db_name: ${var.lakebase_database}
               source_connections: ${var.source_connections}
               jdbc_login_scope: ${var.jdbc_login_scope}
+              app_warehouse_id: ${var.app_warehouse_id}
       environments:
         - environment_key: lakebase_client
           spec:

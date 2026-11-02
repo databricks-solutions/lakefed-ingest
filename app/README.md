@@ -15,7 +15,7 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 | **Schedules** | Run collections at a cadence (see [Schedules](#schedules)): create, edit, pause, resume and delete schedules; each member's next run, wrapper job, last run, p95 run time, skipped triggers, and warnings for overruns and SLAs a schedule can't meet |
 | **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag, SLA). Filter by collection, text, or failing / SLA breached / no SLA / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection, or switch to reads through a UC connection), **enable**, **disable** or **force a reseed**. Changing `write_mode` needs a new sink in the same edit (an append sink and a merge sink can't share a table) |
 | **Databricks jobs** | Under Schedules and jobs: the Databricks ingestion job's active and recent runs (with the ingestion job that started each); **cancel** a run |
-| **Manage** | Only for those with Can Manage on the app itself (see [Security model](#security-model)): the app's version (the commit it was deployed from, and its active deployment) and the state database's schema version against the app's (see Schema upgrades, under Deploy); **Export as CSV** of one, several or every ingestion job's enabled tables, in the columns Create from one CSV reads, with an `ingestion_job` column naming each line's job (streamed a page at a time, so a 200,000-table export works; one job's lines import as a new ingestion job, and an import refuses a file of several jobs); and the Databricks jobs the app runs, each linked |
+| **Manage** | Only for those with Can Manage on the app itself (see [Security model](#security-model)): the app's version (the commit it was deployed from, and its active deployment) and the state database's schema version against the app's (see Schema upgrades, under Deploy); the SQL warehouse the app's queries run on, read only (its name and id, Pro or serverless, its state, and whether it is the bundle's own or `app_warehouse_id`, with a plain line when it is Classic or can't be read; see Discovery through the SQL warehouse); **Export as CSV** of one, several or every ingestion job's enabled tables, in the columns Create from one CSV reads, with an `ingestion_job` column naming each line's job (streamed a page at a time, so a 200,000-table export works; one job's lines import as a new ingestion job, and an import refuses a file of several jobs); and the Databricks jobs the app runs, each linked |
 | **Changes** | The change log: every add, register, edit, enable / disable and reseed made in the app, with who, what and when |
 | **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop): a JDBC source (host and secret) or a UC connection (`use_remote_query`), `write_mode`, `client_attrs` and `jdbc_options` |
 | **Bulk import** | Discover a server's tables (the `lakefed_ingest_discover` job, catalog metadata only), review the recommended settings in an editable grid, set shared fields once (collection, sink catalog / schema / table templates, `client_id` template, freshness SLA), and register the selection. Tables at or above a size threshold (default 1 GB) get a partitioned seed; tables already registered start unticked; duplicates are skipped |
@@ -149,10 +149,37 @@ service principal.
 | The database list | one statement per database (`warehouse_reads.ACCESS_SQL`): opening it is the check, and it counts its tables. Only the page shown is checked (another page or filter checks its own), so a server of 22,000 databases is never checked as a whole. A database the login can't open is greyed out, can't be ticked, and says why on hover; ticking the whole server leaves out the ones found so and says how many, and one on a page not looked at fails in the read with the server's reason, named before anything is added |
 | Reading the chosen tables | one statement per database (`source_catalog.TABLE_SUMMARY_SQL`, one row per user table), saved to `discovered_table` with the same recommendations as the discovery job |
 
-At most 16 statements of one discovery are going at once (`warehouse_reads.IN_FLIGHT`). Each request the page makes
-does one step: it reads the statements going, saves the ones that ended and starts more. Where each database stands
-is kept on its `discovery` row (`listing`: its statement, its claim, and a check's answer), and a request claims the
-databases it starts, so two pages or app instances never start the same one twice.
+**The reads run in the background, truly in parallel.** A thread of the app, the background reader
+(`src/background_reads.py`), keeps every discovery's reads going whether a page is open or not: New job's drafts, Add
+tables' reads and re-discovery's. A bounded pool of workers (`BACKGROUND_READ_WORKERS`, default 32) each sends one
+database's statement with a wait of up to 30 seconds, so its answer comes back in the same call, reads it again only
+while it is still going, saves it, and takes the next. The page, Create's wait and re-discovery only ask where the
+reads stand. `BACKGROUND_READS=0` turns the reader off on an instance; the page's requests then take the reads' steps
+as before (each request reads the statements going, saves the ones that ended and starts more, without a wait).
+
+- **Each source server has a cap** on its reads in flight, counted across every discovery and app instance: in
+  Lakebase, in the claim's own transaction, under a transaction lock of that server's (its connection's name), so two
+  claimers never both take its last places. It starts at 8 (`reads_start_cap`) and moves by 4 between 4 and 32
+  (`reads_max_cap`), from the time each read takes from send to answer, the warehouse's queue included
+  (`warehouse_reads.next_cap`): while the median of the last 8 reads stays within 1.25 times the median at the
+  starting level and the server is held at its cap, it steps up; once that median passes 1.5 times, it steps down.
+  On the lab, a 100-eDTU pool's CPU capped a 1,000-table server's reads at about 0.65 databases a second, each read
+  slower the more were in flight, and a 2X-Small warehouse began queueing at 16. Each instance keeps its own cap in
+  memory and holds the shared count to it, so a restarted instance starts again at 8.
+- **A warehouse that is starting** takes one statement at a time until one answers, and that slow first answer isn't
+  timed.
+- **Nothing is read twice, nothing stays claimed.** Where each database stands is kept on its `discovery` row
+  (`listing`: its statement, its claim, and a check's answer). Whoever starts a database claims it first (`FOR UPDATE
+  SKIP LOCKED`), so two app instances, a page and the reader never start the same one twice. A claim lasts 60 seconds
+  unless whoever watches the statement renews it (the reader does every 20): after a restart, a claim with no
+  statement is free again then, and a statement saved before the restart is read again from its id, never sent again.
+- **The check of the page shown** stays with the page: at most 16 statements of one discovery at once
+  (`warehouse_reads.IN_FLIGHT`), sent together, each with a 5-second wait, so most answers are saved by the request
+  that sent them.
+- The reader only reads what someone started through the app's checks (a read through a connection the app can see,
+  or a job's re-discovery), each through the connection saved on its rows; a page's request naming another connection
+  is refused. A read started more than 6 hours ago, a discarded draft and one nobody has asked about for two hours are
+  left alone.
 
 The step's top line counts the choice: databases chosen of those listed and their tables (counting while some aren't
 checked yet); the same numbers end the step's last line and the job's Chosen summary.
@@ -167,11 +194,17 @@ don't allow and names the server and database.
 filter, starts the read of its tables at once, while the rest of the job is filled in. The read is a draft: its rows
 are the read's own `discovery` and `discovered_table` rows, marked `draft` in `listing`, and nothing of the job
 (control, checkpoint, schedule, rollups) is written before Create.
-- **Add the tables chosen** doesn't wait: the reads go on from New job's page, whose preview counts what is read so
-  far and says how far the read is (asked every 2 seconds while a database is left).
-- **Create** is enabled throughout. Pressed early, it waits for the rest of the read in a background task (its
-  progress shows "reading the chosen databases' tables first"), then writes. A database that couldn't be read stops it
-  by name before anything is written; one the whole server's read couldn't open is left out and counted.
+- **Add the tables chosen** doesn't wait: the reads go on in the background reader, and New job's preview counts what
+  is read so far and says how far the read is (asked every 2 seconds while a database is left).
+- **A database un-ticked** before Create leaves the draft (`POST /api/discoveries/{id}/drop`, by the person who started
+  it): its row is marked `dropped` in `listing` (the app has no DELETE), its statement still going is cancelled, and
+  it counts nowhere: not in the progress, not in Create's wait, and not among the databases that couldn't be read.
+  Ticked again, it comes back; one read already isn't read again. A whole-server read's databases aren't dropped one
+  by one: changing its filter discards that draft and starts another. Create takes the dropped rows with the rest of
+  the draft, so the purge never takes a part of a job's discovery.
+- **Create** is enabled throughout. Pressed early, it records the job at once and the job's prepare task waits for
+  the rest of the read, then writes (see A new job's preparation). A database that couldn't be read is set aside on
+  the job, with why; one the whole server's read couldn't open is left out and counted.
 - Create's transaction takes the draft: the mark comes off and the job is named on its rows.
 - **Cancel**, leaving the page, or choosing the tables again before Create discards the draft
   (`POST /api/discoveries/{id}/discard`, by `sendBeacon` as the page closes): nothing more is read and its statements
@@ -186,6 +219,14 @@ are the read's own `discovery` and `discovered_table` rows, marked `draft` in `l
 hour per cluster while it runs: at a list price of about 0.70 USD per serverless SQL DBU, about 2.80 USD an hour, about
 5.60 USD with both clusters; it stops after 5 idle minutes, so it costs only while someone chooses tables. Your
 contract's price may differ. The app gets `CAN_USE` on it as an app resource (`WAREHOUSE_ID`).
+
+**A warehouse of your own.** Where serverless can't reach the sources, set the bundle variable `app_warehouse_id` to a
+SQL warehouse that can, say a Pro warehouse that runs in your network. It must be Pro or serverless, on version 2025.35
+or above: `remote_query` doesn't run on a Classic warehouse. The app gets it as `APP_WAREHOUSE_ID` and runs every
+statement above there instead (`warehouse.chosen_warehouse`); blank, the default, keeps the bundle's own. The grants job
+gives the app's service principal `CAN_USE` on it (see Security model). Manage shows the warehouse in use and which
+setting chose it, and says so plainly when it is Classic or can't be read; the app starts either way. See
+[docs/deploy.md](../docs/deploy.md#the-apps-sql-warehouse).
 
 **At a whole server's size** (estimates): a check takes about a second, and only the page shown (100 databases) is
 checked, about 7 seconds at 16 at once whatever the server's size. A read of 1,000 tables is about 2 to 5 seconds per
@@ -311,6 +352,92 @@ parts are read once per secret.
 The job page's block shows the last run: its status (running, done, deferred or failed), when it started and
 finished, what it found and added, what was skipped, the new databases, the vanished tables, and any errors.
 
+## A new job's preparation
+
+A job is in one of three states, kept on its record in the schedule's options (`options.prepare`, `src/preparing.py`;
+no schema change):
+
+| State | What it means |
+|---|---|
+| **Preparing** | its chosen databases' tables are read (reading), then its tables are written (writing), then its Databricks jobs are made (syncing) |
+| **Needs you** | some of its databases are set aside, each with why, until someone chooses what happens to them |
+| **Ready** | it runs as any job does |
+
+A job with no record, every job made before it, is Ready.
+
+**Create at once.** A Create from CSV lines in the request, or from a source whose tables are all read, of 5,000 tables
+or fewer, writes every table before it answers, as before, and the job is Ready at once. Any other Create (its tables
+still being read, a database that couldn't be read, more than 5,000 tables, or a file with database-only lines)
+records the job at once and answers with its id; the page opens the job. Before it answers it checks what needs only
+names and settings: the job's name, the target templates, that the group names it would make are free, that no chosen
+database is already in another job, live or deleted, by its key, the source and scope rules, the right to run what it
+starts when the schedule is to be on, and, for database-only lines, the right to run discovery. Then one transaction
+writes the job (paused, no groups yet), its record (Preparing), what it was chosen from with its drafts claimed, and its
+prepare task. `PREPARE_CREATES=0` keeps the earlier Create, which waits for the read and the write in a task of its own.
+
+**The prepare task** (an `app_task` of kind `prepare`, one per job) waits for the reads through the background reader,
+then writes the tables database by database, each database whole in its own transaction, then syncs the job's
+Databricks jobs and makes it Ready. Each transaction takes the job's schedule lock and checks that the task is still its
+thread's (an owner token, with a fresh heartbeat) and the job still preparing, so two app instances never write one job:
+a task is claimed (`FOR UPDATE SKIP LOCKED`) only when no thread holds it. Every instance looks every
+`PREPARE_RESUME_S` (30 s; 0 turns it off) for a preparing job whose task no thread holds (its heartbeat stale after
+`TASK_STALE_S`, or failed more than that ago) and starts it again: a database written is skipped whole, a read done is
+not sent again, and a file's discovery run is kept on the record, so nothing is read or written twice. A job left with
+nothing to write (every database left out) is stopped, never made Ready empty.
+
+**Stop preparing** cancels the statements going, discards the reads still to do and ends the task; the job stays paused
+with its choice and what was read, and **Prepare again** goes on from there. Delete stops the prepare the same way
+first, then deletes as before; only a write of the task in progress (the job's lock) holds it up, never the task's
+heartbeat. Both need Can Manage on the job, as Edit does.
+
+**What Create was asked for is kept.** The record holds the job's settings (targets, load type, fan-in, write modes,
+identity columns), its tables per group or groups per server, its secret scope and trust as Create checked them, the
+upload or discoveries it was chosen from (the parts are its `job_selection` rows), whether its schedule is to be on, and
+who made it. Only the app writes it: a request's `prepare` option is dropped (New schedule), refused (Create) or
+replaced with the stored one (Edit's save, which takes the app's own options again under the job's lock before it
+writes).
+
+**While a job isn't Ready** the server refuses (409, with `reason` `not_ready`, the state and the stage) Run now, a run
+of one database or of one of its groups, re-discovery (its daily run skips the job too), turning its schedule on, and
+every change to what it ingests: Add tables, Add databases, a table's edit, enable or disable, a removal, and the table
+routes that name one of its groups. Its name, when it runs, the e-mails and its advanced configuration change as for
+any job; its groups stay as its preparation makes them, and its secret scope and trust as Create checked them. Pause
+keeps its schedule off once it is Ready; a schedule that was to be on turns on then, if whoever asked for it may still
+run what it starts. How it writes and its group size can be changed while its tables are read: Edit then changes the
+record's settings, checked as Create checks them. Once the write has begun they wait for Ready, so one job never has
+two rules. Delete is as for any job.
+
+**A database set aside** is set aside whole, never part of it, and listed on the job page with why: it couldn't be read
+(the server's message), or its tables are refused at the write (a target another table already writes, two of the
+job's tables writing one target, a sink both dedicated and shared, a database a deleted job keeps). The rest are
+written. In a whole-server choice a database the login can't open is only left out, and listed. While any waits the job
+Needs you and isn't Ready. The job page offers, each needing Can Manage on the job, as Edit does:
+- **Read them again**: the unreadable ones' rows are reset in the same transaction, so the background reader reads them
+  (a file's database-only lines get a new discovery run);
+- **Leave them out**: they come out of the job's choice, which a later re-discovery leaves out too, and the job goes on,
+  Ready when nothing else is left;
+- **Change the job's target names**: new target templates, checked first; the clashing databases come off the list and
+  are planned again with them;
+- **Delete the job**.
+
+The record stays small, as every page of jobs reads it: the counts of each kind, every clash, and the first 200 of the
+rest. `GET /api/ingestion-jobs/{id}/prepare/set-aside` pages them all, read only: `kind=reads` from the job's claimed
+draft rows (those that couldn't be read), `kind=clash` from the record. A database un-ticked before Create counts
+nowhere.
+
+**The job page** shows "Preparing: reading tables, 1,240 of 3,000 databases (58,280 tables so far), about 12 min left"
+with a progress bar, read every 3 seconds from `GET /api/ingestion-jobs/{id}/prepare`, which counts the job's claimed
+draft rows. The minutes left are the databases left over the recent rate (those finished in the last two minutes,
+weighed against the rate since the reading began), shown once 20 databases or 30 seconds are done, and rounded to the
+minute, then to 5 minutes from 15, and to 10 from an hour. Run now and the schedule say they are available when the job
+is ready. The Ingestion jobs list says Preparing or Needs you in its Status column, and a job that needs you counts
+under Needs attention.
+
+**The write is checked when it happens.** A write that runs later, on a thread with no request, is held to the job's
+maker and its connection as they are then (`main._prepare_checks`): the JDBC connection's scope and trust, each key's
+newest login typed under that connection, and the manager rule for reads by host and for a secret scope, all read
+again, before the write and in each of its transactions.
+
 ## Guard rails for edits
 
 Data integrity comes first, so edits go through the server's rules, not the browser's:
@@ -344,7 +471,9 @@ elsewhere, or whose sink table no longer exists, is reseeded instead of silently
 | Part | Where | What |
 |---|---|---|
 | Backend | `src/main.py` (FastAPI) | JSON API under `/api` (OpenAPI docs at `/api/docs`); serves the built frontend for every other path |
-| Data access | `src/lakebase.py`, `src/jobs.py` | Lakebase (psycopg, SDK-minted credential) and the Jobs API, as the app's service principal |
+| Data access | `src/lakebase.py`, `src/jobs.py` | Lakebase (psycopg, SDK-minted credential, a small pool of idle connections: `LAKEBASE_POOL_IDLE`, 0 = off) and the Jobs API, as the app's service principal |
+| Background reader | `src/background_reads.py`, `src/warehouse_reads.py` | Reads the chosen databases' tables through the SQL warehouse, in parallel, within each server's cap (see Discovery through the SQL warehouse). `BACKGROUND_READS=0` turns it off on an instance |
+| Preparation | `src/preparing.py` | A new job's state until it can run, what Create was asked for, its set-aside databases and the minutes left (see A new job's preparation); pure |
 | Run poller | `src/run_poller.py` | One poller (every 15 seconds, one instance at a time through an advisory lock) writes the `databricks_run` table; the pages read that table, and it closes the ingest runs whose Databricks run has ended. `RUN_POLLER=0` turns it off on an instance. Until the table exists, the app reads the Jobs API as before |
 | SQL and rules | `src/queries.py` | Every statement (parameterized), form validation, bulk-import review logic |
 | Frontend | `src/frontend/` (React, TypeScript, Vite) | Pages under `src/frontend/src/pages/`; React Router, TanStack Query, AG Grid Community for the grids |
@@ -382,6 +511,10 @@ The app runs as its own service principal (created with the app):
   the grant for any connection it can't see.
 - **Discovery warehouse:** `CAN_USE` on the bundle's `lakefed_ingest discovery` SQL warehouse, through an app
   resource. The statements run as the service principal, which holds `USE CONNECTION` on the connections above.
+  With `app_warehouse_id` set, the same job also gives it `CAN_USE` on that warehouse, as whoever runs the job, who
+  needs `CAN_MANAGE` on it. The grant adds the app's entry to the warehouse's access list (the Permissions API's
+  update, not its replace), so the other entries stay. A job that may not grant it fails, after the grants above,
+  and says that the warehouse's owner or a workspace admin grants it instead. Blank, nothing is granted.
 - **Azure SQL listing (optional):** for a login that can't open master, Discover's connection test can have the
   discovery job list an Azure SQL server's (or Managed Instance's) databases through Azure Resource Manager instead.
   It takes a Unity Catalog service credential (Catalog Explorer, External data, Credentials) on an access connector
@@ -397,7 +530,8 @@ The app runs as its own service principal (created with the app):
   permission on the job its runs execute as (the check job on a check schedule, else the ingestion job), as the
   Jobs UI does:
   - running it (Run now), cancelling its run (Cancel run), or a new job that isn't paused: `CAN_MANAGE_RUN`;
-  - changing it (Edit and Save, Pause, Resume, Sync jobs), its groups' tables (edit, enable, disable, reseed,
+  - changing it (Edit and Save, Pause, Resume, Sync jobs, and Read them again, Leave them out and Change the job's
+    target names on databases set aside while it is prepared), its groups' tables (edit, enable, disable, reseed,
     Add table, Import CSV, Bulk import's register), or deleting it: `CAN_MANAGE` or owner;
   - a change to tables needs `CAN_MANAGE` on every ingestion job that runs one of their groups, since a group
     can be in more than one job and its tables change for all of them;
@@ -445,6 +579,9 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
      who deploys.
    - `app_version`: what Manage shows as the version, by default the git commit deployed from. It is blank when the
      bundle is deployed from a folder that isn't a git checkout: pass `--var app_version=<commit>` there.
+   - `app_warehouse_id`: a Pro or serverless SQL warehouse (version 2025.35 or above) of your own for the app's
+     queries, when serverless can't reach the sources; blank keeps the bundle's own (see A warehouse of your own,
+     under Discovery through the SQL warehouse).
 2. Deploy and start the app, then run the grant job. Run these from `app/`, as the user who manages the Lakebase
    instance and owns the tables (whoever ran the ingestion setup). On a first deploy the order matters: the grant job
    needs the app's service principal, which exists only once the app is deployed.
@@ -453,14 +590,14 @@ Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakeb
    cd app
    databricks bundle deploy -t <target>
    databricks bundle run lakefed_ingest_app -t <target>          # deploys the code and starts the app
-   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access, USE CONNECTION on source_connections, WRITE on the login scope
+   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access, USE CONNECTION on source_connections, WRITE on the login scope, CAN_USE on app_warehouse_id
    ```
 3. Check the login scope's access list. The grant job sets the app's `WRITE` there (the bundle declares no permission on
    the scope), so the list should show the app's service principal with `WRITE`, the deployer with `MANAGE`, and nothing
    else: `databricks secrets list-acls lakefed_ingest_jdbc_logins -p <profile>`.
 4. Grant `CAN_USE` on the app to your operators, then open the URL printed by `bundle run`.
 
-Re-run the grant job if the app is recreated (new service principal). It also sets the new principal's `WRITE` on the
+Re-run the grant job if the app is recreated (new service principal), or after changing `app_warehouse_id`. It also sets the new principal's `WRITE` on the
 login scope; the old principal's entry stays until you remove it (`databricks secrets delete-acl
 lakefed_ingest_jdbc_logins <old service principal>`). Default privileges cover tables the same owner adds later, so
 schema upgrades don't need it.

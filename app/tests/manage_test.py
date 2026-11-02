@@ -183,12 +183,14 @@ def test_the_jobs_list_names_each_databricks_job_with_its_link(monkeypatch, mana
 def test_the_version_is_what_the_deploy_passed_and_the_apps_active_deployment(monkeypatch, manager):
     monkeypatch.setattr(main.jobs, "APP_VERSION", "0123456789abcdef")
     monkeypatch.setattr(main, "_schema_state", lambda: {"database": 13, "app": 13})
+    monkeypatch.setattr(main.warehouse, "description", lambda: {"id": "wh1"})
     monkeypatch.setattr(main.jobs, "app_deployment", lambda: {"id": "d1", "created": "2026-10-30T11:00:00Z",
                                                               "creator": "deployer@example.com"})
     client = TestClient(main.app, headers=USER)
     assert client.get("/api/manage/version").json() == {
         "app": "lakefed-ops", "version": "0123456789abcdef", "error": None, "schema": {"database": 13, "app": 13},
-        "deployment": {"id": "d1", "created": "2026-10-30T11:00:00Z", "creator": "deployer@example.com"}}
+        "deployment": {"id": "d1", "created": "2026-10-30T11:00:00Z", "creator": "deployer@example.com"},
+        "warehouse": {"id": "wh1"}}
 
     def refused():
         raise PermissionError("Forbidden. No access to the app")
@@ -196,6 +198,33 @@ def test_the_version_is_what_the_deploy_passed_and_the_apps_active_deployment(mo
     monkeypatch.setattr(main.jobs, "APP_VERSION", None)
     answer = client.get("/api/manage/version").json()
     assert (answer["version"], answer["deployment"], answer["error"]) == (None, {}, "Forbidden")
+
+
+def test_the_version_carries_the_warehouse_the_apps_queries_run_on_and_which_setting_chose_it(monkeypatch, manager):
+    from types import SimpleNamespace
+    from databricks.sdk.service.sql import GetWarehouseResponse
+    monkeypatch.setattr(main, "_schema_state", lambda: {"database": 13, "app": 13})
+    monkeypatch.setattr(main.jobs, "app_deployment", lambda: {})
+    monkeypatch.setattr(main.warehouse, "WAREHOUSE_ID", "wh9")
+    monkeypatch.setattr(main.warehouse, "CHOSEN_BY", "app_warehouse_id")
+    found = GetWarehouseResponse.from_dict({"id": "wh9", "name": "ops pro", "warehouse_type": "CLASSIC",
+                                            "enable_serverless_compute": False, "state": "RUNNING"})
+    monkeypatch.setattr(main.warehouse, "workspace", lambda: SimpleNamespace(warehouses=SimpleNamespace(
+        get=lambda id: found)))
+    shown = TestClient(main.app, headers=USER).get("/api/manage/version").json()["warehouse"]
+    assert {k: shown[k] for k in ("id", "chosen_by", "name", "type", "serverless", "state")} == {
+        "id": "wh9", "chosen_by": "app_warehouse_id", "name": "ops pro", "type": "CLASSIC", "serverless": False,
+        "state": "RUNNING"}
+    assert "remote_query doesn't run on one" in shown["problem"]
+
+
+def test_a_warehouse_that_cant_be_read_still_answers_the_version(monkeypatch, manager):
+    monkeypatch.setattr(main, "_schema_state", lambda: {"database": 13, "app": 13})
+    monkeypatch.setattr(main.jobs, "app_deployment", lambda: {})
+    monkeypatch.setattr(main.warehouse, "WAREHOUSE_ID", "wh9")
+    answer = TestClient(main.app, headers=USER).get("/api/manage/version")
+    assert answer.status_code == 200
+    assert answer.json()["warehouse"]["problem"].startswith("The warehouse can't be read: unit tests never reach")
 
 
 def test_the_permissions_say_who_manages_the_app(monkeypatch, manager):

@@ -1,9 +1,13 @@
 // Tests for Manage's helpers (app/src/frontend/src/pages/manageHelpers.ts). Run with `node --test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { exportHref, schemaNote } from "../../src/frontend/src/pages/manageHelpers.ts";
+import {
+  exportHref, schemaNote, warehouseChosenBy, warehouseKind,
+} from "../../src/frontend/src/pages/manageHelpers.ts";
 
 const SCHEMA = { database: 13, app: 13, check: { state: "current" }, run: null, error: null };
+const WAREHOUSE = { id: "abc123", chosen_by: "the bundle's own", name: "lakefed_ingest discovery", type: "PRO",
+                    serverless: true, state: "RUNNING", problem: null };
 
 test("no job ticked exports every ingestion job; ticked ones are named by id", () => {
   assert.equal(exportHref([]), "/api/manage/export.csv");
@@ -30,4 +34,17 @@ test("no schema at all is the deploy's setup step, and an unreadable version is 
   assert.match(schemaNote({ ...SCHEMA, database: 0 }).text, /no schema yet: run the setup job once/);
   assert.deepEqual(schemaNote({ ...SCHEMA, database: null, error: "can't read the state database's schema version: x" }),
                    { tone: "bad", text: "can't read the state database's schema version: x." });
+});
+
+test("the warehouse is shown as serverless, Pro or Classic, and as not known when it can't be read", () => {
+  assert.equal(warehouseKind(WAREHOUSE), "Serverless");
+  assert.equal(warehouseKind({ ...WAREHOUSE, serverless: false }), "Pro");
+  assert.equal(warehouseKind({ ...WAREHOUSE, serverless: false, type: "CLASSIC" }), "Classic");
+  assert.equal(warehouseKind({ ...WAREHOUSE, serverless: null, type: null }), "Not known");
+});
+
+test("the setting that chose the warehouse is the bundle's own or app_warehouse_id", () => {
+  assert.equal(warehouseChosenBy(WAREHOUSE), "The bundle's own");
+  assert.equal(warehouseChosenBy({ ...WAREHOUSE, chosen_by: "app_warehouse_id" }),
+               "app_warehouse_id (a warehouse of your own)");
 });

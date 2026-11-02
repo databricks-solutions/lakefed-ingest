@@ -5,10 +5,13 @@ import { api, type Row } from "../api";
 import { ErrorBox, Metric, Notice, OutLink, PageHead, Section, fmtTime, plural } from "../components";
 import { usePermissions } from "../permissions";
 import { useSettings } from "../App";
-import { exportHref, schemaNote, type SchemaState } from "./manageHelpers";
+import {
+  exportHref, schemaNote, warehouseChosenBy, warehouseKind, type SchemaState, type WarehouseInUse,
+} from "./manageHelpers";
 
-// Manage the app: for those with Can Manage on the app (its Databricks permission). The app's version, the export of
-// the ingestion jobs' tables as the CSV Create reads, and the Databricks jobs the app runs them with.
+// Manage the app: for those with Can Manage on the app (its Databricks permission). The app's version, the SQL
+// warehouse its queries run on, the export of the ingestion jobs' tables as the CSV Create reads, and the Databricks
+// jobs the app runs them with.
 
 function Export() {
   const list = useQuery({ queryKey: ["schedules"], queryFn: () => api.get<Row[]>("/schedules") });
@@ -53,11 +56,16 @@ function DatabricksJobs() {
   );
 }
 
-interface AppVersion { app: string | null; version: string | null; deployment: Row; error: string | null; schema: SchemaState }
+interface AppVersion {
+  app: string | null; version: string | null; deployment: Row; error: string | null; schema: SchemaState;
+  warehouse?: WarehouseInUse;
+}
+
+const versionQuery = { queryKey: ["manage-version"], queryFn: () => api.get<AppVersion>("/manage/version") };
 
 function Version() {
   // Read again while the setup job upgrades the state database, so the page shows when it is done.
-  const version = useQuery({ queryKey: ["manage-version"], queryFn: () => api.get<AppVersion>("/manage/version"),
+  const version = useQuery({ ...versionQuery,
     refetchInterval: (q) => (q.state.data as AppVersion | undefined)?.schema?.run ? 15_000 : false });
   const { config } = useSettings();
   const v = version.data, deployment = v?.deployment ?? {}, schema = v?.schema, note = schemaNote(schema);
@@ -80,6 +88,28 @@ function Version() {
   );
 }
 
+// Read only: the warehouse is set in the bundle (app_warehouse_id), not here.
+function Warehouse() {
+  const warehouse = useQuery(versionQuery).data?.warehouse;
+  if (!warehouse) return null;
+  return (
+    <Section title="SQL warehouse">
+      <p className="muted small">Where the app runs its queries on the sources: the connection test, the database list,
+        the access checks and the table reads. Set in the bundle, by the app_warehouse_id variable.</p>
+      <div className="table-wrap"><table className="data">
+        <thead><tr><th>SQL warehouse</th><th>Type</th><th>State</th><th>Set by</th></tr></thead>
+        <tbody><tr>
+          <td>{warehouse.name ?? "Not known"}{warehouse.id && <span className="sub mono">{warehouse.id}</span>}</td>
+          <td>{warehouseKind(warehouse)}</td>
+          <td>{warehouse.state ?? "Not known"}</td>
+          <td>{warehouseChosenBy(warehouse)}</td>
+        </tr></tbody>
+      </table></div>
+      {warehouse.problem && <Notice tone="warn">{warehouse.problem}</Notice>}
+    </Section>
+  );
+}
+
 export default function Manage() {
   const permissions = usePermissions();
   if (permissions.isPending) return null;
@@ -89,6 +119,7 @@ export default function Manage() {
     <>
       <PageHead title="Manage the app" />
       <Version />
+      <Warehouse />
       <Export />
       <DatabricksJobs />
     </>

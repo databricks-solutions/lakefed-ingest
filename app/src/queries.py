@@ -1583,8 +1583,10 @@ def insert_discovery_rows_sql(count: int) -> str:
 # A discovery's checks and reads through the SQL warehouse (warehouse_reads.py) keep their place on the discovery row:
 # a check works on the listed databases not checked yet, a read on the databases still running. listing holds the
 # statement going (statement_id), when a request claimed the database (claimed_at), and a check's answer (open, why).
+# A database a draft no longer wants (un-ticked) is marked dropped: it isn't read, and it counts nowhere.
+DROPPED = "coalesce(listing, '{}'::jsonb) ? 'dropped'"
 WAREHOUSE_WORK = {"check": "status = 'listed' and (listing -> 'open') is null",
-                  "read": "status = 'running' and not (coalesce(listing, '{}'::jsonb) ? 'discarded')"}
+                  "read": f"status = 'running' and not (coalesce(listing, '{{}}'::jsonb) ? 'discarded') and not ({DROPPED})"}
 
 
 def warehouse_in_flight_sql(kind: str) -> str:
@@ -1596,7 +1598,8 @@ def warehouse_in_flight_sql(kind: str) -> str:
 def warehouse_claim_sql(kind: str) -> str:
     """Claim up to a number of a discovery's databases with no statement yet, skipping those another request holds or
     claimed less than a while ago. A check claims only the names asked for (the page shown): the login's access is
-    checked for what the page lists, never the whole server. A read claims the names asked for first, then by name.
+    checked for what the page lists, never the whole server. A read claims the names asked for first, then by name;
+    the app claims its reads through warehouse_claim_reads_sql instead, which keeps to the server's cap.
     Params: discovery_id, the age in seconds after which a claim with no statement is free again, the names (text[]),
     limit."""
     names = ("and src_database = any(%s::text[]) order by src_database" if kind == "check"
@@ -1611,6 +1614,99 @@ def warehouse_claim_sql(kind: str) -> str:
             f"where d.discovery_id = c.discovery_id and d.src_database = c.src_database returning d.src_database")
 
 
+# The reads through the warehouse are capped per server: the reads in flight on one connection, across every discovery
+# and app instance, are counted in the claim's own transaction, under a transaction lock of that server's
+# (warehouse_reads.CAPS sets each server's cap). A read is in flight while its claim is live: whoever watches its
+# statement (a worker of the background reader, or the page's step) renews the claim (warehouse_hold_sql), so one
+# nobody watches any more, after a restart say, stops counting once CLAIM_S has gone and is read again from its saved
+# statement (warehouse_collect_sql), never sent again.
+_LIVE_CLAIM = "(listing ->> 'claimed_at')::timestamptz >= now() - make_interval(secs => %s)"
+_LAPSED_CLAIM = ("(listing ->> 'claimed_at' is null "
+                 "or (listing ->> 'claimed_at')::timestamptz < now() - make_interval(secs => %s))")
+_THROUGH_WAREHOUSE = "listing ->> 'via' = 'warehouse'"
+
+
+def warehouse_reads_lock_sql() -> str:
+    """Wait for, and take, one server's reads lock for this transaction, so two claimers never both take its last free
+    places. A transaction lock, never a session one: the app's connections are pooled. Param:
+    warehouse_reads_lock_key."""
+    return "select pg_advisory_xact_lock(hashtextextended(%s, 0))"
+
+
+def warehouse_reads_lock_key(server: str) -> str:
+    """The reads lock key of one server (its connection's name, lower case), apart from every other lock's key: a
+    collection's run lock key starts with the schema and a colon (collection_lock_key), so this one doesn't."""
+    return f"{SCHEMA}/warehouse_reads/{server}"
+
+
+def warehouse_reads_going_sql() -> str:
+    """How many reads of one server are in flight: its databases still to read, through the warehouse, with a live
+    claim (a statement going and watched, or one about to be sent). Params: server (lower case), claim age in seconds."""
+    return (f"select count(*) as going from {SCHEMA}.discovery where lower(src_connection) = %s "
+            f"and {_THROUGH_WAREHOUSE} and {WAREHOUSE_WORK['read']} and {_LIVE_CLAIM}")
+
+
+def warehouse_claim_reads_sql() -> str:
+    """Claim up to a number of databases to read, of one server's discoveries, in the order the discoveries are given,
+    then by name: those with no statement and no live claim, skipping those another claimer holds. Params: server
+    (lower case), discovery ids (text[]), claim age in seconds, the same ids again (their order), limit."""
+    return (f"update {SCHEMA}.discovery d set listing = coalesce(d.listing, '{{}}'::jsonb) "
+            f"|| jsonb_build_object('claimed_at', now()::text) "
+            f"from (select discovery_id, src_database from {SCHEMA}.discovery "
+            f"      where lower(src_connection) = %s and discovery_id = any(%s::text[]) and {_THROUGH_WAREHOUSE} "
+            f"      and {WAREHOUSE_WORK['read']} and not (coalesce(listing, '{{}}'::jsonb) ? 'statement_id') "
+            f"      and {_LAPSED_CLAIM} "
+            f"      order by array_position(%s::text[], discovery_id), src_database limit %s for update skip locked) c "
+            f"where d.discovery_id = c.discovery_id and d.src_database = c.src_database "
+            f"returning d.discovery_id, d.src_database")
+
+
+def warehouse_collect_sql() -> str:
+    """Claim up to a number of a discovery's databases whose statement nobody watches (saved, its claim lapsed), to read
+    that statement again: their names and statements. Params: discovery_id, claim age in seconds, limit."""
+    return (f"update {SCHEMA}.discovery d set listing = d.listing || jsonb_build_object('claimed_at', now()::text) "
+            f"from (select discovery_id, src_database from {SCHEMA}.discovery "
+            f"      where discovery_id = %s and {WAREHOUSE_WORK['read']} and listing ? 'statement_id' and {_LAPSED_CLAIM} "
+            f"      order by src_database limit %s for update skip locked) c "
+            f"where d.discovery_id = c.discovery_id and d.src_database = c.src_database "
+            f"returning d.src_database, d.listing ->> 'statement_id' as statement_id")
+
+
+def warehouse_hold_sql() -> str:
+    """Renew the claims of reads still being watched, so no one else takes them and they keep counting under the cap.
+    Params: discovery ids (text[]) and databases (text[]), pair by pair."""
+    return (f"update {SCHEMA}.discovery set listing = listing || jsonb_build_object('claimed_at', now()::text) "
+            f"where (discovery_id, src_database) in (select * from unnest(%s::text[], %s::text[])) "
+            f"and {WAREHOUSE_WORK['read']}")
+
+
+def warehouse_read_work_sql() -> str:
+    """The discoveries with reads to do through the warehouse, oldest first, for the background reader: each one's
+    connection, its databases waiting for a statement (none saved, no live claim) and those whose statement nobody
+    watches (saved, its claim lapsed). A database whose read started more than a while ago is left alone, and so is a
+    draft discarded or not asked about for the drafts' time limit (the purge's rule: delete_job.purgeable_drafts_sql).
+    Params: claim age, the most a read's age may be, the drafts' time limit, all in seconds."""
+    work = f"{WAREHOUSE_WORK['read']} and started_at > now() - make_interval(secs => p.max_age)"
+    lapsed = _LAPSED_CLAIM.replace("%s", "p.claim_s")
+    return (f"with p as (select %s::float as claim_s, %s::float as max_age, %s::float as draft_ttl), "
+            f"live as (select distinct discovery_id from {SCHEMA}.discovery where status = 'running' "
+            f"         and {_THROUGH_WAREHOUSE} and src_connection is not null) "
+            f"select d.discovery_id, min(d.src_connection) as src_connection, "
+            f"count(*) filter (where {work} and not (listing ? 'statement_id') and {lapsed}) as waiting, "
+            f"count(*) filter (where {work} and listing ? 'statement_id' and {lapsed}) as orphaned "
+            f"from {SCHEMA}.discovery d cross join p where d.discovery_id in (select discovery_id from live) "
+            f"group by d.discovery_id, p.draft_ttl "
+            f"having count(*) filter (where {work} and {lapsed}) > 0 "
+            f"and not (bool_or(listing ? 'draft') and coalesce(max((listing ->> 'touched_at')::timestamptz), "
+            f"max(started_at)) < now() - make_interval(secs => p.draft_ttl)) "
+            f"order by min(d.started_at)")
+
+
+def discovery_connection_sql() -> str:
+    """The connection a discovery was started through, saved on its rows. Param: discovery_id."""
+    return f"select src_connection from {SCHEMA}.discovery where discovery_id = %s limit 1"
+
+
 def warehouse_unchecked_sql() -> str:
     """How many of the names asked for are listed and not checked yet: the page's checks still to come. Params:
     discovery_id, the names (text[])."""
@@ -1619,9 +1715,12 @@ def warehouse_unchecked_sql() -> str:
 
 
 def warehouse_started_sql() -> str:
-    """Record the statement started for a database. Params: statement_id, discovery_id, src_database."""
-    return (f"update {SCHEMA}.discovery set listing = coalesce(listing, '{{}}'::jsonb) || jsonb_build_object('statement_id', %s::text) "
-            f"where discovery_id = %s and src_database = %s")
+    """Record the statement started for a database, its claim renewed with it; returns the database when it did. Not
+    on a database its draft dropped while the statement was being sent: that statement is cancelled instead. Params:
+    statement_id, discovery_id, src_database."""
+    return (f"update {SCHEMA}.discovery set listing = coalesce(listing, '{{}}'::jsonb) "
+            f"|| jsonb_build_object('statement_id', %s::text, 'claimed_at', now()::text) "
+            f"where discovery_id = %s and src_database = %s and not ({DROPPED}) returning src_database")
 
 
 def warehouse_clear_sql() -> str:
@@ -1639,11 +1738,17 @@ def warehouse_check_done_sql() -> str:
 
 
 def warehouse_read_done_sql() -> str:
-    """A read's end on a database: ok with its table count, or failed with why. Params: status, tables, error,
-    discovery_id, src_database. Only a database still running is changed, so a second answer writes nothing."""
+    """A read's end on a database: ok with its table count, or failed with why; returns the database when it changed.
+    Params: status, tables, error, discovery_id, src_database, statement_id, statement_id, status. Only a database
+    still running is changed, so a second answer writes nothing; and only by the statement saved for it (or before
+    one is saved), so a statement it no longer waits on never ends it. A database dropped meanwhile keeps a read that
+    succeeded (ticked again, it costs nothing) and is never failed: its statement was cancelled because it was
+    dropped, and ticked again, it is read again."""
     return (f"update {SCHEMA}.discovery set status = %s, tables = %s, error = %s, finished_at = now(), "
             f"listing = coalesce(listing, '{{}}'::jsonb) - 'statement_id' - 'claimed_at' "
-            f"where discovery_id = %s and src_database = %s and status = 'running'")
+            f"where discovery_id = %s and src_database = %s and status = 'running' "
+            f"and coalesce(listing ->> 'statement_id', %s::text) = %s::text "
+            f"and (%s::text = 'ok' or not ({DROPPED})) returning src_database")
 
 
 def insert_discovered_tables_sql(columns, count: int) -> str:
@@ -1655,18 +1760,18 @@ def insert_discovered_tables_sql(columns, count: int) -> str:
 
 def warehouse_progress_sql(kind: str) -> str:
     """Where a discovery's checks or reads stand: its databases, those still to do (pending), and by outcome. A check
-    counts the databases open, closed and their tables; a read those read (done), failed, and their tables. Param:
-    discovery_id."""
+    counts the databases open, closed and their tables; a read those read (done), failed, and their tables, leaving
+    out a database its draft dropped. Param: discovery_id."""
     if kind == "check":
         return (f"select count(*) as databases, count(*) filter (where (listing -> 'open') is null) as pending, "
                 f"count(*) filter (where (listing ->> 'open')::boolean) as open, "
                 f"count(*) filter (where not (listing ->> 'open')::boolean) as closed, "
                 f"coalesce(sum(tables) filter (where (listing ->> 'open')::boolean), 0) as tables "
                 f"from {SCHEMA}.discovery where discovery_id = %s and status = 'listed'")
-    return (f"select count(*) as databases, count(*) filter (where status = 'running') as pending, "
+    return (f"select count(*) as databases, count(*) filter (where {WAREHOUSE_WORK['read']}) as pending, "
             f"count(*) filter (where status = 'ok') as done, count(*) filter (where status = 'failed') as failed, "
             f"coalesce(sum(tables) filter (where status = 'ok'), 0) as tables "
-            f"from {SCHEMA}.discovery where discovery_id = %s")
+            f"from {SCHEMA}.discovery where discovery_id = %s and not ({DROPPED})")
 
 
 def warehouse_read_rows_sql() -> str:
@@ -1681,11 +1786,15 @@ def warehouse_read_rows_sql() -> str:
 
 
 def warehouse_named_rows_sql(count: int) -> str:
-    """Start a read of named databases: one running row each. Params per row: discovery_id, src_connection,
-    src_database, requested_by, the draft's marks (JSON text, {} for none)."""
+    """Start a read of named databases: one running row each. A database its draft dropped is taken back instead (its
+    mark comes off): read already, it is kept as it was, so ticking it again costs nothing; not read yet, it is read.
+    Params per row: discovery_id, src_connection, src_database, requested_by, the draft's marks (JSON text, {} for
+    none)."""
     one_row = "(%s, 'sqlserver', %s, %s, 'running', %s, jsonb_build_object('via', 'warehouse') || %s::jsonb)"
     return (f"insert into {SCHEMA}.discovery (discovery_id, src_type, src_connection, src_database, status, requested_by, "
-            f"listing) values {', '.join([one_row] * count)} on conflict (discovery_id, src_database) do nothing")
+            f"listing) values {', '.join([one_row] * count)} on conflict (discovery_id, src_database) do update "
+            f"set listing = {SCHEMA}.discovery.listing - 'dropped' - 'claimed_at' "
+            f"where {SCHEMA}.discovery.listing ? 'dropped'")
 
 
 # A draft: a read through the warehouse started as the databases are chosen, before the job exists. Its rows are the
@@ -1704,9 +1813,9 @@ def drafts_to_purge_sql() -> str:
 
 
 def draft_of_sql() -> str:
-    """A draft's connection, if it is one still open (marked, not discarded). Param: discovery_id."""
-    return (f"select src_connection from {SCHEMA}.discovery where discovery_id = %s and listing ? 'draft' "
-            f"and not listing ? 'discarded' limit 1")
+    """A draft's connection and who started it, if it is one still open (marked, not discarded). Param: discovery_id."""
+    return (f"select src_connection, listing ->> 'draft_by' as draft_by from {SCHEMA}.discovery where discovery_id = %s "
+            f"and listing ? 'draft' and not listing ? 'discarded' limit 1")
 
 
 def draft_touch_sql() -> str:
@@ -1726,9 +1835,24 @@ def draft_discard_sql() -> str:
             f"returning listing ->> 'statement_id' as statement_id")
 
 
+def draft_drop_sql() -> str:
+    """Drop databases from an open draft (un-ticked): each one marked dropped, its claim and statement forgotten; the
+    statements going, to cancel. Never a whole-server read's database: that draft is discarded and started again when
+    its filter changes. Params: discovery_id, the names (text[]), discovery_id."""
+    return (f"with old as (select src_database, listing ->> 'statement_id' as statement_id from {SCHEMA}.discovery "
+            f"             where discovery_id = %s and src_database = any(%s::text[]) and listing ? 'draft' "
+            f"             and not listing ? 'discarded' and not listing ? 'dropped' "
+            f"             and not coalesce((listing ->> 'whole_server')::boolean, false) for update) "
+            f"update {SCHEMA}.discovery d set listing = (d.listing - 'statement_id' - 'claimed_at') "
+            f"|| jsonb_build_object('dropped', now()::text) from old "
+            f"where d.discovery_id = %s and d.src_database = old.src_database "
+            f"returning old.src_database, old.statement_id")
+
+
 def draft_claim_sql() -> str:
     """In a Create's or an Add's transaction: the drafts it was chosen from become the job's, so no purge takes them.
-    Params: job id, discovery ids (text[])."""
+    The databases dropped from them go with them, so a purge never takes a part of a job's discovery. Params: job id,
+    discovery ids (text[])."""
     return (f"update {SCHEMA}.discovery set listing = (listing - 'draft' - 'draft_by' - 'touched_at') "
             f"|| jsonb_build_object('job_id', %s::bigint) "
             f"where discovery_id = any(%s::text[]) and listing ? 'draft' and not listing ? 'discarded'")
@@ -1736,20 +1860,24 @@ def draft_claim_sql() -> str:
 
 def draft_reads_sql() -> str:
     """Where the reads of a choice's discoveries stand: per discovery, its connection, its databases still to read,
-    read, failed, discarded and their tables. Param: discovery ids (text[])."""
+    read, failed, discarded and their tables. A database its draft dropped counts nowhere: Create neither waits for it
+    nor stops for it. Param: discovery ids (text[])."""
     return (f"select discovery_id, min(src_connection) as src_connection, count(*) as databases, "
             f"count(*) filter (where status = 'running' and not listing ? 'discarded') as pending, "
             f"count(*) filter (where status = 'ok') as done, count(*) filter (where status = 'failed') as failed, "
             f"count(*) filter (where listing ? 'discarded') as discarded, "
             f"coalesce(sum(tables) filter (where status = 'ok'), 0) as tables "
-            f"from {SCHEMA}.discovery where discovery_id = any(%s::text[]) and status <> 'listed' group by discovery_id")
+            f"from {SCHEMA}.discovery where discovery_id = any(%s::text[]) and status <> 'listed' and not ({DROPPED}) "
+            f"group by discovery_id")
 
 
 def draft_failed_sql() -> str:
     """The databases of a choice's discoveries that couldn't be read, with why and whether a whole-server read took
-    them (which leaves out one the login can't open, as the check would have). Param: discovery ids (text[])."""
+    them (which leaves out one the login can't open, as the check would have); not one its draft dropped. Param:
+    discovery ids (text[])."""
     return (f"select src_database, error, coalesce((listing ->> 'whole_server')::boolean, false) as whole_server "
-            f"from {SCHEMA}.discovery where discovery_id = any(%s::text[]) and status = 'failed' order by src_database")
+            f"from {SCHEMA}.discovery where discovery_id = any(%s::text[]) and status = 'failed' and not ({DROPPED}) "
+            f"order by src_database")
 
 
 def warehouse_left_out_sql() -> str:
@@ -1928,9 +2056,10 @@ def task_of_request_sql() -> str:
 
 
 def job_tasks_sql() -> str:
-    """A job's tasks of the last day, newest first. Param: job_id."""
+    """A job's tasks of the last day, newest first; not its prepare task, which its Preparation shows. Param:
+    job_id."""
     return (f"select {', '.join(APP_TASK_FIELDS)} from {SCHEMA}.app_task where job_id = %s "
-            f"and created_at > now() - interval '1 day' order by created_at desc limit 10")
+            f"and kind <> 'prepare' and created_at > now() - interval '1 day' order by created_at desc limit 10")
 
 
 def task_progress_sql() -> str:
@@ -1960,11 +2089,11 @@ def stale_tasks_sql() -> str:
     succeeded, so nothing reads as done before what follows it has finished: one with a result had committed its tables
     but missed the Databricks job sync that follows (unsynced is its error); one with progress but no result is a
     by-database write whose committed databases are kept, and the error says to send the request again to finish it
-    (partial); the rest were rolled back with the app (rolled_back). Params: unsynced, rolled_back, partial, seconds,
-    id (or null), job_id (or null)."""
+    (partial); the rest were rolled back with the app (rolled_back). A prepare task is left to its own resume
+    (claim_prepare_sql). Params: unsynced, rolled_back, partial, seconds, id (or null), job_id (or null)."""
     return (f"update {SCHEMA}.app_task set status = 'failed', "
             f"error = case when result is not null then %s when progress is null then %s else %s end, finished_at = now() "
-            f"where status = 'running' and heartbeat_at < now() - make_interval(secs => %s) "
+            f"where status = 'running' and heartbeat_at < now() - make_interval(secs => %s) and kind <> 'prepare' "
             f"and (id = %s or job_id = %s)")
 
 
@@ -1998,8 +2127,10 @@ def resume_synced_task_sql() -> str:
 
 
 def running_task_sql() -> str:
-    """Whether a job has a write running (its heartbeat fresh): a Delete waits for it. Params: job_id, seconds."""
-    return (f"select id from {SCHEMA}.app_task where job_id = %s and status = 'running' "
+    """Whether a job has a write running (its heartbeat fresh): a Delete waits for it. Not its prepare task: Delete
+    stops that first, and waits only for a write of it in progress (the job's schedule lock). Params: job_id,
+    seconds."""
+    return (f"select id from {SCHEMA}.app_task where job_id = %s and status = 'running' and kind <> 'prepare' "
             f"and heartbeat_at > now() - make_interval(secs => %s) limit 1")
 
 EDITABLE_REVIEW_FIELDS = ("include", "load_type", "primary_key", "cursor_column", "load_partitioned",
@@ -2633,6 +2764,178 @@ def set_rediscovery_sql() -> str:
     """Write a job's re-discovery record (options.rediscovery). Params: the record as JSON, id."""
     return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), '{{rediscovery}}', "
             f"%s::jsonb) where id = %s")
+
+
+def set_prepare_sql() -> str:
+    """Write a job's preparation record (options.prepare, preparing.py), whole. Params: the record as JSON, id."""
+    return (f"update {SCHEMA}.schedule set options = jsonb_set(coalesce(options, '{{}}'::jsonb), '{{prepare}}', "
+            f"%s::jsonb) where id = %s")
+
+
+def job_reads_sql() -> str:
+    """Where the reads of a job's claimed drafts stand, for its Preparing bar: its databases, those still to read, read,
+    failed and their tables, how many finished within the last window, and how long ago the first was started. Only
+    the rows its Create claimed (listing.job_id) of the discoveries it was chosen from, so the primary key finds them;
+    a database its draft dropped counts nowhere, as in draft_reads_sql. Params: the window in seconds, discovery ids
+    (text[]), job id (as text)."""
+    return (f"select count(*) as databases, "
+            f"count(*) filter (where status = 'running' and not listing ? 'discarded') as pending, "
+            f"count(*) filter (where status = 'ok') as done, count(*) filter (where status = 'failed') as failed, "
+            f"coalesce(sum(tables) filter (where status = 'ok'), 0) as tables, "
+            f"count(*) filter (where status in ('ok', 'failed') "
+            f"and finished_at >= now() - make_interval(secs => %s)) as recent, "
+            f"coalesce(extract(epoch from now() - min(started_at)), 0)::float as elapsed_s "
+            f"from {SCHEMA}.discovery where discovery_id = any(%s::text[]) and listing ->> 'job_id' = %s "
+            f"and status <> 'listed' and not ({DROPPED})")
+
+
+# ---- a job's prepare task (main._prepare_job): one per job, claimed with its heartbeat ------------------------------
+# A job Create records at once is prepared by one task (app_task, kind PREPARE_KIND, made in Create's transaction). Its
+# thread holds it by an owner token in its progress and a fresh heartbeat; an instance claims it only when it isn't
+# running or its heartbeat is stale, so two instances never prepare one job at once. Each write of it re-checks the
+# token in its own transaction (prepare_fence_sql), under the job's schedule lock.
+PREPARE_KIND = "prepare"
+_STALE = "heartbeat_at < now() - make_interval(secs => %s)"
+
+
+def claim_prepare_sql() -> str:
+    """Claim a job's prepare task for a thread: running with a new owner token and a fresh heartbeat, when no thread
+    has held it yet (Create just made it), it isn't running and ended a while ago (the backoff after a failure; 0 for a
+    user's own ask), or its heartbeat is stale (its thread is gone with its app). FOR UPDATE SKIP LOCKED: a claim
+    another instance holds is left to it, and finds the heartbeat fresh once that commits. Returns the task's id when
+    this call claimed it. Params: owner, job id, stale seconds, backoff seconds."""
+    return (f"update {SCHEMA}.app_task set status = 'running', error = null, finished_at = null, heartbeat_at = now(), "
+            f"progress = jsonb_build_object('owner', %s::text) "
+            f"where id = (select id from {SCHEMA}.app_task where kind = '{PREPARE_KIND}' and job_id = %s "
+            f"            and ((status = 'running' and ({_STALE} or progress is null)) or (status <> 'running' "
+            f"            and coalesce(finished_at, created_at) < now() - make_interval(secs => %s))) "
+            f"            order by id desc limit 1 for update skip locked) "
+            f"returning id")
+
+
+def prepare_beat_sql() -> str:
+    """The prepare task's heartbeat, only while this thread holds it: returns its id, or nothing once another claimed
+    it or it ended. Params: id, owner."""
+    return (f"update {SCHEMA}.app_task set heartbeat_at = now() where id = %s and status = 'running' "
+            f"and progress ->> 'owner' = %s returning id")
+
+
+def prepare_fence_sql() -> str:
+    """In each transaction of a prepare task's write: its task row, locked, while this thread still holds it (a claim
+    by another instance waits for the commit, and finds the heartbeat fresh). Params: id, owner."""
+    return (f"select id from {SCHEMA}.app_task where id = %s and status = 'running' and progress ->> 'owner' = %s "
+            f"for update")
+
+
+def finish_prepare_sql() -> str:
+    """End a job's prepare task while it is running: its status and why; given an owner, only while that thread holds
+    it. Params: status, error, job id, owner (or null), owner (or null)."""
+    return (f"update {SCHEMA}.app_task set status = %s, error = %s, finished_at = now() "
+            f"where kind = '{PREPARE_KIND}' and job_id = %s and status = 'running' "
+            f"and (%s::text is null or progress ->> 'owner' = %s)")
+
+
+def preparing_jobs_sql() -> str:
+    """The live jobs Create recorded that are still Preparing, not stopped, whose prepare task no thread holds (not
+    running and ended a while ago, or its heartbeat stale): the ones to prepare again after a restart. Params: stale
+    seconds, backoff seconds."""
+    return (f"select s.id from {SCHEMA}.schedule s join {SCHEMA}.app_task t on t.job_id = s.id "
+            f"and t.kind = '{PREPARE_KIND}' "
+            f"where s.deleted_at is null and s.options -> 'prepare' ->> 'state' = 'preparing' "
+            f"and not (s.options -> 'prepare' ? 'stopped') "
+            f"and ((t.status = 'running' and t.{_STALE}) or (t.status <> 'running' "
+            f"and coalesce(t.finished_at, t.created_at) < now() - make_interval(secs => %s))) "
+            f"order by s.id limit 50")
+
+
+def job_database_groups_sql() -> str:
+    """The databases some groups already have, each with its group: what a prepare pass finds written (a database is
+    written whole, in one transaction, so one with any row has them all). Param: groups (text[])."""
+    return (f"select distinct lower(coalesce(src_connection, src_host)) as server, lower(src_database) as src_database, "
+            f"task_collection from {SCHEMA}.control where task_collection = any(%s::text[])")
+
+
+_CLAIMED = "discovery_id = any(%s::text[]) and listing ->> 'job_id' = %s"
+_LEFT_OUT = "coalesce(listing, '{}'::jsonb) ? 'left_out'"
+
+
+def job_failed_reads_sql() -> str:
+    """One page of the databases of a job's claimed drafts that couldn't be read, by server and name: each one's server,
+    error and whether a whole-server read took it, with the count of them all. Not one its draft dropped, nor one the
+    job left out. Params: discovery ids (text[]), job id (as text), limit, offset."""
+    return (f"select lower(coalesce(src_connection, src_host)) as server, src_database, error, "
+            f"coalesce((listing ->> 'whole_server')::boolean, false) as whole_server, count(*) over () as total "
+            f"from {SCHEMA}.discovery where {_CLAIMED} and status = 'failed' and not ({DROPPED}) "
+            f"and not ({_LEFT_OUT}) order by lower(coalesce(src_connection, src_host)), lower(src_database) limit %s offset %s")
+
+
+def _named_reads(names_param: str) -> str:
+    return (f"(%s::boolean or (lower(coalesce(src_connection, src_host)), lower(src_database)) in "
+            f"(select * from unnest({names_param}::text[], %s::text[])))")
+
+
+def prepare_read_again_sql() -> str:
+    """Read again: a job's claimed databases that couldn't be read through the warehouse (all of them, or those named)
+    are running again, their statement and claim forgotten and their start now, so the background reader takes them.
+    Not one its draft dropped, nor one the job left out. Returns each database reset. Params: discovery ids (text[]),
+    job id (as text), all (boolean), the servers (text[], lower case, without a port), the databases (text[], lower
+    case)."""
+    return (f"update {SCHEMA}.discovery set status = 'running', error = null, tables = null, finished_at = null, "
+            f"started_at = now(), listing = listing - 'statement_id' - 'claimed_at' - 'discarded' "
+            f"where {_CLAIMED} and status = 'failed' and listing ->> 'via' = 'warehouse' and not ({DROPPED}) "
+            f"and not ({_LEFT_OUT}) and {_named_reads('%s')} returning lower(coalesce(src_connection, src_host)) as server, src_database")
+
+
+def prepare_leave_out_reads_sql() -> str:
+    """Leave out: a job's claimed databases that couldn't be read (all of them, or those named) are marked left out, so
+    no list or read takes them again. Returns each one, with why it couldn't be read. Params: as
+    prepare_read_again_sql."""
+    return (f"update {SCHEMA}.discovery set listing = listing || jsonb_build_object('left_out', now()::text) "
+            f"where {_CLAIMED} and status = 'failed' and not ({DROPPED}) and not ({_LEFT_OUT}) "
+            f"and {_named_reads('%s')} "
+            f"returning lower(coalesce(src_connection, src_host)) as server, src_database, error, "
+            f"coalesce((listing ->> 'whole_server')::boolean, false) as whole_server")
+
+
+def prepare_stop_reads_sql() -> str:
+    """Stop preparing: a job's claimed databases still to read are marked discarded, so the reader takes none of them;
+    their statements going, to cancel. Params: discovery ids (text[]), job id (as text)."""
+    return (f"update {SCHEMA}.discovery set listing = (listing - 'claimed_at') "
+            f"|| jsonb_build_object('discarded', now()::text) "
+            f"where {_CLAIMED} and status = 'running' and not (listing ? 'discarded') "
+            f"returning listing ->> 'statement_id' as statement_id")
+
+
+def prepare_resume_reads_sql() -> str:
+    """Prepare again: a job's claimed databases its Stop left unread (still running, or failed as their statement was
+    cancelled) are running again, with their start now, for the reader. Returns how many. Params: discovery ids
+    (text[]), job id (as text)."""
+    return (f"with resumed as (update {SCHEMA}.discovery set status = 'running', error = null, finished_at = null, "
+            f"started_at = now(), listing = listing - 'discarded' - 'statement_id' - 'claimed_at' "
+            f"where {_CLAIMED} and listing ? 'discarded' and status <> 'ok' returning 1) "
+            f"select count(*) as resumed from resumed")
+
+
+def database_owners_sql() -> str:
+    """The first job, by name, whose groups already read one of the given databases (database_key), live or deleted and
+    not yet purged: the database, the job's name and whether it is deleted. What Create refuses by database key alone,
+    before any table is read. Param: database keys (text[])."""
+    key = f"{database_source_sql('t')} || chr(31) || coalesce(t.src_database, '')"
+    return (f"with k as (select unnest(%s::text[]) as key) "
+            f"select min(t.src_database) as database, d.name as job, (d.deleted_at is not null) as deleted "
+            f"from {SCHEMA}.control t join {SCHEMA}.schedule_member m on m.task_collection = t.task_collection "
+            f"join {SCHEMA}.schedule d on d.id = m.schedule_id and (m.removed_at is null or d.deleted_at is not null) "
+            f"and not {PURGED_OPTION.replace('options', 'd.options')} "
+            f"where t.src_database in (select split_part(key, chr(31), -1) from k) and {key} in (select key from k) "
+            f"group by d.id, d.name, d.deleted_at order by d.name, d.id limit 1")
+
+
+def upload_database_sources_sql() -> str:
+    """One line per database of an upload (its first, in file order), with its fields: what Create keys each database
+    by before anything is written. Param: upload_id."""
+    return (f"select distinct on (server, lower(src_database)) server, src_database, fields "
+            f"from {SCHEMA}.table_upload_line where upload_id = %s and status = 'ok' "
+            f"order by server, lower(src_database), line")
 
 
 def selection_discoveries_sql() -> str:

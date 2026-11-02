@@ -169,13 +169,41 @@ def test_create_and_add_tables_by_reference_to_an_upload_keep_what_was_chosen(cl
         ("tables", "sql_a", "eng_015", ["gen.t0001", "GEN.T0002"], None, "upload")]
 
 
-def test_a_large_selection_runs_as_a_task(client):
+def test_a_large_selection_runs_as_a_task(client, monkeypatch):
+    # The earlier Create, a big one written in a task of its own (PREPARE_CREATES=0, the rollback); the Create that
+    # answers at once is the next test.
+    monkeypatch.setattr(main, "PREPARE_CREATES", False)
     up = client.post("/api/uploads", json={"csv": _csv(10, 80), "connection": "sql_a"}).json()["upload_id"]
     r = _create(client, "ref-big", source={"upload_id": up, "whole_server": True})
     assert r.status_code == 202
     task = client.get(f"/api/tasks/{r.json()['task']['id']}").json()
     assert task["status"] == "succeeded" and task["done"] == 800
     assert client.sql("select count(*) from lakefed_ingest.job_selection where job_id = %s", (task["job_id"],)) == [(1,)]
+
+
+def test_a_large_selection_is_created_at_once_and_prepared_by_its_task(client):
+    """More than BACKGROUND_ROWS tables: Create records the job and answers at once with its id and its preparation, no
+    task to follow; the prepare task (run inline here) writes it and makes it Ready. The same request again answers
+    with the same job."""
+    up = client.post("/api/uploads", json={"csv": _csv(10, 80), "connection": "sql_a"}).json()["upload_id"]
+    r = _create(client, "ref-big", source={"upload_id": up, "whole_server": True})
+    assert r.status_code == 200 and "task" not in r.json()
+    answer = r.json()
+    job_id = answer["id"]
+    assert answer["created"] is True and answer["summary"] is None
+    assert (answer["prepare"]["state"], answer["prepare"]["stage"]) == ("preparing", "reading")
+    tasks = client.sql("select status, error from lakefed_ingest.app_task where job_id = %s and kind = %s",
+                       (job_id, main.q.PREPARE_KIND))
+    assert tasks == [("succeeded", None)], tasks
+    prepare = client.get(f"/api/ingestion-jobs/{job_id}/prepare").json()
+    assert (prepare["state"], prepare["stage"]) == ("ready", None)
+    assert client.sql("select count(*), count(distinct task_collection) from lakefed_ingest.control") == [(800, 4)]
+    assert client.sql("select count(*) from lakefed_ingest.schedule_member where schedule_id = %s", (job_id,)) == [(4,)]
+    assert client.sql("select count(*) from lakefed_ingest.job_selection where job_id = %s", (job_id,)) == [(1,)]
+    again = _create(client, "ref-big", source={"upload_id": up, "whole_server": True})
+    assert again.status_code == 200 and again.json()["id"] == job_id and again.json()["prepare"]["state"] == "ready"
+    assert client.sql("select count(*) from lakefed_ingest.schedule") == [(1,)]
+    assert client.sql("select count(*) from lakefed_ingest.control") == [(800,)]
 
 
 def test_a_discovery_is_a_source_too(client):

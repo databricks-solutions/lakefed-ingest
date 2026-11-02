@@ -112,9 +112,12 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   instead (`lakefed_ingest discovery`, 2X-Small, up to 2 clusters, stopping after 5 idle minutes: bundle variables
   `discovery_warehouse_size`, `discovery_warehouse_max_clusters`, `discovery_warehouse_auto_stop_mins`), through the
   Unity Catalog connection, so the test, the database list and the table reads answer in seconds; the warehouse
-  needs the same network path to the sources (serverless network connectivity). The discovery job stays for listing
-  through Azure and for sources read by host and password. See [app/README.md](../app/README.md), Discovery through
-  the SQL warehouse.
+  needs the same network path to the sources (serverless network connectivity), or set `app_warehouse_id` to a Pro
+  warehouse of your own that has one (see [The app's SQL warehouse](#the-apps-sql-warehouse)). The app reads at most
+  8 databases of one source server at once to begin with, and raises that by 4, up to 32, only while each read keeps
+  its time (bundle variables `reads_start_cap`, `reads_max_cap`). The discovery job
+  stays for listing through Azure and for sources read by host and password. See [app/README.md](../app/README.md),
+  Discovery through the SQL warehouse.
 - **Ingestion** runs on job clusters with the source network path (scheduled, recurring work).
 - **The operations app's helper jobs**, `lakefed_ingest_cluster_copies` and `lakefed_ingest_delete_job`, run on
   serverless as the deployer. The delete job purges an app job's groups: a Delete keeps the job for
@@ -247,78 +250,45 @@ targets:
 
 ### The app's SQL warehouse
 
-The operations app runs its discovery SQL (the connection test, database lists, and table reads through
-`remote_query`) on one SQL warehouse. The app gets its ID as `WAREHOUSE_ID`, from the app resource
-`discovery-warehouse` in `app/resources/lakefed_ingest_app.yml`. Only `app/src/warehouse.py` reads it, from the
+The operations app runs its queries on the sources (the connection test, the database lists, the access checks, and
+table reads through `remote_query`) on one SQL warehouse. Only `app/src/warehouse.py` chooses it, from the
 environment, so no app code holds a warehouse ID.
 
-By default that resource is the bundle's own warehouse, `lakefed_ingest discovery`: Pro, serverless, sized by
+By default it is the bundle's own warehouse, `lakefed_ingest discovery`: Pro, serverless, sized by
 `discovery_warehouse_size`, `discovery_warehouse_max_clusters` and `discovery_warehouse_auto_stop_mins` in
-`app/databricks.yml`. It auto-stops when idle.
+`app/databricks.yml`. It auto-stops when idle. The app gets its ID as `WAREHOUSE_ID`, from the app resource
+`discovery-warehouse` in `app/resources/lakefed_ingest_app.yml`, which also gives the app `CAN_USE` on it.
 
-To use a customer's warehouse instead, it must be Pro or serverless, on version 2025.35 or above. The
-[remote_query docs](https://learn.microsoft.com/en-us/azure/databricks/query-federation/remote-queries) say
-"SQL warehouses must be Pro or Serverless and use version 2025.35 or above" (the AWS page is
-[query-federation/remote-queries](https://docs.databricks.com/aws/en/query-federation/remote-queries)).
-(The Runtime 18.3 requirement applies to clusters, not to SQL warehouses.)
-
-**Why a variable can't switch this.** The app resource takes one warehouse ID, and the default is the ID of a
-warehouse the bundle creates. YAML has no conditionals. The override below changes the `discovery-warehouse`
-resource in a target of `app/databricks.yml`. It repeats every app resource, because whether a target replaces a
-list or merges it is not confirmed. Run `databricks bundle plan` and confirm no app resource is removed.
+To run the app's queries on a warehouse of your own instead, say a Pro warehouse that runs in your network and
+reaches sources serverless can't, set the `app_warehouse_id` variable in your target of `app/databricks.yml`:
 
 ```yaml
 # app/databricks.yml
 targets:
   dev:                                           # your target
-    resources:
-      apps:
-        lakefed_ingest_app:
-          resources:
-            - name: ingest-job
-              description: The lakefed_ingest ingestion job.
-              job:
-                id: ${var.ingest_job_id}
-                permission: CAN_MANAGE
-            - name: setup-job
-              description: The lakefed_ingest_setup schema job.
-              job:
-                id: ${var.setup_job_id}
-                permission: CAN_MANAGE_RUN
-            - name: discover-job
-              description: The lakefed_ingest_discover table discovery job (bulk import).
-              job:
-                id: ${var.discover_job_id}
-                permission: CAN_MANAGE
-            - name: check-job
-              description: The lakefed_ingest_check job, started by schedules of the check variant.
-              job:
-                id: ${var.check_job_id}
-                permission: CAN_MANAGE
-            - name: cluster-copies-job
-              description: The lakefed_ingest_cluster_copies job, started when an app job's own cluster changes.
-              job:
-                id: ${var.cluster_copies_job_id}
-                permission: CAN_MANAGE_RUN
-            - name: delete-job
-              description: The lakefed_ingest_delete_job job, started when an app job is deleted.
-              job:
-                id: ${var.delete_job_id}
-                permission: CAN_MANAGE_RUN
-            - name: discovery-warehouse
-              description: The SQL warehouse discovery runs on.
-              sql_warehouse:
-                id: "<customer-warehouse-id>"         # Pro or serverless, version 2025.35 or above
-                permission: CAN_USE
+    variables:
+      app_warehouse_id: "<warehouse-id>"         # Pro or serverless, version 2025.35 or above
 ```
 
-- The bundle's own warehouse is still defined and created. This override doesn't remove it, and it stays idle
-  while nothing uses it. Whether a target can drop it is not confirmed.
-- The app's service principal gets `CAN_USE` through the resource. What the deploying user needs to bind a
-  customer's warehouse is not confirmed; check it at deploy.
-- Discovery reads the sources through `remote_query` on whichever warehouse is set, so that warehouse needs a
-  network path to each source. For a customer's warehouse, that is its own network setup, not the bundle's
-  serverless network connectivity.
+or pass `--var app_warehouse_id=<warehouse-id>` to `databricks bundle deploy`. Blank, the default, keeps the bundle's
+own warehouse. The app reads the setting as `APP_WAREHOUSE_ID` and uses it in place of `WAREHOUSE_ID` when it is set.
+
+- The warehouse must be Pro or serverless, on version 2025.35 or above. The
+  [remote_query docs](https://learn.microsoft.com/en-us/azure/databricks/query-federation/remote-queries) say
+  "SQL warehouses must be Pro or Serverless and use version 2025.35 or above" (the AWS page is
+  [query-federation/remote-queries](https://docs.databricks.com/aws/en/query-federation/remote-queries)).
+  A Classic warehouse doesn't work. (The Runtime 18.3 requirement applies to clusters, not to SQL warehouses.)
+- The `lakefed_ingest_app_grants` job gives the app's service principal `CAN_USE` on that warehouse. It adds one
+  entry to the warehouse's access list and leaves the others as they are. Whoever runs the job needs `CAN_MANAGE`
+  on the warehouse; without it the job fails and says so, and the warehouse's owner or a workspace admin grants
+  `CAN_USE` to the app's service principal instead. Run the job again after changing `app_warehouse_id`.
+- Manage shows the warehouse in use, read only: its name and ID, Pro or serverless, its state, and which setting
+  chose it. It says so plainly when the warehouse is Classic or can't be read. The app still starts either way.
+- The bundle's own warehouse is still defined and created, and the app keeps `CAN_USE` on it through its resource
+  (a variable can't switch an app resource). It stays idle while nothing uses it.
+- The app reads the sources through `remote_query` on whichever warehouse is set, so that warehouse needs a network
+  path to each source. For a warehouse of your own, that is its own network setup, not the bundle's serverless
+  network connectivity.
 
 ## 3. Steps outside the bundle
 

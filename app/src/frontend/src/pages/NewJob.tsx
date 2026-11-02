@@ -127,7 +127,8 @@ export default function NewJob() {
     mutationFn: async (sent: Row) => { created.current = true; setTask(null); return finished(await api.post<Row>("/ingestion-jobs", sent), setTask); },
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["ingestion-jobs"] }); qc.invalidateQueries({ queryKey: ["schedules"] });
-      if (r.created) navigate(`/ingestion-jobs/${r.id}`);
+      // The job's page as soon as Create names the job: written already, or recorded and preparing, which its page follows.
+      if (r.id != null && (r.created || r.prepare)) navigate(`/ingestion-jobs/${r.id}`);
     },
     // A Create that failed is a new request when it is sent again, unless it stopped part way: its databases are kept
     // and the same request finishes it.
