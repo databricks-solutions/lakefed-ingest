@@ -1,61 +1,59 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="410" viewBox="0 0 880 410" font-family="'DM Sans', Helvetica, Arial, sans-serif">
-  <title>How the parts of lakefed-ingest fit</title>
-  <desc>The check job asks the source databases what changed and starts ingest runs on job clusters for the databases with work. The ingest runs read the changes through a Unity Catalog connection or JDBC and write Delta tables. Both record their state in Lakebase. The optional operations app writes the control rows to Lakebase, starts jobs through their schedules, and reads table lists from the sources through its SQL warehouse.</desc>
-  <defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0 0 L10 5 L0 10 z" fill="#1B3139"/>
-    </marker>
-  </defs>
-  <rect x="0" y="0" width="880" height="410" fill="#FFFFFF"/>
-  <g stroke="#1B3139" stroke-width="1.5" fill="none" marker-end="url(#arrow)">
-    <path d="M290 50 L192 50"/>
-    <path d="M105 80 L105 148"/>
-    <path d="M420 80 L420 128"/>
-    <path d="M290 158 L192 180"/>
-    <path d="M420 180 L420 208"/>
-    <path d="M290 240 L192 240"/>
-    <path d="M550 235 L648 214"/>
-    <path d="M420 260 L420 318"/>
-    <path d="M550 50 L610 50 L610 350 L552 350"/>
-  </g>
-  <g stroke="#1B3139" stroke-width="1.25">
-    <rect x="290" y="20" width="260" height="60" rx="10" fill="#EEEDE9" stroke-dasharray="6 4"/>
-    <rect x="20" y="20" width="170" height="60" rx="10" fill="#F9F7F4"/>
-    <rect x="20" y="150" width="170" height="120" rx="10" fill="#F9F7F4"/>
-    <rect x="290" y="130" width="260" height="50" rx="10" fill="#F9F7F4"/>
-    <rect x="290" y="210" width="260" height="50" rx="10" fill="#F9F7F4"/>
-    <rect x="290" y="320" width="260" height="60" rx="10" fill="#EEEDE9"/>
-  </g>
-  <rect x="650" y="185" width="210" height="60" rx="10" fill="#FFFFFF" stroke="#FF3621" stroke-width="2"/>
-  <g fill="#1B3139" font-size="14" text-anchor="middle">
-    <text x="420" y="45" font-weight="700">Operations app (optional)</text>
-    <text x="420" y="64" font-size="12" fill="#5A6F77">find tables, make and watch jobs</text>
-    <text x="105" y="45" font-weight="700">SQL warehouse</text>
-    <text x="105" y="64" font-size="12" fill="#5A6F77">for the app's discovery</text>
-    <text x="105" y="178" font-weight="700">Source databases</text>
-    <text x="105" y="200" font-size="12" fill="#5A6F77">SQL Server</text>
-    <text x="105" y="217" font-size="12" fill="#5A6F77">Oracle</text>
-    <text x="105" y="234" font-size="12" fill="#5A6F77">PostgreSQL</text>
-    <text x="105" y="251" font-size="12" fill="#5A6F77">MySQL</text>
-    <text x="420" y="152" font-weight="700">Check job</text>
-    <text x="420" y="170" font-size="12" fill="#5A6F77">serverless: what changed?</text>
-    <text x="420" y="232" font-weight="700">Ingest runs</text>
-    <text x="420" y="250" font-size="12" fill="#5A6F77">job clusters, UC connection or JDBC</text>
-    <text x="755" y="211" font-weight="700">Delta tables</text>
-    <text x="755" y="230" font-size="12" fill="#5A6F77">in Unity Catalog</text>
-    <text x="420" y="344" font-weight="700">Lakebase</text>
-    <text x="420" y="363" font-size="12" fill="#5A6F77">control rows, positions, run history</text>
-  </g>
-  <g fill="#5A6F77" font-size="11">
-    <text x="241" y="42" text-anchor="middle">runs on</text>
-    <text x="112" y="118">reads table lists and columns only</text>
-    <text x="428" y="108">a job's schedule starts the check</text>
-    <text x="198" y="198">asks what changed</text>
-    <text x="428" y="199">starts the runs with work</text>
-    <text x="200" y="233">reads changes</text>
-    <text x="655" y="178">MERGE or append</text>
-    <text x="428" y="295">records positions and outcomes</text>
-    <text x="618" y="282">writes control rows,</text>
-    <text x="618" y="296">reads state</text>
-  </g>
+<title>How the parts of lakefed-ingest fit</title>
+<desc>The check job, a Lakeflow job, asks the source databases what changed and starts ingest runs, also Lakeflow jobs, on job clusters for the databases with work. The ingest runs read the changes through a Unity Catalog connection or JDBC and write Delta tables in Unity Catalog. Both record their state in Lakebase. The optional operations app, a Databricks App, writes the control rows to Lakebase, starts jobs through their schedules, and reads table lists from the sources through its SQL warehouse.</desc>
+<defs><marker id="hif-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#1B3139"/></marker></defs>
+<rect x="0" y="0" width="880" height="410" fill="#FFFFFF"/>
+<g stroke="#1B3139" stroke-width="1.5" fill="none" marker-end="url(#hif-arrow)"><path d="M290 50 L208 50"/><path d="M111 80 L111 148"/><path d="M420 80 L420 128"/><path d="M290 158 L208 180"/><path d="M420 180 L420 208"/><path d="M290 240 L208 240"/><path d="M550 235 L648 214"/><path d="M420 260 L420 318"/><path d="M550 50 L610 50 L610 350 L552 350"/></g>
+<rect x="290" y="20" width="260" height="60" rx="10" fill="#EEEDE9" stroke="#1B3139" stroke-width="1.25" stroke-dasharray="6 4"/>
+<rect x="16" y="20" width="190" height="60" rx="10" fill="#F9F7F4" stroke="#1B3139" stroke-width="1.25"/>
+<rect x="16" y="150" width="190" height="120" rx="10" fill="#F9F7F4" stroke="#1B3139" stroke-width="1.25"/>
+<rect x="290" y="130" width="260" height="50" rx="10" fill="#F9F7F4" stroke="#1B3139" stroke-width="1.25"/>
+<rect x="290" y="210" width="260" height="50" rx="10" fill="#F9F7F4" stroke="#1B3139" stroke-width="1.25"/>
+<rect x="290" y="320" width="260" height="60" rx="10" fill="#EEEDE9" stroke="#1B3139" stroke-width="1.25"/>
+<rect x="650" y="185" width="210" height="60" rx="10" fill="#FFFFFF" stroke="#FF3621" stroke-width="2"/>
+<svg x="302" y="36" width="28" height="28" viewBox="0 0 512 512" fill="none"><path d="M64 72C64 67.5817 67.5817 64 72 64H216C220.418 64 224 67.5817 224 72V216C224 220.418 220.418 224 216 224H72C67.5817 224 64 220.418 64 216V72Z" fill="#FABFBA"/>
+<path d="M280 72C280 67.5817 283.582 64 288 64H432C436.418 64 440 67.5817 440 72V216C440 220.418 436.418 224 432 224H288C283.582 224 280 220.418 280 216V72Z" fill="#FF5F46"/>
+<path d="M64 296C64 291.582 67.5817 288 72 288H216C220.418 288 224 291.582 224 296V440C224 444.418 220.418 448 216 448H72C67.5817 448 64 444.418 64 440V296Z" fill="#FF5F46"/>
+<path d="M280 296C280 291.582 283.582 288 288 288H432C436.418 288 440 291.582 440 296V440C440 444.418 436.418 448 432 448H288C283.582 448 280 444.418 280 440V296Z" fill="#FABFBA"/></svg>
+<text x="342" y="45" font-size="14" font-weight="700" fill="#1B3139">Operations app (optional)</text><text x="342" y="64" font-size="12" fill="#5A6F77">find tables, make and watch jobs</text>
+<svg x="24" y="34" width="32" height="32" viewBox="0 0 150 150" fill="none"><path d="M74.9998 47.2817C100.405 47.2817 121 43.3671 121 38.5381C121 33.7091 100.405 29.7944 74.9998 29.7944C49.5946 29.7944 28.9996 33.7091 28.9996 38.5381C28.9996 43.3671 49.5946 47.2817 74.9998 47.2817Z" stroke="#1B3139" stroke-width="3" stroke-miterlimit="3" stroke-linecap="square"/>
+<path d="M121 39.563V53.1589C121 57.9871 100.406 61.9025 74.9998 61.9025C49.5936 61.9025 28.9996 57.9871 28.9996 53.1589V67.7796C28.9996 72.6079 49.5936 76.5233 74.9998 76.5233C100.406 76.5233 121 72.6079 121 67.7796V82.4004C121 87.2286 100.406 91.1441 74.9998 91.1441C49.5936 91.1441 28.9996 87.2286 28.9996 82.4004V97.0212C28.9996 101.849 49.5936 105.765 74.9998 105.765C100.406 105.765 121 101.849 121 97.0212V111.642C121 116.47 100.406 120.386 74.9998 120.386C49.5936 120.386 28.9996 116.47 28.9996 111.642V108.207" stroke="#1B3139" stroke-width="3" stroke-miterlimit="3" stroke-linecap="square"/></svg>
+<text x="60" y="45" font-size="14" font-weight="700" fill="#1B3139">SQL warehouse</text><text x="60" y="64" font-size="12" fill="#5A6F77">for the app's discovery</text>
+<svg x="26" y="164" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#5A6F77" stroke-width="1.5" stroke-linecap="round"><ellipse cx="12" cy="5" rx="8" ry="3" fill="#FFFFFF"/><path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5"/><path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"/></svg>
+<text x="60" y="182" font-size="14" font-weight="700" fill="#1B3139">Source databases</text>
+<text x="60" y="204" font-size="12" fill="#5A6F77">SQL Server</text><text x="60" y="221" font-size="12" fill="#5A6F77">Oracle</text><text x="60" y="238" font-size="12" fill="#5A6F77">PostgreSQL</text><text x="60" y="255" font-size="12" fill="#5A6F77">MySQL</text>
+<svg x="302" y="142" width="26" height="26" viewBox="0 0 512 512" fill="none"><path d="M220.408 401.342L362.785 257.242L220.408 113.143L220.408 56L299.582 56L299.582 136.544L314.387 142.792L370.291 85.8379L426.713 143.32L370.807 200.274L376.941 215.356H456.002V296.644H376.941L370.807 311.726L426.713 368.68L370.291 426.162L314.385 369.208L299.582 375.456L299.582 456H220.408L220.408 401.342Z" fill="#FABFBA"/>
+<path d="M156.584 100.984V100.722L308.78 256.001L156.584 411.281V411.004L141.711 426.159L85.2895 368.676L141.196 311.722L135.061 296.641H56V215.352H135.061L141.196 200.271L85.2895 143.317L141.711 85.8345L156.584 100.984Z" fill="#FF5F46"/></svg>
+<text x="340" y="151" font-size="14" font-weight="700" fill="#1B3139">Check job</text><text x="340" y="169" font-size="12" fill="#5A6F77">serverless: what changed?</text>
+<svg x="302" y="222" width="26" height="26" viewBox="0 0 512 512" fill="none"><path d="M220.408 401.342L362.785 257.242L220.408 113.143L220.408 56L299.582 56L299.582 136.544L314.387 142.792L370.291 85.8379L426.713 143.32L370.807 200.274L376.941 215.356H456.002V296.644H376.941L370.807 311.726L426.713 368.68L370.291 426.162L314.385 369.208L299.582 375.456L299.582 456H220.408L220.408 401.342Z" fill="#FABFBA"/>
+<path d="M156.584 100.984V100.722L308.78 256.001L156.584 411.281V411.004L141.711 426.159L85.2895 368.676L141.196 311.722L135.061 296.641H56V215.352H135.061L141.196 200.271L85.2895 143.317L141.711 85.8345L156.584 100.984Z" fill="#FF5F46"/></svg>
+<text x="340" y="231" font-size="14" font-weight="700" fill="#1B3139">Ingest runs</text><text x="340" y="249" font-size="12" fill="#5A6F77">job clusters, UC connection or JDBC</text>
+<svg x="658" y="197" width="36" height="36" viewBox="0 0 150 150" fill="none"><g clip-path="url(#hif-clip0_1_1990)">
+<path d="M80.2 24.4999C79.1 22.5999 77 21.3999 74.8 21.3999C72.6 21.3999 70.5 22.5999 69.4 24.4999L28.6 95.1999C28.2 95.9999 28.3 96.9999 28.9 97.5999C29.5 98.1999 30.4 98.3999 31.2 98.0999C39.4 94.4999 48.2 92.4999 57.2 92.2999C63.1 92.1999 69 93.6999 74.2 96.4999L75.7 93.8999C70.8 90.9999 63.7 89.1999 57.1 89.1999C48.7 89.3999 40.4 91.0999 32.5 94.1999L71.9 25.9999C72.5 24.9999 73.6 24.3999 74.7 24.3999C75.9 24.3999 76.9 24.9999 77.5 25.9999L127.7 110.2C129 112.3 128.6 115.1 126.7 116.8C122.2 120.8 113.9 125.6 99.9 125.6C87.3 125.6 80.5 121.6 73.9 117.8C68.4 114.6 62.8 111.3 54.2 110.6C41.5 109.6 28.4 115.3 22.2 118.2C29.8 107.9 41.6 101.6 54.3 100.7C65.3 99.9999 70.7 103.2 76.4 106.6C81.8 109.8 87.3 113.1 97.5 113.1C101.4 113.1 105.2 112.4 108.8 111.1C110.3 110.6 111.2 108.9 110.6 107.4C110.5 107.2 110.4 107 110.3 106.8L77.6 51.1999C77.1 50.2999 76.1 49.6999 75 49.6999C73.9 49.6999 72.9 50.2999 72.3 51.1999L56.5 78.8999C55.7 80.3999 56.2 82.1999 57.6 83.0999C57.9 83.2999 58.2 83.3999 58.5 83.3999C65.1 84.5999 71.4 87.1999 77 90.9999L78.7 88.4999C72.9 84.3999 66.2 81.6999 59.2 80.3999V80.2999L75 52.5999H75.1L108 108.3C104.7 109.5 101.2 110.1 97.6 110.1C88.2 110.1 83.3 107.1 78 104C72.1 100.5 66.1 96.8999 54.2 97.5999C36.2 98.6999 23.2 110.4 18.8 117.9C18.1 119.1 18.5 120.6 19.7 121.3C20.4 121.7 21.3 121.8 22.1 121.4C27.3 118.9 41.1 112.3 54.1 113.4C62 114 67.1 117 72.6 120.2C79.5 124.2 86.7 128.4 100.1 128.4C115 128.4 124 123.2 128.9 118.9C131.8 116.3 132.5 111.9 130.5 108.6L80.2 24.4999Z" fill="#1B3139"/>
+</g>
+<defs>
+<clipPath id="hif-clip0_1_1990">
+<rect width="150" height="150" fill="white"/>
+</clipPath>
+</defs></svg>
+<text x="698" y="210" font-size="14" font-weight="700" fill="#1B3139">Delta tables</text>
+<svg x="698" y="218" width="16" height="16" viewBox="0 0 512 512" fill="none"><path d="M255.38 185.263L194.172 220.632V291.368L255.38 326.737L316.588 291.368V220.632L255.38 185.263Z" fill="#FF5F46"/>
+<path d="M384.434 181.579H454.86L419.462 120.421L384.434 181.579Z" fill="#FF5F46"/>
+<path d="M384.434 330.79L419.831 391.947L455.229 330.79H384.434Z" fill="#FF5F46"/>
+<path d="M219.98 466H290.407L255.009 404.842L219.98 466Z" fill="#FF5F46"/>
+<path d="M55.5312 330.79L90.9288 391.947L126.326 330.79H55.5312Z" fill="#FF5F46"/>
+<path d="M55.5312 181.579H125.958L90.5601 120.421L55.5312 181.579Z" fill="#FF5F46"/>
+<path d="M219.98 46L255.378 107.158L290.776 46H219.98Z" fill="#FF5F46"/>
+<path d="M322.487 58.1582L281.559 128.895L352.354 169.79L393.282 99.0529L322.487 58.1582Z" fill="#FABFBA"/>
+<path d="M460.392 215.105H378.535V296.895H460.392V215.105Z" fill="#FABFBA"/>
+<path d="M352.354 342.579L281.559 383.474L322.487 454.211L393.282 413.316L352.354 342.579Z" fill="#FABFBA"/>
+<path d="M158.038 342.579L117.109 413.316L187.905 454.211L228.833 383.474L158.038 342.579Z" fill="#FABFBA"/>
+<path d="M131.857 215.105H50V296.895H131.857V215.105Z" fill="#FABFBA"/>
+<path d="M187.905 58.1582L117.109 99.0529L158.038 169.79L228.833 128.895L187.905 58.1582Z" fill="#FABFBA"/></svg>
+<text x="718" y="230" font-size="12" fill="#5A6F77">in Unity Catalog</text>
+<svg x="302" y="336" width="28" height="28" viewBox="0 0 512 512" fill="none"><path d="M448 305.954H447.994C419.48 315.543 386.842 321.022 352 321.022C317.158 321.022 284.484 315.543 256.006 305.954H64V203.887H448V305.954ZM160 290.251C125.156 290.251 92.5155 295.961 64 305.953H256C227.52 295.961 194.844 290.251 160 290.251Z" fill="#FABFBA"/>
+<path d="M160.451 327.787C195.132 327.787 227.655 332.986 256.001 342.085H256C284.346 351.184 316.868 356.383 351.549 356.383C385.146 356.383 416.684 351.504 444.426 342.927L447.099 342.085H448V447.999H64V342.085H64.9023C93.2839 332.986 125.771 327.787 160.451 327.787Z" fill="#FF5F46"/>
+<rect x="64" y="64" width="384" height="105.914" fill="#FABFBA"/></svg>
+<text x="342" y="345" font-size="14" font-weight="700" fill="#1B3139">Lakebase</text><text x="342" y="364" font-size="12" fill="#5A6F77">control rows, positions, run history</text>
+<g fill="#5A6F77" font-size="11"><text x="249" y="42" text-anchor="middle">runs on</text><text x="118" y="118">reads table lists and columns only</text><text x="428" y="108">a job's schedule starts the check</text><text x="213" y="198">asks what changed</text><text x="428" y="199">starts the runs with work</text><text x="213" y="233">reads changes</text><text x="655" y="178">MERGE or append</text><text x="428" y="295">records positions and outcomes</text><text x="618" y="282">writes control rows,</text><text x="618" y="296">reads state</text></g>
 </svg>
