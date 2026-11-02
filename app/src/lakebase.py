@@ -73,6 +73,12 @@ def query(sql: str, params: tuple = ()) -> List[dict]:
         return [{c: _jsonable(v) for c, v in zip(cols, row)} for row in cur.fetchall()]
 
 
+def execute(sql: str, params: tuple = ()) -> None:
+    """A statement that returns no rows, committed at once on its own connection."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+
+
 def fetch(cur, sql: str, params: tuple = ()) -> List[dict]:
     """Like ``query``, on a cursor of an open transaction."""
     cur.execute(sql, params)

@@ -1,70 +1,453 @@
+/* The Databricks workspace look: the design system's (dbui) published tokens in ./dbui/tokens.css
+   (scripts/sync-dbui-tokens.mjs) and its DM Sans font. The short names below alias those tokens for this
+   app's own styles; status bars use the design system's semantic status colors. */
+@import "./dbui/dm-sans.css";
+@import "./dbui/tokens.css";
+
 :root {
-  --bg: #f6f7f9; --card: #fff; --text: #1d2433; --muted: #5f6b7a; --border: #e2e6eb;
-  --accent: #2563eb; --accent-text: #fff; --ok: #0f7b4f; --ok-bg: #e6f6ee; --warn: #8a5a00; --warn-bg: #fff4dc;
-  --bad: #b42318; --bad-bg: #fdecea; --info-bg: #eef4ff;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  color: var(--text); background: var(--bg); font-size: 14px;
+  --bg: var(--db-surface-base); --card: var(--db-surface-base); --text: var(--db-text-base);
+  --muted: var(--db-text-subtle); --border: var(--db-border-base); --nav-bg: var(--db-surface-subtle);
+  --accent: var(--db-accent-surface); --accent-hover: var(--db-accent-surface-hover); --accent-text: var(--db-text-on-accent-surface);
+  --link: var(--db-accent-text);
+  --ok: var(--db-positive-text); --ok-bg: var(--db-positive-surface-subtle);
+  --warn: var(--db-caution-text); --warn-bg: var(--db-caution-surface-subtle);
+  --bad: var(--db-negative-text); --bad-bg: var(--db-negative-surface-subtle);
+  --info-bg: var(--db-accent-surface-subtle);
+  /* state colors for bars, checked for color-vision separation as two sets (state, run progress). Healthy is a quiet
+     neutral, as the Databricks lists keep rows neutral and color what needs a look: amber late, red failing. */
+  /* State colours, as the Databricks UI's run statuses draw them: green succeeded or loaded, blue running, grey waiting
+     or not started, amber late, red failed. */
+  --s-loaded: var(--db-positive-border); --s-unchanged: color-mix(in srgb, var(--db-positive-border) 45%, white);
+  --s-running: var(--db-accent-surface); --s-waiting: color-mix(in srgb, var(--db-text-subtle) 55%, white);
+  --s-late: var(--db-caution-surface-strong); --s-failing: var(--db-negative-surface); --s-track: var(--db-surface-strong);
 }
 * { box-sizing: border-box; }
-body { margin: 0; }
-h1 { font-size: 22px; margin: 0 0 16px; }
-h2 { font-size: 16px; margin: 0; }
-code { font-size: 12px; background: #eef0f3; padding: 1px 4px; border-radius: 4px; }
-a { color: var(--accent); }
+/* On body, not :root: the tokens' rem sizes stay relative to the browser's root size, as in the workspace. */
+body { margin: 0; font-family: var(--db-font-family); color: var(--text); background: var(--bg);
+  font-size: var(--db-font-size-base); line-height: var(--db-line-height-base); }
+h1 { font-size: var(--db-font-size-xl); line-height: var(--db-line-height-xl); font-weight: var(--db-font-weight-semibold); margin: 0 0 var(--db-space-4); }
+h2 { font-size: var(--db-typography-h5-font-size); font-weight: var(--db-font-weight-semibold); margin: 0; }
+h3 { font-size: var(--db-font-size-base); font-weight: var(--db-font-weight-semibold); margin: 0; }
+code { font-family: "DM Mono", ui-monospace, Menlo, monospace; font-size: var(--db-font-size-sm); background: var(--db-surface-strong);
+  padding: 1px 4px; border-radius: var(--db-shape-control); }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--db-color-action-default-border-focus); outline-offset: 1px; }
+
+/* Shell: a light left navigation, as in the workspace */
 .layout { display: flex; min-height: 100vh; }
-.sidebar { width: 220px; flex-shrink: 0; background: #111827; color: #e5e7eb; padding: 18px 14px; display: flex; flex-direction: column; gap: 18px; position: sticky; top: 0; height: 100vh; }
-.brand { font-weight: 700; font-size: 16px; }
-.sidebar nav { display: flex; flex-direction: column; gap: 2px; }
-.sidebar nav a { color: #cbd5e1; text-decoration: none; padding: 7px 10px; border-radius: 6px; }
-.sidebar nav a:hover { background: #1f2937; }
-.sidebar nav a.active { background: #2563eb; color: #fff; }
-.sidebar-foot { margin-top: auto; display: flex; flex-direction: column; gap: 10px; }
-.sidebar-foot label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #cbd5e1; }
-.sidebar-foot code { background: #1f2937; color: #e5e7eb; }
-.sidebar .muted { color: #9ca3af; }
-.content { flex: 1; padding: 24px 28px; min-width: 0; }
-.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-.card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 12px; }
-.card-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
-.metric { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
-.metric-label { color: var(--muted); font-size: 12px; }
-.metric-value { font-size: 24px; font-weight: 600; margin-top: 4px; }
-.metric.bad .metric-value { color: var(--bad); } .metric.warn .metric-value { color: var(--warn); } .metric.ok .metric-value { color: var(--ok); }
-.toolbar { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 12px; }
-.toolbar label, .form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.sidebar { width: 232px; flex-shrink: 0; background: var(--nav-bg); border-right: 1px solid var(--border); padding: var(--db-space-4) var(--db-space-2);
+  display: flex; flex-direction: column; gap: var(--db-space-3); position: sticky; top: 0; height: 100vh; }
+.brand { font-weight: var(--db-font-weight-semibold); font-size: 18px; padding: 0 var(--db-space-2); display: flex; align-items: center; gap: var(--db-space-2); }
+.brand .mark { width: 22px; height: 22px; border-radius: var(--db-shape-control); background: var(--db-negative-surface); display: inline-flex;
+  align-items: center; justify-content: center; color: #fff; font-size: 12px; font-weight: 700; }
+.brand small { display: block; font-weight: var(--db-font-weight-normal); font-size: var(--db-font-size-sm); color: var(--muted); }
+.sidebar nav, .sidebar nav > div { display: flex; flex-direction: column; gap: 1px; }
+.nav-group { font-size: var(--db-font-size-xs); font-weight: var(--db-font-weight-semibold); text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted); padding: var(--db-space-3) var(--db-space-2) var(--db-space-1); }
+.sidebar nav a { color: var(--text); text-decoration: none; padding: 6px var(--db-space-2); border-radius: var(--db-shape-control); }
+/* Selection in the navigation is neutral gray, as in the workspace; blue is kept for links and primary actions. */
+.sidebar nav a:hover { background: var(--db-color-table-background-selected-default); text-decoration: none; }
+.sidebar nav a.active { background: var(--db-color-table-background-selected-hover); color: var(--text);
+  font-weight: var(--db-font-weight-semibold); }
+.sidebar .muted { color: var(--muted); }
+.sidebar-foot { margin-top: auto; display: flex; flex-direction: column; align-items: flex-start; gap: var(--db-space-2);
+  padding: var(--db-space-3) var(--db-space-2) 0; border-top: 1px solid var(--border); font-size: var(--db-font-size-sm); color: var(--muted); }
+.content { flex: 1; padding: var(--db-space-6) var(--db-space-8); min-width: 0; }
+
+/* Page header */
+.page-head { display: flex; justify-content: space-between; align-items: flex-end; gap: var(--db-space-4); flex-wrap: wrap; margin-bottom: var(--db-space-4); }
+.page-head > div { min-width: 0; max-width: 100%; }
+/* As a Databricks job page: the title and lead wrap, the actions keep the top right at every width above a phone's. */
+@media (min-width: 900px) {
+  .page-head { flex-wrap: nowrap; align-items: flex-start; }
+  .page-head > div:first-child { flex: 1 1 0; }
+  .page-head > div + div { flex: none; }
+}
+.page-head h1 { margin: 0; overflow-wrap: anywhere; }
+/* A title edited in place, as the Databricks Jobs editor's job name: it reads as the heading until hovered or focused. */
+.title-edit-row { display: flex; align-items: baseline; gap: var(--db-space-3); flex-wrap: wrap; }
+.page-head h1 input.title-edit { font: inherit; color: inherit; border: 1px solid transparent; border-radius: var(--db-shape-control);
+  background: transparent; padding: 0 var(--db-space-1); margin-left: calc(-1 * var(--db-space-1)); width: min(100%, 36ch); }
+.page-head h1 input.title-edit:hover { border-color: var(--border); }
+.page-head h1 input.title-edit:focus { border-color: var(--accent); outline: none; background: var(--card); }
+.title-note { font-size: var(--db-font-size-sm); font-weight: var(--db-font-weight-normal); color: var(--bad); }
+.page-head .crumb, .page-head .lead { overflow-wrap: anywhere; }
+.crumb { font-size: var(--db-font-size-sm); color: var(--muted); margin-bottom: var(--db-space-1); }
+.eyebrow { font-size: var(--db-font-size-sm); color: var(--muted); }
+.eyebrow a { color: var(--link); }
+.lead { color: var(--muted); margin: var(--db-space-1) 0 0; max-width: 900px; }
+.lead strong { color: var(--text); font-weight: var(--db-font-weight-semibold); }
+.stamp { font-size: var(--db-font-size-sm); color: var(--muted); white-space: nowrap; }
+
+/* Cards and tiles */
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4);
+  margin-bottom: var(--db-space-4); min-width: 0; }
+.card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--db-space-3); gap: var(--db-space-3); flex-wrap: wrap; }
+/* Pages use the full width; only running text is capped, for reading. */
+.card-head p { margin: 2px 0 0; color: var(--muted); font-size: var(--db-font-size-sm); max-width: 120ch; }
+p.small, .alert, .empty { max-width: 140ch; }
+.card-actions { display: flex; gap: var(--db-space-2); align-items: center; flex-wrap: wrap; }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: var(--db-space-3); margin-bottom: var(--db-space-4); }
+.metric { background: var(--card); border: 1px solid var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-3) var(--db-space-4); min-width: 0; }
+/* A totals tile that opens its list, as the workspace home's tiles do: the whole tile is the link, and on hover the
+   whole tile tints and lifts, no underlined text. */
+.metric-link { color: inherit; text-decoration: none; cursor: pointer; transition: background-color .12s, box-shadow .12s; }
+.metric-link:hover { text-decoration: none; background: var(--db-surface-hover); box-shadow: 0 1px 4px rgba(0, 0, 0, .08); }
+.metric-label { color: var(--muted); font-size: var(--db-font-size-sm); }
+.metric-value { font-size: var(--db-font-size-xl); line-height: var(--db-line-height-xl); font-weight: var(--db-font-weight-semibold);
+  margin-top: 2px; font-variant-numeric: tabular-nums; }
+.metric-value small { font-size: var(--db-font-size-sm); font-weight: var(--db-font-weight-normal); color: var(--muted); margin-left: 4px; }
+.metric-sub { color: var(--muted); font-size: var(--db-font-size-sm); }
+.metric.bad .metric-value { color: var(--bad); }
+
+/* Server cards */
+.server-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--db-space-3); }
+.server-card { border: 1px solid var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-3) var(--db-space-4);
+  display: flex; flex-direction: column; gap: var(--db-space-2); min-width: 0; background: var(--card); }
+.server-card.selectable { cursor: pointer; }
+.server-card.selectable:hover { border-color: var(--db-border-hover); }
+.server-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.server-card.disabled { opacity: .55; cursor: default; }
+.server-card .top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: var(--db-space-2); }
+.server-card .top > div:first-child { flex: 1 1 160px; min-width: 0; }
+.server-card .top > .tag { flex-shrink: 0; }
+.server-card h3 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.server-card .meta { font-size: var(--db-font-size-sm); color: var(--muted); overflow-wrap: break-word; }
+.nums { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--db-space-1); }
+.nums.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.nums b { display: block; font-size: var(--db-font-size-md); font-variant-numeric: tabular-nums; }
+.nums span { font-size: var(--db-font-size-xs); color: var(--muted); }
+
+/* Tags (the design system's Tag look) */
+.badge, .tag { display: inline-flex; align-items: center; gap: 4px; padding: 0 var(--db-space-2); height: 20px; border-radius: var(--db-shape-control);
+  font-size: var(--db-font-size-sm); background: var(--db-color-tag-background-default); color: var(--db-color-tag-text-default); white-space: nowrap; }
+/* Success reads as quiet text with a small green dot, as in the Jobs list, never a green fill. */
+.badge.ok, .tag.ok { background: var(--db-color-tag-background-default); color: var(--db-color-tag-text-default); }
+.tag.ok .dot, .badge.ok::before { background: var(--db-positive-surface-strong); }
+.badge.ok::before { content: ""; width: 6px; height: 6px; border-radius: 50%; }
+.badge.warn, .tag.warn { background: var(--db-color-tag-background-lemon); color: var(--db-color-tag-text-lemon); }
+.badge.bad, .tag.bad { background: var(--db-color-tag-background-coral); color: var(--db-color-tag-text-coral); }
+.tag.run { background: var(--db-color-tag-background-indigo); color: var(--db-color-tag-text-indigo); }
+.tag.first { background: var(--db-color-tag-background-purple); color: var(--db-color-tag-text-purple); }
+.tag .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+/* Bars: a table's state, or a run's progress; segments carry a title and a labeled count */
+.bar { display: flex; height: 8px; border-radius: var(--db-radius-full); overflow: hidden; background: var(--s-track); gap: 2px; min-width: 120px; }
+.bar.big { height: 12px; }
+.bar > span { display: block; height: 100%; min-width: 2px; }
+.seg-loaded { background: var(--s-loaded); } .seg-unchanged { background: var(--s-unchanged); }
+.seg-running { background: repeating-linear-gradient(45deg, var(--s-running) 0 3px, color-mix(in srgb, var(--s-running) 55%, white) 3px 6px); }
+.seg-waiting { background: var(--s-waiting); } .seg-late { background: var(--s-late); } .seg-failing { background: var(--s-failing); }
+.seg-notrun { background: repeating-linear-gradient(45deg, var(--s-track) 0 3px, var(--db-border-base) 3px 6px); }
+.seg-track { background: var(--s-track); border: 1px solid var(--border); }
+.state-bar { min-width: 120px; }
+.bar-counts { display: flex; flex-wrap: wrap; column-gap: 0; row-gap: 2px; margin-top: 4px; font-size: var(--db-font-size-sm); line-height: 1.3; }
+.bar-counts.stacked { flex-direction: column; }
+.bar-counts.stacked > span + span::before { content: none; }
+.bar-counts > span + span::before { content: "·"; margin: 0 6px; color: var(--muted); font-weight: var(--db-font-weight-normal); }
+.tone-loaded, .tone-unchanged { color: var(--ok); } .tone-running { color: var(--db-accent-text); } .tone-late { color: var(--warn); }
+.tone-failing { color: var(--bad); } .tone-waiting, .tone-notrun, .tone-zero { color: var(--muted); }
+.all-done { display: inline-flex; align-items: center; gap: 4px; font-weight: var(--db-font-weight-semibold); }
+.key { display: flex; flex-wrap: wrap; gap: var(--db-space-3); font-size: var(--db-font-size-sm); color: var(--muted); margin-top: var(--db-space-2); }
+.key i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.key b { color: var(--text); font-weight: var(--db-font-weight-semibold); }
+/* A card's bar and its legend: the legend on one wrapping line, each count beside its swatch. */
+.summary { display: flex; flex-direction: column; gap: var(--db-space-2); margin-top: var(--db-space-2); min-width: 0; }
+.summary .key { margin-top: 0; align-items: center; gap: var(--db-space-1) var(--db-space-3); }
+.summary .key > span { display: inline-flex; align-items: center; gap: 6px; margin: 0; white-space: nowrap; }
+.summary .bar { min-width: 0; }
+.key .all-done { color: var(--text); }
+.key .all-done svg { color: var(--s-loaded); flex: none; }
+
+/* Running now */
+.run-row { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(0, 2.2fr) minmax(200px, 1fr); gap: var(--db-space-4); align-items: center;
+  padding: var(--db-space-3) 0; border-top: 1px solid var(--border); }
+.run-row:first-of-type { border-top: 0; padding-top: 0; }
+.run-row .title { font-weight: var(--db-font-weight-semibold); font-size: var(--db-font-size-md); }
+.kv { display: flex; gap: var(--db-space-3); flex-wrap: wrap; font-size: var(--db-font-size-sm); color: var(--muted); }
+.kv b { color: var(--text); font-weight: var(--db-font-weight-semibold); font-variant-numeric: tabular-nums; }
+.kv.stack { flex-direction: column; gap: 2px; }
+.count { margin-bottom: var(--db-space-2); }
+
+/* Data tables (plain HTML, for the monitoring views) */
+table.data { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+table.data th { text-align: left; font-weight: var(--db-font-weight-semibold); color: var(--muted); font-size: var(--db-font-size-sm);
+  padding: 6px var(--db-space-2); border-bottom: 1px solid var(--border); white-space: nowrap; }
+table.data td { padding: 8px var(--db-space-2); border-bottom: 1px solid var(--db-border-subtle); vertical-align: middle; }
+table.data tr:last-child td { border-bottom: 0; }
+table.data tbody tr:hover td { background: var(--db-surface-hover); }
+table.data tr.link { cursor: pointer; }
+table.data tr.selected td { background: var(--db-surface-selected); }
+table.data tr.total td { font-weight: var(--db-font-weight-semibold); border-top: 1px solid var(--border); white-space: nowrap; }
+table.data td.num, table.data th.num { text-align: right; white-space: nowrap; }
+table.data td a b { font-weight: var(--db-font-weight-normal); }
+table.data td .sub { display: block; font-size: var(--db-font-size-sm); color: var(--muted); font-weight: var(--db-font-weight-normal); }
+/* A host name never breaks across lines: an ellipsis when it does not fit, the full name in its tooltip (Tip). */
+.tip-target { display: inline-block; max-width: 100%; vertical-align: bottom; }
+.host { display: inline-block; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        vertical-align: bottom; }
+.tip-pop { position: fixed; z-index: 1000; max-width: min(560px, calc(100vw - 8px)); padding: 4px 8px;
+           background: var(--db-surface-base, #fff); color: var(--text); border: 1px solid var(--border, #d1d9e1);
+           border-radius: 4px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12); font-size: var(--db-font-size-sm);
+           overflow-wrap: anywhere; pointer-events: none; }
+.table-wrap { overflow-x: auto; }
+.table-wrap.fill { overflow-y: auto; }
+.table-wrap.fill table.data thead th { position: sticky; top: 0; background: var(--card); z-index: 1; }
+
+/* Failures grouped by cause */
+.err-group { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px var(--db-space-4); padding: var(--db-space-3) 0; border-top: 1px solid var(--border); }
+.err-group:first-of-type { border-top: 0; padding-top: 0; }
+.err-group .what { font-weight: var(--db-font-weight-semibold); }
+.err-group .where { color: var(--muted); font-size: var(--db-font-size-sm); overflow-wrap: anywhere; }
+.err-group .raw { grid-column: 1 / -1; font-family: "DM Mono", ui-monospace, Menlo, monospace; font-size: var(--db-font-size-sm); color: var(--muted);
+  overflow-wrap: anywhere; }
+
+/* Forms and controls (the design system's Button and Input look) */
+.toolbar { display: flex; gap: var(--db-space-3); align-items: flex-end; flex-wrap: wrap; margin-bottom: var(--db-space-3); }
+.toolbar label, .form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: var(--db-font-size-sm); color: var(--muted); }
 .toolbar .grow { flex: 1; min-width: 240px; }
+.toolbar .toolbar-end { margin-left: auto; }
 label.checkbox { flex-direction: row !important; align-items: center; gap: 6px !important; color: var(--text) !important; }
-.form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; margin-bottom: 12px; align-items: start; }
+/* A fluid form grid, the same in every section: up to four fields a row, each at least 240 px, filling the row; fewer
+   a row as the window narrows or the zoom grows, down to one field the full width. */
+.form-grid { display: grid; gap: var(--db-space-3); margin-bottom: var(--db-space-3); align-items: start;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, max(240px, calc((100% - 3 * var(--db-space-3)) / 4))), 1fr)); }
 .form-grid .wide { grid-column: 1 / -1; }
-input, select, textarea { font: inherit; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: #fff; color: var(--text); }
-input[type="checkbox"] { width: 16px; height: 16px; }
-button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border); background: #fff; cursor: pointer; }
+input, select, textarea { font: inherit; padding: 5px 8px; border: 1px solid var(--db-color-action-default-border-default); border-radius: var(--db-shape-control);
+  background: var(--db-surface-base); color: var(--text); min-height: 32px; }
+input:hover, select:hover, textarea:hover { border-color: var(--db-color-action-default-border-hover); }
+input[type="checkbox"] { width: 16px; height: 16px; min-height: 0; accent-color: var(--accent); }
+button { font: inherit; padding: 0 12px; height: 32px; border-radius: var(--db-shape-control); border: 1px solid var(--db-color-action-default-border-default);
+  background: var(--db-surface-base); color: var(--db-color-action-default-text-default); cursor: pointer; }
+button:hover { border-color: var(--db-color-action-default-border-hover); color: var(--db-color-action-default-text-hover); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
+.create-lock { border: 0; margin: 0; padding: 0; min-width: 0; }
 button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
-button.danger { background: var(--bad); color: #fff; border-color: var(--bad); }
-button.ghost { background: transparent; }
-.sidebar button.ghost { color: #e5e7eb; border-color: #374151; }
+button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--accent-text); }
+button.danger { background: var(--db-negative-surface); color: #fff; border-color: var(--db-negative-surface); }
+button.ghost.danger-text { color: var(--bad); }
+button.ghost { background: transparent; border-color: transparent; color: var(--link); }
 .confirm { display: inline-flex; gap: 6px; }
-.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; background: #eef0f3; }
-.badge.ok { background: var(--ok-bg); color: var(--ok); } .badge.warn { background: var(--warn-bg); color: var(--warn); } .badge.bad { background: var(--bad-bg); color: var(--bad); }
-.alert { padding: 10px 12px; border-radius: 6px; margin: 8px 0; background: var(--info-bg); }
-.alert.ok { background: var(--ok-bg); color: var(--ok); } .alert.warn { background: var(--warn-bg); color: var(--warn); } .alert.bad { background: var(--bad-bg); color: var(--bad); }
+.seg { display: inline-flex; border: 1px solid var(--db-color-action-default-border-default); border-radius: var(--db-shape-control); overflow: hidden; }
+.seg button { border: 0; border-radius: 0; height: 30px; }
+.seg button + button { border-left: 1px solid var(--db-color-action-default-border-default); }
+.seg button[aria-pressed="true"] { background: var(--db-color-table-background-selected-hover); color: var(--text); font-weight: var(--db-font-weight-semibold); }
+
+/* Notices (the design system's Alert look) */
+.alert { padding: var(--db-space-2) var(--db-space-3); border-radius: var(--db-shape-control); margin: var(--db-space-2) 0; background: var(--info-bg);
+  border: 1px solid var(--db-color-action-default-border-default); }
+.alert.ok { background: var(--ok-bg); color: var(--ok); border-color: var(--db-positive-border); }
+.alert.warn { background: var(--warn-bg); color: var(--warn); border-color: var(--db-caution-border); }
+.alert.bad { background: var(--bad-bg); color: var(--bad); border-color: var(--db-negative-border); }
 .alert .hint { margin-top: 4px; color: var(--text); }
-.muted { color: var(--muted); } .small { font-size: 12px; }
-p.small { margin: 0 0 10px; }
-.drawer { position: fixed; top: 0; right: 0; width: min(920px, 92vw); height: 100vh; overflow-y: auto; background: #fff;
-  border-left: 1px solid var(--border); box-shadow: -8px 0 24px rgba(0,0,0,0.08); padding: 20px; z-index: 50; }
+.muted { color: var(--muted); } .small { font-size: var(--db-font-size-sm); }
+p.small { margin: 0 0 var(--db-space-2); }
+p.right { text-align: right; max-width: none; }
+.empty { color: var(--muted); padding: var(--db-space-4) 0; }
+
+/* Drawers, change marks, checklists, timeline */
+.drawer { position: fixed; top: 0; right: 0; width: min(920px, 92vw); height: 100vh; overflow-y: auto; background: var(--db-surface-base);
+  border-left: 1px solid var(--border); box-shadow: var(--db-elevation-high); padding: var(--db-space-5, 20px); z-index: 50; }
 .drawer-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .drawer h3 { font-size: 14px; margin: 18px 0 8px; }
-label.changed { color: var(--accent) !important; font-weight: 600; }
+label.changed { color: var(--link) !important; font-weight: 600; }
 label.changed input, label.changed select { border-color: var(--accent); }
 .checklist { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 4px 12px; max-height: 260px; overflow-y: auto;
-  border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-top: 6px; }
+  border: 1px solid var(--border); border-radius: var(--db-shape-control); padding: 8px; margin-top: 6px; }
 .checklist label.checkbox { font-size: 13px; }
 .checklist .muted { margin-left: 4px; }
 .timeline { overflow-x: auto; padding: 8px; }
 .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .legend i { display: inline-block; width: 14px; height: 10px; border-radius: 2px; margin-left: 8px; }
-.legend i.tick { width: 1px; height: 12px; background: #9aa5b1; }
+.legend i.tick { width: 1px; height: 12px; background: var(--db-border-strong); }
 .legend .skipmark { color: var(--bad); margin-left: 8px; }
+.legend i.hollow { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--muted); background: transparent; }
+/* The Timeline's job names and job runs open their pages, as the Jobs UI's timeline bars do. */
+.timeline .lane-link { fill: var(--accent); cursor: pointer; font-weight: var(--db-font-weight-semibold); }
+.timeline .lane-link:hover { text-decoration: underline; }
+.timeline .run-bar { cursor: pointer; opacity: 0.9; }
+.timeline .run-bar:hover { opacity: 1; stroke: var(--text); stroke-width: 1; }
+.timeline .hollow-mark { fill: var(--db-surface-base); stroke: var(--muted); stroke-width: 1.5; cursor: pointer; }
+.split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--db-space-4); }
+@media (max-width: 1100px) { .run-row, .split { grid-template-columns: minmax(0, 1fr); } }
+
+/* Ingestion jobs: status cells, pagers, filter chips, attention rows */
+.status-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 150px; }
+.status-cell .sub { font-size: var(--db-font-size-sm); color: var(--muted); }
+.word { white-space: nowrap; }
+table.data td.name { min-width: 140px; }
+/* A long job name wraps at a set width, so the list's columns fit a 1,280 px window as the Jobs list does. */
+table.data td.name.capped { max-width: 240px; }
+input.search-wide { width: 280px; }
+table.data.fit .status-cell { min-width: 0; }
+table.data.fit .bar { min-width: 80px; }
+table.data.fit th, table.data.fit td { padding-left: 6px; padding-right: 6px; }
+/* A wide table's two-word headers take two lines, so its last column stays in view at 1200 px. */
+table.data.wrap-head th { white-space: normal; vertical-align: bottom; }
+table.data.wrap-head td.name { min-width: 110px; }
+table.data td.mono { white-space: nowrap; }
+.pager { display: flex; align-items: center; justify-content: space-between; gap: var(--db-space-3); flex-wrap: wrap; margin: var(--db-space-2) 0; }
+.pager-buttons { display: inline-flex; gap: var(--db-space-2); }
+.chips { display: inline-flex; flex-wrap: wrap; gap: var(--db-space-2); }
+.chip { border-radius: var(--db-radius-full); padding: 2px 12px; }
+.chip.active { background: var(--accent); color: var(--accent-text); }
+.attention-row { padding: var(--db-space-3) 0; border-top: 1px solid var(--border); }
+.attention-row:first-of-type { border-top: 0; padding-top: 0; }
+.attention-row .title { font-weight: var(--db-font-weight-semibold); }
+.attention-row .example { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.metric-value.small-value { font-size: var(--db-font-size-md); }
+.stamp.stale { color: var(--bad); font-weight: var(--db-font-weight-semibold); max-width: 420px; display: inline-block; }
+table.data.dense th, table.data.dense td { padding-left: var(--db-space-2); padding-right: var(--db-space-2); }
+.csv-input { width: 100%; font-family: var(--db-font-family-mono, ui-monospace, monospace); font-size: var(--db-font-size-sm); }
+
+/* Job Edit: the server › database › table tree, help and impact lines, and the advanced section. */
+table.tree tr.l2 td.name { padding-left: 28px; } table.tree tr.l3 td.name { padding-left: 52px; color: var(--muted); }
+table.tree tr.l2 td[colspan] { padding-left: 28px; } table.tree tr.l3 td[colspan] { padding-left: 52px; }
+/* The disclosure chevron (components.Chevron): Catalog Explorer's tree and a job page's collapsible panels. */
+.chevron { flex: none; color: var(--muted); transition: transform .12s ease; }
+.chevron.open { transform: rotate(90deg); }
+.twisty { display: inline-flex; align-items: center; justify-content: center; height: 24px; min-width: 24px; padding: 0;
+          margin-right: 4px; border: 0; border-radius: var(--db-radius-sm, 4px); background: transparent; color: var(--text);
+          font: inherit; text-align: left; cursor: pointer; vertical-align: middle; }
+.twisty.named { gap: 4px; padding-right: 6px; margin-right: 0; }
+.twisty:hover { background: var(--db-color-table-background-selected-default, rgba(0, 0, 0, .04)); }
+.twisty:hover .chevron { color: var(--text); }
+.twisty:focus-visible { outline: 2px solid var(--db-accent-border); outline-offset: 1px; }
+/* A section that opens (details): the same chevron in place of the browser's triangle. */
+details > summary { list-style: none; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before { content: ""; flex: none; width: 16px; height: 16px; align-self: center; background: var(--muted);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6 3.5 10.5 8 6 12.5' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 16px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6 3.5 10.5 8 6 12.5' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 16px no-repeat;
+  transition: transform .12s ease; }
+details[open] > summary::before { transform: rotate(90deg); }
+details > summary { cursor: pointer; display: flex; gap: var(--db-space-2); align-items: baseline; }
+.help { display: block; font-size: 12px; color: var(--muted); line-height: 1.35; }
+.impact { font-size: var(--db-font-size-sm); color: var(--warn); background: var(--warn-bg); border-radius: 4px; padding: 4px 8px; }
+span.info { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; border: 1px solid var(--border);
+            font-size: 11px; margin-right: 4px; }
+.mono { font-family: var(--db-font-family-mono, ui-monospace, Menlo, monospace); }
+.tree-search { width: min(420px, 100%); }
+table.tree td .target-path { padding-left: 28px; }
+table.tree tr.l3 td { padding-top: 3px; padding-bottom: 3px; }
+.add-databases { border: 1px solid var(--border); border-radius: 6px; padding: var(--db-space-3); margin-bottom: var(--db-space-3); }
+details.advanced summary { cursor: pointer; display: flex; gap: var(--db-space-2); align-items: baseline; }
+details.advanced[open] summary { margin-bottom: var(--db-space-3); }
+details.advanced .compute { margin-top: var(--db-space-4); }
+/* Fields stay inside their card: inputs fill their grid cell and never push past it. */
+.form-grid input, .form-grid select { width: 100%; min-width: 0; box-sizing: border-box; }
+.form-grid label.checkbox input { width: auto; }
+.form-grid .emails { max-width: 640px; }
+label.checkbox .help { display: inline; }
+/* Identity columns: as wide as its fields, the action next to them, every cell aligned to the top. */
+table.identity { width: auto; }
+table.identity td { vertical-align: top; }
+table.identity input { width: 260px; }
+details.advanced .compute h4 { margin: var(--db-space-3) 0 var(--db-space-2); }
+
+/* Top bar, as the Databricks workspace's: actions and the signed-in user's menu at the top right. */
+.topbar { display: flex; justify-content: flex-end; align-items: center; gap: var(--db-space-2); margin: calc(-1 * var(--db-space-2)) 0 var(--db-space-2); }
+.menu { position: relative; display: inline-flex; }
+.menu-items { position: absolute; right: 0; top: calc(100% + 4px); z-index: 20; min-width: 200px; background: var(--db-surface-base);
+  border: 1px solid var(--border); border-radius: var(--db-shape-control); box-shadow: 0 4px 16px rgb(0 0 0 / 12%); padding: 4px 0; }
+.menu-items > button { display: block; width: 100%; text-align: left; border: 0; border-radius: 0; background: transparent; padding: 6px 12px; }
+.menu-items > button:hover:not(:disabled) { background: var(--db-color-table-background-selected-default); }
+.menu-items > button.danger-text { color: var(--bad); }
+.menu-items > button:has(.sub) { height: auto; padding: 8px 12px; }
+.menu-items > button .sub { display: block; color: var(--muted); font-size: var(--db-font-size-sm); white-space: normal; }
+.menu-items.wide, .menu-items:has(.sub) { min-width: 320px; }
+.page-sub { font-size: var(--db-font-size-lg, 16px); margin: var(--db-space-4) 0 var(--db-space-2); }
+.modal:has(.discover) { width: min(880px, 94vw); }
+.discover .radio-row { display: flex; gap: 8px; align-items: center; font-weight: var(--db-font-weight-semibold); margin: var(--db-space-2) 0; }
+.discover .radio-body { margin: 0 0 var(--db-space-3) 24px; }
+.discover .tree-pick { max-height: 46vh; overflow: auto; }
+/* A database the connection's login can't open: greyed out and not choosable; its reason shows on hover. */
+.tree-pick tr.closed td.name { color: var(--muted); }
+.tree-pick tr.closed .tri-box { opacity: .35; pointer-events: none; }
+.discover .pick-counts { margin: var(--db-space-1) 0 var(--db-space-2); }
+.pick-row { cursor: pointer; }
+.tri-box { display: inline-grid; place-items: center; width: 16px; height: 16px; min-height: 0; padding: 0; border-radius: 3px;
+           border: 1px solid var(--db-border-strong, #8a96a3); background: var(--db-surface-base); color: var(--accent-text);
+           font-size: 11px; line-height: 1; vertical-align: -3px; cursor: pointer; }
+.tri-box.all, .tri-box.part { background: var(--accent); border-color: var(--accent); }
+.task-progress { display: block; width: 100%; margin: var(--db-space-2) 0; accent-color: var(--accent); }
+.empty-drop { border: 1px dashed var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4); text-align: center; color: var(--muted); margin: 0; }
+.drop-zone { border: 1px dashed var(--border); border-radius: var(--db-shape-container-small); padding: var(--db-space-4); text-align: center; display: grid; justify-items: center; gap: var(--db-space-2); }
+.drop-zone.over { border-color: var(--db-color-action-primary-background-default, #2272b4); }
+.empty-choices { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--db-space-2); margin-top: var(--db-space-3); }
+.menu-note { padding: 6px 12px; overflow-wrap: anywhere; }
+.menu-note + .menu-note { border-top: 1px solid var(--border); }
+button.avatar { width: 32px; height: 32px; padding: 0; border-radius: 50%; border: 0; background: var(--db-color-action-primary-background-default, #2272b4);
+  color: #fff; font-weight: var(--db-font-weight-semibold); font-size: var(--db-font-size-sm); }
+button.kebab { width: 32px; padding: 0; font-size: 18px; line-height: 1; }
+button.th-sort { border: 0; background: transparent; padding: 0; font: inherit; color: inherit; cursor: pointer; }
+
+/* Dialogs, as the Databricks UI asks before a change: a title, what it does, Cancel and the action at the right. */
+/* Centred by auto margins, not grid centring: a dialog wider or taller than the window then starts at the window's edge
+   instead of running off its left and top. */
+.modal-backdrop { position: fixed; inset: 0; background: rgb(0 0 0 / 35%); z-index: 1000; display: flex; padding: 16px; }
+.modal { background: var(--db-surface-base); border-radius: var(--db-shape-container-small); box-shadow: var(--db-elevation-high, 0 8px 32px rgb(0 0 0 / 25%));
+  width: min(520px, 100%); padding: var(--db-space-5, 20px) var(--db-space-6, 24px);
+  /* As Databricks' own dialogs: the dialog fits the window, its body scrolls, and its title and actions stay put. */
+  max-height: calc(100vh - 32px); max-width: calc(100vw - 32px); min-width: 0; margin: auto;
+  display: flex; flex-direction: column; overflow: hidden; }
+.modal h2, .modal-actions { flex-shrink: 0; }
+.modal h2 { margin-bottom: var(--db-space-3); overflow-wrap: anywhere; }
+.modal-body { color: var(--text); overflow: auto; min-height: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
+.unread-all ul { max-height: 240px; overflow: auto; margin: var(--db-space-2) 0 0; }
+.modal-body p { margin: 0 0 var(--db-space-2); }
+.modal-actions { display: flex; justify-content: flex-end; gap: var(--db-space-2); margin-top: var(--db-space-4); }
+/* Why the dialog's action is off, said beside it rather than only in a tooltip. */
+.modal-actions .modal-why { margin-right: auto; align-self: center; min-width: 0; }
+.modal-actions .modal-why.bad { color: var(--bad); }
+.alert p.mono { overflow-wrap: anywhere; }
+.modal-actions > button { flex-shrink: 0; white-space: nowrap; }
+
+/* A job run opened to its group runs, as a Databricks run's task list under its row. */
+.run-groups { padding: 4px 8px 10px 28px; }
+.run-groups table.data { background: var(--surface, #fff); }
+
+/* A blank field a new job needs to be created. */
+.required { color: var(--bad); margin-left: 2px; }
+button.reset { padding: 0 4px; margin-left: 6px; font-size: 12px; min-height: 0; border: 0; background: none; color: var(--link); }
+/* The info icon and its explanation (components.Info). */
+.info-tip { position: relative; display: inline-flex; margin-left: 4px; color: var(--muted); cursor: help; font-size: 13px;
+  font-weight: var(--db-font-weight-normal); vertical-align: baseline; }
+.info-tip:hover, .info-tip:focus { color: var(--text); outline: none; }
+.info-pop { display: none; position: absolute; left: 50%; top: calc(100% + 6px); transform: translateX(-50%); z-index: 20;
+  width: max-content; max-width: 320px; padding: var(--db-space-2) var(--db-space-3); border-radius: var(--db-shape-control);
+  background: var(--db-color-tooltip-background, #11171c); color: #fff; font-size: 12px; line-height: 1.4; text-transform: none;
+  letter-spacing: normal; white-space: normal; box-shadow: 0 2px 8px rgba(0, 0, 0, .2); }
+.info-tip:hover .info-pop, .info-tip:focus .info-pop, .info-tip:focus-within .info-pop { display: block; }
+
+/* Running now, in the order a job run goes, as a Databricks job run lists its tasks. */
+.run-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--db-space-2); margin-bottom: var(--db-space-3); }
+ol.run-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--db-space-4); }
+ol.run-steps > li { border-left: 2px solid var(--border); padding-left: var(--db-space-3); }
+ol.run-steps h3 { display: flex; align-items: center; gap: var(--db-space-2); margin: 0 0 var(--db-space-1); }
+.step-number { display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; font-size: 12px;
+               background: var(--db-surface-strong); color: var(--text); font-weight: var(--db-font-weight-semibold); }
+.menu > button .chevron, button .chevron { color: currentColor; vertical-align: -3px; }
+.twisty:disabled { cursor: not-allowed; color: var(--muted); }
+.twisty:disabled .chevron { opacity: .35; }
+.twisty:disabled:hover { background: transparent; }
+
+/* Something running: one line with a spinner, the elapsed time once it runs long, and a thin bar when its share is known. */
+.busy { display: flex; align-items: center; gap: var(--db-space-2); margin: var(--db-space-2) 0; color: var(--text); }
+.spinner { width: 14px; height: 14px; flex: none; border-radius: 50%; border: 2px solid var(--border, #d1d9e1);
+  border-top-color: var(--accent); animation: spin .8s linear infinite; display: inline-block; vertical-align: middle; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.busy-progress { width: 120px; height: 4px; }
+
+/* Toasts, as Databricks confirms an action: dark, at the foot of the page, fading on their own. */
+.toasts { position: fixed; bottom: var(--db-space-4); left: 50%; transform: translateX(-50%); z-index: 1000;
+  display: flex; flex-direction: column; gap: var(--db-space-2); pointer-events: none; }
+.toast { background: #1f272d; color: #fff; padding: 8px 16px; border-radius: 6px; box-shadow: 0 4px 12px rgba(0, 0, 0, .2);
+  animation: toast-fade 4s ease forwards; }
+@keyframes toast-fade { 0% { opacity: 0; } 8% { opacity: 1; } 85% { opacity: 1; } 100% { opacity: 0; } }
+
+/* A row's last cell with its count and, at the far right, an icon action (New job's Remove the tables). */
+.row-end { display: inline-flex; align-items: center; gap: var(--db-space-2); justify-content: flex-end; width: 100%; }
+button.icon.remove { padding: 0 6px; min-height: 0; line-height: 1.2; font-size: 16px; color: var(--muted); }
+button.icon.remove:hover { color: var(--text); }

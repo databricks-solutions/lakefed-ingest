@@ -1,11 +1,13 @@
 """Operations app SQL: parameterized everywhere, filters build the expected predicates, form checks."""
+from pathlib import Path
+
 import pytest
 
 import queries as q
 
 
 def test_every_statement_is_parameterized_and_schema_qualified():
-    for sql in (q.collections_overview_sql(), q.running_runs_sql(), q.run_events_sql(), q.recent_errors_sql(),
+    for sql in (q.collections_overview_sql(), q.running_runs_sql(), q.run_events_sql(), q.recent_errors_sql(), q.failed_tables_sql(),
                 q.collections_sql(), q.set_enabled_sql(), q.force_reseed_sql(), q.log_reseed_sql(),
                 q.insert_control_sql()):
         assert "lakefed_ingest." in sql
@@ -14,7 +16,7 @@ def test_every_statement_is_parameterized_and_schema_qualified():
 
 def test_runs_sql_optional_collection_and_limit():
     sql, params = q.runs_sql(None, limit=50)
-    assert "where" not in sql and params == (50,)
+    assert "task_collection" not in sql.split("where")[1] and params == (50,)
     sql, params = q.runs_sql("c1", limit=10)
     assert "where task_collection = %s" in sql and params == ("c1", 10)
 
@@ -35,7 +37,9 @@ def test_table_filters(flt, frag):
 
 def test_table_filter_all_and_invalid():
     sql, params = q.tables_sql(None, None, "all", 5)
-    assert "where" not in sql and params == (5,)
+    assert sql.split(" as ingestion_job,")[1].count("where") == 0 and params == (5,)      # the job name's subquery aside
+    sql, params = q.tables_sql(None, None, "all", 5, job=7)
+    assert "m.schedule_id = %s" in sql and params == (7, 5)
     with pytest.raises(ValueError):
         q.tables_sql(None, None, "bogus", 5)
 
@@ -127,6 +131,15 @@ def test_identifier_and_insert_if_absent():
     assert q.insert_control_if_absent_sql().endswith("on conflict do nothing returning id")
 
 
+def test_unity_catalog_identifier_only_replaces_what_unity_catalog_refuses():
+    assert q.unity_catalog_identifier("Order-Lines") == "order-lines"
+    assert q.unity_catalog_identifier("Sales (2024)") == "sales_(2024)"
+    assert q.unity_catalog_identifier("a--b") == "a--b"
+    assert q.unity_catalog_identifier("a`b") == "a`b"
+    assert q.unity_catalog_identifier("Order Lines") == "order_lines"
+    assert q.unity_catalog_identifier("a.b/c\td\x7fe") == "a_b_c_d_e"
+
+
 def test_parse_databases():
     assert q.parse_databases(" a, b\nc,,a ") == ["a", "b", "c"] and q.parse_databases(None) == []
 
@@ -170,7 +183,7 @@ def test_plan_edit_ignores_cosmetic_changes():
 
 def test_plan_edit_move_secret_and_select_list_notes():
     (p,) = q.plan_edit([ROW], {"task_collection": "c2", "secret_key": "k2"}, bulk=False)
-    assert p["reseed"] is None and any("moves to collection c2" in n for n in p["notes"])
+    assert p["reseed"] is None and any("moves to ingestion group c2" in n for n in p["notes"])
     (p,) = q.plan_edit([ROW], {"select_list": "id, w"}, bulk=False)
     assert any("new columns w" in n for n in p["notes"]) and any("removed columns v stay in the sink" in n for n in p["notes"])
 
@@ -198,10 +211,20 @@ def test_update_sql_whitelists_columns():
 def test_sla_breach_rule_uses_control_sla_and_creation_for_never_succeeded():
     rule = q.SLA_BREACHED
     assert "t.task_enabled" in rule and "t.freshness_sla_minutes is not null" in rule
-    assert "coalesce(cp.last_success_at, t.created_at)" in rule
+    assert f"coalesce({q.LAST_SUCCESS}, t.created_at)" in rule and "cp.last_success_at" in q.LAST_SUCCESS
     assert rule in q.collections_overview_sql()
     sql, _ = q.tables_sql(None, None, "all", 5)
     assert "as sla_breached" in sql and "as sla_min" in sql
+
+
+def test_the_documented_sla_alert_counts_database_check_stamps_as_the_app_does():
+    # A quiet database checked and found unchanged stamps the database, not each table: the alert query in
+    # docs/monitoring.md must count that stamp, as LAST_SUCCESS does, or a quiet table alerts while the app shows it current.
+    doc = (Path(__file__).parents[2] / "docs" / "monitoring.md").read_text()
+    alert = doc.split("Freshness SLA breaches.")[1].split("```sql")[1].split("```")[0]
+    assert "database_check dc" in alert and "dc.checked_at" in alert and "greatest(cp.last_success_at" in alert
+    assert "coalesce(last_success_at, created_at)" in alert and "c.freshness_sla_minutes IS NOT NULL" in alert
+    assert "dc.checked_at" in q.LAST_SUCCESS
 
 
 @pytest.mark.parametrize("value,ok", [(None, True), ("", True), (15, True), ("30", True),
@@ -279,3 +302,74 @@ def test_reseed_flips_clear_status_and_any_pending_append():
     for sql in (q.force_reseed_sql(), q.flip_to_seeding_sql()):
         assert "phase = 'seeding'" in sql and "status = 'ok'" in sql
         assert "pending_position = null" in sql and "pending_run_id = null" in sql
+
+
+def test_tables_page_after_a_cursor_with_an_exact_database():
+    sql, params = q.tables_sql("c1", None, "all", 100, database="db1", after=["c1", "db1", "dbo", "t5", 42])
+    assert "coalesce(t.src_database, '') = %s" in sql and params == ("c1", "db1", "c1", "db1", "dbo", "t5", 42, 100)
+    assert sql.rstrip().endswith("order by t.task_collection, coalesce(t.src_database, ''), t.src_schema, t.src_table, t.id limit %s")
+
+
+def _engine():
+    import importlib.util
+    import sys
+    from pathlib import Path
+    engine_dir = Path(__file__).resolve().parents[2] / "src" / "lakefed_ingest"
+    if str(engine_dir) not in sys.path:
+        sys.path.insert(0, str(engine_dir))
+    spec = importlib.util.spec_from_file_location("engine_state_store", engine_dir / "state_store.py")
+    engine = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = engine
+    spec.loader.exec_module(engine)
+    return engine
+
+
+def test_the_database_source_in_sql_is_the_engines():
+    engine = _engine()
+    assert q.database_source_sql("t") == engine.database_source_sql("t")
+    for row in ({"src_host": "Srv", "src_port": 1433, "secret_key": "k"}, {"src_connection": "conn"},
+                {"src_host": "srv", "src_port": None, "secret_key": ""}):
+        assert q.database_source(row) == engine.database_source(row)
+
+
+def test_the_database_source_copies_agree_for_every_source_type_and_port():
+    engine = _engine()
+    import source_adapters
+    assert q.DEFAULT_PORTS == {t: source_adapters.get_adapter(t).default_port for t in source_adapters.SRC_TYPES}
+    mysql = {"src_type": "mysql", "src_host": "Srv", "src_port": None, "secret_key": "k"}
+    assert q.database_source(mysql) == "srv|3306|k"
+    assert q.database_source({"src_type": "mysql", "src_connection": "conn", "src_port": None, "secret_key": None}) \
+        == "conn|0|conn"
+    for src_type in (None, "", "SQLServer", "oracle", "postgresql", "mysql", "db2", "\toracle", "oracle\n", " oracle "):
+        for host in ("Srv", None, ""):
+            for connection in (None, "conn", ""):
+                for port in (None, 0, 1433, 1521, 5432, 3306, 3307):
+                    for secret in (None, "", "k"):
+                        row = {"src_type": src_type, "src_host": host, "src_connection": connection,
+                               "src_port": port, "secret_key": secret}
+                        assert q.database_source(row) == engine.database_source(row), row
+    assert "database_check dc" in q.DATABASE_CHECK_JOIN and "dc.source = " + q.database_source_sql("t") in q.DATABASE_CHECK_JOIN
+
+
+def test_lists_of_group_runs_leave_out_the_check_jobs_own_records():
+    for sql in (q.runs_sql(None)[0], q.runs_sql("c1")[0], q.group_runs_before_sql(),
+                q.last_runs_sql(), q.running_progress_sql(), q.collection_run_stats_sql()):
+        assert q.not_a_check() in sql or q.not_a_check("x") in sql
+    assert q.not_a_check() not in q.group_runs_sql()      # job runs place the checks themselves
+
+
+def test_a_jobs_table_lists_count_the_database_check_stamp_in_each_tables_last_success():
+    for sql in (q.job_tables_sql(), q.job_target_sources_sql()):
+        assert f"max({q.LAST_SUCCESS}) as last_success_at" in sql and "cp.phase, cp.last_success_at" not in sql
+        assert "database_check dc" in sql
+
+
+def test_run_time_medians_and_percentiles_leave_out_cancelled_runs():
+    """A cancelled run didn't finish, so how long it ran is no run time for the baselines."""
+    for sql in (q.running_progress_sql(), q.running_runs_sql(), q.collection_run_stats_sql()):
+        assert "status not in ('skipped', 'cancelled')" in sql
+
+
+def test_cancel_requested_runs_are_read_by_run_id_and_the_request_column():
+    sql = q.cancel_requested_runs_sql()
+    assert "run_id = any(%s)" in sql and "cancel_requested_at is not null" in sql

@@ -1,34 +1,96 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AgGridReact } from "ag-grid-react";
-import { themeQuartz, type ColDef } from "ag-grid-community";
+import { type ColDef } from "ag-grid-community";
 import { api, type Row } from "../api";
 import { useSettings } from "../App";
-import { Badge, ConfirmButton, ErrorBox, Grid, Notice, Section, autoColumns, fmtTime } from "../components";
+import { groupsRefusal, usePermissions } from "../permissions";
+import { Badge, Busy, ConfirmButton, ErrorBox, FillBox, ToastOn, Grid, Notice, PageHead, Section, Tag, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme, Host, plural } from "../components";
 
 const EDITABLE = ["include", "load_type", "primary_key", "cursor_column", "load_partitioned", "partition_col",
   "partition_size_mb", "sink_catalog", "sink_schema", "sink_table", "client_id", "freshness_sla_minutes"];
 const NUMBER_FIELDS = ["partition_size_mb", "freshness_sla_minutes"];
 const BULK_FIELDS = EDITABLE.filter((f) => f !== "include");
 const key = (r: Row) => `${r.src_database}\u0000${r.src_schema}\u0000${r.src_table}`;
-const theme = themeQuartz.withParams({ fontSize: 13, headerFontSize: 13, spacing: 5, wrapperBorderRadius: 6 });
+const theme = gridTheme;
 
 interface Shared {
   sink_catalog: string; sink_schema: string; sink_table: string; client_id: string;
   freshness_sla_minutes: number | null; partition_threshold_mb: number; partition_size_mb: number; include_default: boolean;
 }
 
-function DiscoverForm({ onStarted }: { onStarted: (id: string, runId: number) => void }) {
+interface Connection { name: string; connection_type: string; host?: string; port?: string; owner?: string; discoverable: boolean;
+  tracked: { databases: number; tables: number; collections: number } }
+
+/** The Unity Catalog connections the app can see, with what lakefed already tracks on each; picking one fills the
+    discovery form's host and port. Discovery itself still reads over JDBC with a secret per database. */
+function Connections({ picked, onPick }: { picked: Connection | null; onPick: (c: Connection) => void }) {
+  const list = useQuery({ queryKey: ["connections"], queryFn: () => api.get<{ connections: Connection[]; error: string | null }>("/connections") });
+  const tracked = useQuery({
+    queryKey: ["connection-databases", picked?.name],
+    queryFn: () => api.get(`/connections/${encodeURIComponent(picked!.name)}/databases`),
+    enabled: !!picked,
+  });
+  const found = list.data?.connections ?? [];
+  return (
+    <Section title="1. Source" note="Unity Catalog connections this app can use, with the databases, tables and ingestion groups lakefed already tracks on each (matched by connection name or host).">
+      <ErrorBox error={list.error} />
+      {list.data?.error && <Notice tone="warn">Could not list connections: {list.data.error}. Discovery by host and secret below still works.</Notice>}
+      {list.data && !list.data.error && !found.length && <div className="empty">No Unity Catalog connections visible to this app.</div>}
+      <div className="server-cards">
+        {found.map((c) => (
+          <div key={c.name} className={`server-card ${c.discoverable ? "selectable" : "disabled"} ${picked?.name === c.name ? "selected" : ""}`}
+            onClick={() => c.discoverable && onPick(c)} role="button" aria-pressed={picked?.name === c.name}>
+            <div className="top"><div className="name"><h3 title={c.name}>{c.name}</h3>
+              <div className="meta">{c.connection_type}{c.host && <> · <Host host={c.host} port={c.port} /></>}</div></div>
+              {picked?.name === c.name ? <Tag tone="run">Selected</Tag> : c.tracked.tables ? <Tag tone="ok">Tracked</Tag> : <Tag>Not tracked</Tag>}</div>
+            {c.discoverable ? (
+              <div className="nums three"><div><b>{fmtInt(c.tracked.databases)}</b><span>databases tracked</span></div>
+                <div><b>{fmtInt(c.tracked.tables)}</b><span>tables tracked</span></div>
+                <div><b>{fmtInt(c.tracked.collections)}</b><span>ingestion groups</span></div></div>
+            ) : <div className="meta">Discovery is SQL Server only for now.</div>}
+          </div>
+        ))}
+      </div>
+      {picked && (
+        <div style={{ marginTop: 16 }}>
+          <h3>Tracked on {picked.name}</h3>
+          <p className="small muted">Databases lakefed already ingests from this source. Listing the server's other databases needs
+            discovery through the connection, which is not built yet; add new ones in the discovery form below.</p>
+          <ErrorBox error={tracked.error} />
+          <FillBox min={200}>
+            <table className="data">
+              <thead><tr><th>Database</th><th>Ingestion groups</th><th className="num">Tables</th><th className="num">Last success</th></tr></thead>
+              <tbody>
+                {(tracked.data ?? []).map((d) => (
+                  <tr key={d.src_database}><td><b>{d.src_database}</b></td><td>{d.collections}</td><td className="num">{fmtInt(d.tables)}</td>
+                    <td className="num">{fmtAgo(d.newest_success_at)}</td></tr>
+                ))}
+                {tracked.data && !tracked.data.length && <tr><td colSpan={4} className="muted">Nothing tracked on this source yet.</td></tr>}
+              </tbody>
+            </table>
+          </FillBox>
+        </div>
+      )}
+    </Section>
+  );
+}
+
+function DiscoverForm({ onStarted, prefill }: { onStarted: (id: string, runId: number) => void; prefill: Connection | null }) {
   const [f, setF] = useState({ src_host: "", src_port: "", databases: "", secret_key_template: "{database}" });
+  useEffect(() => {
+    if (prefill) setF((v) => ({ ...v, src_host: prefill.host ?? "", src_port: prefill.port ?? "" }));
+  }, [prefill]);
+  const discoveryRefusal = usePermissions().data?.run.discovery ?? null;
   const start = useMutation({
     mutationFn: () => api.post<{ discovery_id: string; run_id: number; databases: number }>("/discoveries", {
       ...f, src_port: f.src_port ? Number(f.src_port) : null }),
     onSuccess: (r) => onStarted(r.discovery_id, r.run_id),
   });
   return (
-    <Section title="1. Discover tables">
+    <Section title="2. Discover tables">
       <p className="muted small">Runs the discovery job on the ingestion network path; it reads catalog metadata only
-        (no table data). SQL Server for now.</p>
+        (no table data). SQL Server for now.{prefill && <> Host and port come from <b>{prefill.name}</b>.</>}</p>
       <form className="form-grid" onSubmit={(e) => { e.preventDefault(); start.mutate(); }}>
         <label>src_host *<input required value={f.src_host} onChange={(e) => setF({ ...f, src_host: e.target.value })} /></label>
         <label>src_port<input type="number" placeholder="1433" value={f.src_port} onChange={(e) => setF({ ...f, src_port: e.target.value })} /></label>
@@ -39,11 +101,11 @@ function DiscoverForm({ onStarted }: { onStarted: (id: string, runId: number) =>
         <label className="wide">Databases * (comma- or newline-separated)
           <textarea required rows={3} value={f.databases} onChange={(e) => setF({ ...f, databases: e.target.value })} />
         </label>
-        <div className="wide"><button className="primary" disabled={start.isPending}>{start.isPending ? "Starting…" : "Discover"}</button></div>
+        {discoveryRefusal && <p className="wide muted small">Discover: {discoveryRefusal}.</p>}
+        <div className="wide"><button className="primary" disabled={start.isPending || !!discoveryRefusal}>{start.isPending ? "Starting…" : "Discover"}</button></div>
       </form>
       <ErrorBox error={start.error} />
-      {start.data && <Notice tone="ok">Discovery {start.data.discovery_id} started for {start.data.databases} databases
-        (job run {start.data.run_id}). It appears below; results arrive in a few minutes.</Notice>}
+      <ToastOn text={start.data ? `Discovery started for ${fmtInt(start.data.databases)} ${plural(start.data.databases, "database")}` : null} />
     </Section>
   );
 }
@@ -52,6 +114,7 @@ export default function BulkImport() {
   const { config } = useSettings();
   const qc = useQueryClient();
   const [discoveryId, setDiscoveryId] = useState<string>("");
+  const [picked, setPicked] = useState<Connection | null>(null);
   const [startedRun, setStartedRun] = useState<{ did: string; runId: number } | null>(null);
   // A discovery just started has no rows until its job runs: keep polling until its databases appear
   // and finish (polling only while a row said "running" stopped before the first row existed).
@@ -92,14 +155,15 @@ export default function BulkImport() {
   const progress = (dbs.data ?? []).map((d) => `${d.src_database}:${d.status}:${d.tables}`).join("|");
 
   const [collection, setCollection] = useState("");
+  const locked = groupsRefusal(usePermissions().data, [collection.trim()]);
   const [shared, setShared] = useState<Shared>({
     sink_catalog: "main", sink_schema: "bronze_{database}", sink_table: "{table}", client_id: "", freshness_sla_minutes: null,
     partition_threshold_mb: config?.defaults.partition_threshold_mb ?? 1024,
     partition_size_mb: config?.defaults.partition_size_mb ?? 512, include_default: true,
   });
   const review = useQuery({
-    queryKey: ["review", did, shared, progress],
-    queryFn: () => api.post<Row[]>(`/discoveries/${did}/review`, { shared }),
+    queryKey: ["review", did, shared, progress, collection.trim()],
+    queryFn: () => api.post<Row[]>(`/discoveries/${did}/review`, { shared, task_collection: collection.trim() }),
     enabled: !!did && !!dbs.data && !running,
   });
   const [rows, setRows] = useState<Row[]>([]);
@@ -141,28 +205,35 @@ export default function BulkImport() {
   const validate = useMutation({ mutationFn: () => api.post(`/discoveries/${did}/register`, payload(true)) });
   const register = useMutation({
     mutationFn: () => api.post(`/discoveries/${did}/register`, payload(false)),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ["review"] }); qc.invalidateQueries({ queryKey: ["collections"] }); },
+    // Registering changes what lakefed tracks on the connection, so its card and database list refresh too.
+    onSuccess: () => {
+      for (const key of ["review", "collections", "connections", "connection-databases", "overview", "tables"]) {
+        qc.invalidateQueries({ queryKey: [key] });
+      }
+    },
   });
   const result = (register.data ?? validate.data) as Row | undefined;
   const nIncluded = rows.filter((r) => r.include).length;
   const nPartitioned = rows.filter((r) => r.include && r.load_partitioned).length;
 
-  if (!config?.jobs.discover) return <><h1>Bulk import</h1><Notice tone="warn">DISCOVER_JOB_ID isn't configured for this app.</Notice></>;
+  const head = <PageHead title="Bulk import" lead="Pick a source, see what lakefed already tracks on it, discover the rest, then review and register." />;
+  if (!config?.jobs.discover) return <>{head}<Notice tone="warn">DISCOVER_JOB_ID isn't configured for this app.</Notice></>;
   return (
     <>
-      <h1>Bulk import</h1>
-      <DiscoverForm onStarted={(id, runId) => {
+      {head}
+      <Connections picked={picked} onPick={setPicked} />
+      <DiscoverForm prefill={picked} onStarted={(id, runId) => {
         setDiscoveryId(id); setStartedRun({ did: id, runId }); qc.invalidateQueries({ queryKey: ["discoveries"] });
       }} />
 
-      <Section title="2. Review">
+      <Section title="3. Review">
         <ErrorBox error={discoveries.error || dbs.error} />
         <div className="toolbar">
           <label className="grow">Discovery
             <select value={did} onChange={(e) => setDiscoveryId(e.target.value)}>
               {discoveries.data?.map((d) => (
                 <option key={d.discovery_id} value={d.discovery_id}>
-                  {d.discovery_id}: {d.src_host}, {d.databases} databases, {d.tables} tables, {fmtTime(d.started_at)}
+                  {d.discovery_id}: {d.src_host}, {d.databases} {plural(d.databases, "database")}, {d.tables} {plural(d.tables, "table")}, {fmtTime(d.started_at)}
                   {Number(d.running) > 0 ? " (running)" : ""}{Number(d.failed) > 0 ? ` (${d.failed} failed)` : ""}
                 </option>
               ))}
@@ -171,13 +242,13 @@ export default function BulkImport() {
         </div>
         {!discoveries.data?.length && <p className="muted">No discoveries yet.</p>}
         {dbs.data && (
-          <Grid rows={dbs.data} height={Math.min(60 + dbs.data.length * 42, 240)}
+          <Grid rows={dbs.data} fitRows
             columns={autoColumns(dbs.data, { status: { cellRenderer: (p: any) => <Badge value={p.value} /> },
               error: { flex: 1, minWidth: 300, tooltipField: "error" } })} />
         )}
-        {waiting && <Notice tone="warn">Waiting for the discovery job to start; this updates automatically.</Notice>}
+        {waiting && <Busy label="Starting the discovery" />}
         {jobEnded && (noRows || run.data?.result !== "SUCCESS") && (
-          <Notice tone="bad">The discovery job run ended ({run.data?.result ?? run.data?.state}
+          <Notice tone="bad">The discovery ended ({run.data?.result ?? run.data?.state}
             {run.data?.message ? `: ${run.data.message}` : ""}){noRows ? " without discovering any database" : ""}.{" "}
             {run.data?.url && <a href={run.data.url} target="_blank" rel="noreferrer">Open the run</a>}</Notice>
         )}
@@ -185,11 +256,11 @@ export default function BulkImport() {
       </Section>
 
       {did && !running && (
-        <Section title="3. Shared fields and tables">
+        <Section title="4. Shared fields and tables">
           <p className="muted small">Templates can use <code>{"{database}"}</code>, <code>{"{schema}"}</code> and
             <code>{" {table}"}</code>. Changing shared fields rebuilds the grid, so set them before editing rows.</p>
           <div className="form-grid">
-            <label>task_collection *<input value={collection} onChange={(e) => setCollection(e.target.value)} /></label>
+            <label>Ingestion group (task_collection) *<input value={collection} onChange={(e) => setCollection(e.target.value)} /></label>
             <label>sink_catalog *<input value={shared.sink_catalog} onChange={(e) => setShared({ ...shared, sink_catalog: e.target.value })} /></label>
             <label>sink_schema *<input value={shared.sink_schema} onChange={(e) => setShared({ ...shared, sink_schema: e.target.value })} /></label>
             <label>sink_table *<input value={shared.sink_table} onChange={(e) => setShared({ ...shared, sink_table: e.target.value })} /></label>
@@ -197,8 +268,8 @@ export default function BulkImport() {
               <input placeholder="e.g. {database}" value={shared.client_id} onChange={(e) => setShared({ ...shared, client_id: e.target.value })} />
               <span className="muted small">with a shared sink_schema, consolidates databases into one table each</span>
             </label>
-            <label>freshness_sla_minutes
-              <input type="number" min={1} placeholder="blank = no SLA" value={shared.freshness_sla_minutes ?? ""}
+            <label>Freshness target (freshness_sla_minutes)
+              <input type="number" min={1} placeholder="blank = no target" value={shared.freshness_sla_minutes ?? ""}
                 onChange={(e) => setShared({ ...shared, freshness_sla_minutes: Number(e.target.value) > 0 ? Number(e.target.value) : null })} />
               <span className="muted small">a table is late when its last success is older than this</span>
             </label>
@@ -240,22 +311,23 @@ export default function BulkImport() {
               onSelectionChanged={(e) => setSelected(e.api.getSelectedRows())}
               onCellValueChanged={(e) => update((r) => key(r) === key(e.data), () => ({ ...e.data }))} />
           </div>
-          <p className="muted small">{nIncluded} of {rows.length} tables included ({nPartitioned} partitioned).
+          <p className="muted small">{nIncluded} of {rows.length} {plural(rows.length, "table")} included ({nPartitioned} partitioned).
             {rows.length - shown.length > 0 && ` ${rows.length - shown.length} already registered are hidden.`}</p>
         </Section>
       )}
 
       {did && !running && (
-        <Section title="4. Register">
+        <Section title="5. Register">
           <div className="toolbar">
             <button className="ghost" disabled={!nIncluded || !collection || validate.isPending} onClick={() => { register.reset(); validate.mutate(); }}>
-              Validate {nIncluded} tables
+              Validate {nIncluded} {plural(nIncluded, "table")}
             </button>
-            <ConfirmButton label={`Register ${nIncluded} tables`} disabled={!nIncluded || !collection}
-              confirmLabel={`Confirm: register ${nIncluded} tables in '${collection}'`}
+            <ConfirmButton label={`Register ${nIncluded} ${plural(nIncluded, "table")}`} disabled={!nIncluded || !collection || !!locked}
+              confirmLabel={`Confirm: register ${nIncluded} ${plural(nIncluded, "table")} in '${collection}'`}
               onConfirm={async () => { validate.reset(); await register.mutateAsync(); }} />
-            {!collection && <span className="muted">Set task_collection first.</span>}
+            {!collection && <span className="muted">Set the ingestion group first.</span>}
           </div>
+          {locked && <p className="muted small">Register: {locked}.</p>}
           <ErrorBox error={validate.error || register.error} />
           {result && (
             <>
@@ -264,7 +336,7 @@ export default function BulkImport() {
                 {register.data && result.counts.registered ? " Their first run seeds them." : ""}
               </Notice>
               {result.results.some((r: Row) => r.errors?.length) && (
-                <Grid height={260} rows={result.results.filter((r: Row) => r.errors?.length).map((r: Row) => ({ ...r, errors: r.errors.join("; ") }))}
+                <Grid fitRows rows={result.results.filter((r: Row) => r.errors?.length).map((r: Row) => ({ ...r, errors: r.errors.join("; ") }))}
                   columns={autoColumns([{ table: "", status: "", errors: "" }], { status: { cellRenderer: (p: any) => <Badge value={p.value} /> }, errors: { flex: 1 } })} />
               )}
             </>

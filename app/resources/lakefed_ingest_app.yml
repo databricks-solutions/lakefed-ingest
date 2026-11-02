@@ -1,8 +1,18 @@
 # The operations app and its one-time grant job.
 #
-# The app runs as its own service principal, with least privilege:
-#   - ingestion, setup and discovery jobs: CAN_MANAGE_RUN through app resources (view, run, cancel;
-#     not edit);
+# The app runs as its own service principal, with the least privilege its checks allow:
+#   - ingestion, check and discovery jobs: CAN_MANAGE through app resources, so the app can read their access
+#     lists: every action that runs, changes or deletes a job follows the signed-in user's own permission on these
+#     jobs (jobs.user_job_permission). Reading an access list needs CAN_MANAGE, so this is more than the
+#     CAN_MANAGE_RUN that starting runs needs, and would let the app edit or delete these jobs: it never does
+#     (app/README.md, Security model);
+#   - setup job: CAN_MANAGE_RUN, to start it when the app finds the state database behind (schema_upgrade.py) and
+#     to read its runs. No user starts it through the app, so its access list is never read; the run executes as
+#     the job's run-as identity, the deployer, who owns the schema;
+#   - cluster copies job: CAN_MANAGE_RUN, to start it when an app job's own cluster changes. It runs as the
+#     deployer and makes the copies of the ingestion job (each gives the app CAN_MANAGE on it);
+#   - the discovery warehouse below: CAN_USE through an app resource, to run discovery's catalog queries through the
+#     Unity Catalog connections (remote_query; app/src/warehouse.py says why the app can't open them itself);
 #   - Lakebase: granted by the lakefed_ingest_app_grants job below (run once after the first deploy,
 #     as the instance manager / tables' owner): CAN_USE on the instance, a Postgres role, and
 #     SELECT / INSERT / UPDATE on the lakefed_ingest tables. The app has no `database` resource:
@@ -27,12 +37,28 @@ resources:
             value_from: setup-job
           - name: DISCOVER_JOB_ID
             value_from: discover-job
+          - name: CHECK_JOB_ID
+            value_from: check-job
+          - name: CLUSTER_COPIES_JOB_ID
+            value_from: cluster-copies-job
+          - name: DELETE_JOB_ID
+            value_from: delete-job
+          - name: DELETED_JOB_RETENTION_DAYS
+            value: ${var.deleted_job_retention_days}
+          - name: WAREHOUSE_ID
+            value_from: discovery-warehouse
+          - name: APP_VERSION
+            value: ${var.app_version}
+          - name: APP_MANAGERS
+            value: ${var.app_managers}
+          - name: JDBC_LOGIN_SCOPE
+            value: ${var.jdbc_login_scope}
       resources:
         - name: ingest-job
           description: The lakefed_ingest ingestion job.
           job:
             id: ${var.ingest_job_id}
-            permission: CAN_MANAGE_RUN
+            permission: CAN_MANAGE
         - name: setup-job
           description: The lakefed_ingest_setup schema job.
           job:
@@ -42,12 +68,59 @@ resources:
           description: The lakefed_ingest_discover table discovery job (bulk import).
           job:
             id: ${var.discover_job_id}
+            permission: CAN_MANAGE
+        - name: check-job
+          description: The lakefed_ingest_check job, started by schedules of the check variant.
+          job:
+            id: ${var.check_job_id}
+            permission: CAN_MANAGE
+        - name: cluster-copies-job
+          description: The lakefed_ingest_cluster_copies job, started when an app job's own cluster changes.
+          job:
+            id: ${var.cluster_copies_job_id}
             permission: CAN_MANAGE_RUN
+        - name: delete-job
+          description: The lakefed_ingest_delete_job job, started when an app job is deleted.
+          job:
+            id: ${var.delete_job_id}
+            permission: CAN_MANAGE_RUN
+        - name: discovery-warehouse
+          description: The serverless SQL warehouse discovery runs on.
+          sql_warehouse:
+            id: ${resources.sql_warehouses.lakefed_ingest_discovery.id}
+            permission: CAN_USE
+
+  # Discovery's warehouse: serverless, the smallest size, stopping after a few idle minutes. It runs only catalog
+  # queries (database names, tables, columns, keys), never table data, and only while someone chooses tables.
+  sql_warehouses:
+    lakefed_ingest_discovery:
+      name: "lakefed_ingest discovery"
+      warehouse_type: PRO
+      enable_serverless_compute: true
+      cluster_size: ${var.discovery_warehouse_size}
+      min_num_clusters: 1
+      max_num_clusters: ${var.discovery_warehouse_max_clusters}
+      auto_stop_mins: ${var.discovery_warehouse_auto_stop_mins}
+      tags:
+        custom_tags:
+          - key: project
+            value: lakefed_ingest
+
+  # The dedicated scope for JDBC logins that users type into the app (app/src/jdbc_logins.py). This bundle creates it,
+  # so the deployer is its creator and holds MANAGE, and the ingestion jobs, which run as the deployer, read the logins
+  # with it. The app's service principal gets WRITE on it from the lakefed_ingest_app_grants job, and nothing else: a
+  # permission here that names the app's service principal fails at deploy, so it can't be declared in this bundle.
+  # prevent_destroy: destroying this bundle would delete every login in the scope.
+  secret_scopes:
+    jdbc_logins:
+      name: ${var.jdbc_login_scope}
+      lifecycle:
+        prevent_destroy: true
 
   jobs:
     lakefed_ingest_app_grants:
       name: "lakefed_ingest_app_grants"
-      description: "Grant the operations app's service principal access to the lakefed_ingest Lakebase tables. Run as the tables' owner; idempotent."
+      description: "Grant the operations app's service principal access to the lakefed_ingest Lakebase tables, USE CONNECTION on the source_connections, and WRITE on the JDBC login scope. Run as the deployer, who owns the tables and created the scope; idempotent."
       # Serverless: the task only talks to the Lakebase instance and the workspace APIs.
       tasks:
         - task_key: grant_app_access
@@ -58,6 +131,8 @@ resources:
               app_name: ${resources.apps.lakefed_ingest_app.name}
               db_instance: ${var.lakebase_instance}
               db_name: ${var.lakebase_database}
+              source_connections: ${var.source_connections}
+              jdbc_login_scope: ${var.jdbc_login_scope}
       environments:
         - environment_key: lakebase_client
           spec:

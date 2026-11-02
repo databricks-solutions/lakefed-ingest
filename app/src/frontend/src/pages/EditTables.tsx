@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
-import { Badge, ConfirmButton, ErrorBox, Grid, Notice, autoColumns, fmtTime } from "../components";
+import { Badge, ConfirmButton, ErrorBox, Grid, Notice, autoColumns, fmtTime, plural } from "../components";
 
 // Every edit runs through the server's plan first (preview): what changes, which tables reseed and
 // why, warnings, and validation errors. Apply is only offered for a clean preview of the same edit.
 
-export const EDIT_FIELDS: { key: string; type?: "number" | "checkbox" | "select"; options?: string[]; help?: string }[] = [
-  { key: "task_collection" }, { key: "task_enabled", type: "checkbox" }, { key: "tier" }, { key: "priority", type: "number" },
-  { key: "freshness_sla_minutes", type: "number", help: "minutes; blank = no SLA" },
+export const EDIT_FIELDS: { key: string; label?: string; type?: "number" | "checkbox" | "select"; options?: string[]; help?: string }[] = [
+  { key: "task_collection", label: "Ingestion group (task_collection)" }, { key: "task_enabled", type: "checkbox" }, { key: "tier" }, { key: "priority", type: "number" },
+  { key: "freshness_sla_minutes", label: "Freshness target (freshness_sla_minutes)", type: "number", help: "minutes; blank = no target" },
   { key: "src_type", type: "select", options: ["sqlserver", "oracle", "postgresql", "mysql"] },
   { key: "use_remote_query", type: "checkbox", help: "read through the UC connection in src_connection" },
   { key: "src_connection" }, { key: "src_host" },
@@ -37,12 +37,12 @@ function PlanView({ result }: { result: PlanResult }) {
   return (
     <>
       <Notice tone={s.errors ? "bad" : s.reseed ? "warn" : "ok"}>
-        {s.applied ? "Applied" : "Preview"}: {s.changed} of {s.rows} tables change
+        {s.applied ? "Applied" : "Preview"}: {s.changed} of {s.rows} {plural(s.rows, "table")} change
         {s.reseed ? `, ${s.reseed} will reseed on their next run` : ""}{s.errors ? `, ${s.errors} have errors (nothing can be applied)` : ""}.
       </Notice>
       <Grid rows={rows} height={Math.min(80 + rows.length * 42, 320)}
         columns={autoColumns(rows, { changes: { minWidth: 320 }, notes: { flex: 1, minWidth: 320, tooltipField: "notes" },
-          errors: { minWidth: 240, cellStyle: { color: "#b42318" }, tooltipField: "errors" },
+          errors: { minWidth: 240, cellStyle: { color: "var(--bad)" }, tooltipField: "errors" },
           reseed: { cellRenderer: (p: any) => p.value ? <Badge value="seeding" /> : null } })} />
     </>
   );
@@ -73,7 +73,7 @@ function ApplyBar({ changes, edit }: { changes: Row; edit: ReturnType<typeof use
       <button className="primary" disabled={!Object.keys(changes).length || edit.run.isPending}
         onClick={() => edit.run.mutate({ changes, dry_run: true })}>Preview changes</button>
       <ConfirmButton label="Apply" disabled={!ready}
-        confirmLabel={`Confirm: apply to ${edit.preview?.summary.changed ?? 0} tables`}
+        confirmLabel={`Confirm: apply to ${edit.preview?.summary.changed ?? 0} ${plural(edit.preview?.summary.changed ?? 0, "table")}`}
         onConfirm={() => edit.run.mutateAsync({ changes, dry_run: false })} />
       {edit.preview && edit.previewKey !== key && !edit.preview.summary.applied && <span className="muted">Edited since the preview: preview again.</span>}
     </div>
@@ -107,7 +107,7 @@ export function EditOne({ id, onClose }: { id: number; onClose: () => void }) {
       <div className="form-grid">
         {EDIT_FIELDS.map((f) => (
           <label key={f.key} className={changes[f.key] !== undefined ? "changed" : ""}>
-            {f.key}
+            {f.label ?? f.key}
             {f.type === "checkbox" ? (
               <input type="checkbox" checked={!!form[f.key]} onChange={(e) => setForm({ ...form, [f.key]: e.target.checked })} />
             ) : f.type === "select" ? (
@@ -139,7 +139,7 @@ export function EditBulk({ ids, onClose }: { ids: number[]; onClose: () => void 
   return (
     <div className="drawer">
       <div className="drawer-head">
-        <h2>Bulk edit {ids.length} tables</h2>
+        <h2>Bulk edit {ids.length} {plural(ids.length, "table")}</h2>
         <button className="ghost" onClick={onClose}>Close</button>
       </div>
       <p className="muted small">Bulk edits are limited to fields that are safe across many tables. Source, key and sink
