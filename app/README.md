@@ -7,7 +7,7 @@ root doesn't depend on it, and everything the app does can also be done with SQL
 
 | Page | What it does |
 |---|---|
-| **Overview** | Ingestion jobs (a schedule and its ingestion groups) with their tables by state, late databases (a database with a late table; its database page lists the tables), last job run and Status (running, failing, late, paused); groups in no job; job runs going now (progress over all the job's tables, speed, expected end); jobs needing attention, with their failures grouped by cause |
+| **Overview** | Live ingestion jobs (a schedule and its ingestion groups) with their tables by state, late databases (a database with a late table; its database page lists the tables), last job run and Status (running, failing, late, paused); groups in no job; job runs going now (progress over all the job's tables, speed, expected end); jobs needing attention, with their failures grouped by cause. A deleted job (kept for a Restore, still deleting, or whose delete failed) is left out, with the groups, databases and tables only it holds |
 | **Ingestion jobs** | Every ingestion job, filtered (running, failing, late, paused) and searched; one job's details with its job runs (one per trigger: outcome, took, speed, parallelism, clusters), its groups, and **Run now** and **Cancel run** (see Run now and Cancel run, under [Schedules](#schedules)); one job run with its group runs, databases and failures |
 | **Runs** | Job runs of every ingestion job, running first; group runs of groups in no job. A group run's page shows its outcome, speed, time left, tables in flight, databases and table events |
 | **Sources** | Each source instance: how it is read (UC connection or JDBC host), its ingestion jobs, its tables by state, and tables discovered and not registered yet; UC connections with nothing registered |
@@ -180,8 +180,9 @@ as before (each request reads the statements going, saves the ones that ended an
   is refused. A read started more than 6 hours ago, a discarded draft and one nobody has asked about for two hours are
   left alone.
 
-The step's top line counts the choice: databases chosen of those listed and their tables (counting while some aren't
-checked yet); the same numbers end the step's last line and the job's Chosen summary.
+The step's top line counts the choice: databases chosen of those listed, then their tables once they are counted (the
+count and the access checks go on out of sight, with nothing spinning); the same numbers end the step's last line and
+the job's Chosen summary.
 
 **Keys and identity columns of a new fan-in job.** Each row's `__client_id__` is the server and database joined by an
 underscore (`{server}_{database}`): the UC connection name, or host and port, in lower case, then the database name.
@@ -190,7 +191,8 @@ and Add databases on a job made before keep its `{database}` key and add no colu
 don't allow and names the server and database.
 
 **New job reads the tables as they are chosen (drafts).** Ticking a whole database, or the whole server under its
-filter, starts the read of its tables at once, while the rest of the job is filled in. The read is a draft: its rows
+filter, starts the read of its tables at once, while the rest of the job is filled in. The read goes on out of sight; its
+progress shows once **Add the tables chosen** hands it to New job. The read is a draft: its rows
 are the read's own `discovery` and `discovered_table` rows, marked `draft` in `listing`, and nothing of the job
 (control, checkpoint, schedule, rollups) is written before Create.
 - **Add the tables chosen** doesn't wait: the reads go on in the background reader, and New job's preview counts what
