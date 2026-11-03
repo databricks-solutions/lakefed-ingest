@@ -56,19 +56,21 @@ The full list, with how to check each one, is in the [deployment guide](docs/dep
 ## Deploy
 
 Clone the repository and log in to the workspace as a profile (`databricks auth login --host <workspace-url> -p
-<profile>`). Add a target for your workspace to `databricks.yml` (the committed hosts are placeholders), or let the
-profile supply the host. Then, from the repository root:
+<profile>`). The bundle has two targets: `dev`, a development copy (names prefixed with your user name, schedules
+paused), and `prod`. The profile names the workspace, so there is nothing to write before a first deploy. From the
+repository root:
 
 ```bash
-databricks bundle validate -t <target> -p <profile>
-databricks bundle deploy -t <target> -p <profile>
+databricks bundle validate -t dev -p <profile>
+databricks bundle deploy -t dev -p <profile>      # or -t prod
 ```
 
 The one deploy creates everything (the Lakebase instance and database, the jobs, the app and its SQL warehouse),
 applies the Lakebase schema, starts the app with its code and gives the app its access. It waits for each of these
 and stops at the first that fails, naming it; the next deploy picks up from there. Then grant `CAN_USE` on the app to
-the people who run ingestion and open its URL (`databricks apps get <app_name> -p <profile>`). The settings a target
-can change (names, compute, who manages the app, its SQL warehouse) are in the [deployment guide](docs/deploy.md).
+the people who run ingestion and open its URL (`databricks apps get <app_name> -p <profile>`). The settings you can change
+(names, compute, who manages the app, its SQL warehouse) are variables, set under a target or with `--var`; they are
+in the [deployment guide](docs/deploy.md).
 
 Upgrades are the same command: pull and deploy. The deploy migrates the Lakebase schema before it starts the new app
 (see [Upgrading](docs/deploy.md#upgrading)).

@@ -37,21 +37,28 @@ In the workspace:
 
 The engine itself needs no SQL warehouse; only the app's discovery does.
 
-## 1. Add a target
+## 1. Choose a target and its settings
 
-In `databricks.yml`, add a target for your workspace (placeholders shown):
+`databricks.yml` has two targets and nothing per workspace in them; the profile you deploy with (`-p <profile>`)
+names the workspace:
+
+| Target | What it is |
+|---|---|
+| `dev` (the default) | A development copy: job, cluster and warehouse names are prefixed with `[dev <your user name>]`, and job schedules are paused |
+| `prod` | Production: names as written, schedules as written, one copy in the workspace folder `/Workspace/lakefed_ingest_v2` (production mode needs a fixed folder) |
+
+Change a setting only where its default doesn't suit you, either under the target in `databricks.yml` or with
+`--var name=value` on the command line. The common settings, with their defaults (and, last, examples for a large
+estate):
 
 ```yaml
 targets:
-  dev:
-    mode: development
-    workspace:
-      host: https://<your-workspace-host>/
+  dev:                                        # or prod
     variables:
-      node_type_id: Standard_D8ds_v5          # ingestion workers / the single-node utility cluster
-      driver_node_type_id: Standard_D16ds_v5  # the ingestion job is driver-bound: size this first
-      num_workers: 2
-      # Optional overrides (defaults shown):
+      # node_type_id: Standard_D8ds_v5          # ingestion workers / the single-node utility cluster
+      # driver_node_type_id: Standard_D16ds_v5  # the ingestion job is driver-bound: size this first
+      # num_workers: 2
+      # trust_server_certificate: "true"      # "false" in production, so the sources' certificates are checked
       # lakebase_instance: lakefed-ingest
       # lakebase_capacity: CU_1
       # lakebase_database: lakefed_ingest
@@ -72,9 +79,10 @@ targets:
 The default compute needs ~32 cores; a subscription with a small vCPU quota must use smaller nodes
 or raise the quota first.
 
-**A second copy in the same workspace.** Development mode prefixes job, cluster and warehouse names with the target,
-but not the app, the secret scopes or the Lakebase names, so a second target in one workspace sets its own
-`app_name`, `jdbc_login_scope`, `secret_scope`, `lakebase_instance`, `lakebase_database` and `lakebase_catalog`.
+**A second copy in the same workspace** (`dev` beside `prod`, or a second person's `dev`). Development mode prefixes
+job, cluster and warehouse names, but not the app, the secret scopes or the Lakebase names, so the second copy sets
+its own `app_name`, `jdbc_login_scope`, `secret_scope`, `lakebase_instance`, `lakebase_database` and
+`lakebase_catalog`.
 
 **Already have a Lakebase instance or secret scope?** Adopt it instead of creating a new one:
 `bind` works for the instance, its database catalog, and the secret scope:

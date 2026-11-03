@@ -149,22 +149,18 @@ variables:
       higher.
     default: 32
 
+# Two targets, and nothing per workspace in them: the profile you deploy with (-p <profile>) names the workspace.
+# Set any variable above for one target under targets.<name>.variables, or pass --var name=value.
 targets:
+  # A development copy: names are prefixed with '[dev <your user name>] ' and job schedules are paused
+  # (https://docs.databricks.com/dev-tools/bundles/deployment-modes.html). The default, so a command without -t
+  # never reaches prod.
   dev:
-    # The default target uses 'mode: development' to create a development copy.
-    # - Deployed resources get prefixed with '[dev my_user_name]'
-    # - Any job schedules and triggers are paused by default.
-    # See also https://docs.databricks.com/dev-tools/bundles/deployment-modes.html.
     mode: development
     default: true
-    workspace:
-      host: https://company-dev.cloud.databricks.com/
-
 
   prod:
     mode: production
     workspace:
-      host: https://company-prd.cloud.databricks.com/
-      # Use fixed location to make sure we only have a single copy.
-      # If this path results in an error, please make sure you have a recent version of the CLI installed.
+      # Production mode needs a fixed folder, so there is only one copy.
       root_path: /Workspace/${bundle.name}

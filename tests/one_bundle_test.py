@@ -60,6 +60,15 @@ def test_the_deploy_runs_the_grants_job_every_time():
     assert "          - on_bundle_deploy: true\n" in run
 
 
+
+def test_the_bundle_has_only_a_development_and_a_production_target_and_neither_names_a_workspace():
+    targets = BUNDLE.split("\ntargets:\n", 1)[1]
+    assert re.findall(r"^  ([a-z_]+):$", targets, re.M) == ["dev", "prod"]
+    assert "host:" not in targets
+    assert "  dev:\n    mode: development\n    default: true\n" in targets
+    assert "  prod:\n    mode: production\n    workspace:\n" in targets and "root_path: /Workspace/${bundle.name}" in targets
+
+
 def _job_keys():
     return {key for path in RESOURCE_FILES
             for key in re.findall(r"^    ([a-z_]+):\n      name:", path.read_text().split("\n  jobs:\n", 1)[-1], re.M)}
