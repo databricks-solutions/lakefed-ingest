@@ -173,6 +173,23 @@ def test_an_edit_that_points_a_table_at_a_host_needs_a_manager_and_other_edits_d
     main._refuse_connection_edits([row], to_host, user="ann@example.com")
 
 
+def test_moving_a_table_read_by_host_to_another_group_needs_a_manager_and_moving_other_tables_does_not(
+        managers, monkeypatch):
+    monkeypatch.setattr(main, "_group_connections", lambda groups: {})
+    host_row = {"id": 1, "task_collection": "g1", "src_connection": None, "use_remote_query": False,
+                "src_host": "h1", "secret_key": "k", "src_type": "sqlserver", "src_port": None}
+    uc_row = {**host_row, "id": 2, "src_connection": "uc", "use_remote_query": True, "src_host": None,
+              "secret_key": None}
+    move = [{"id": 1, "changes": {"task_collection": ["g1", "g2"]}}]
+    with pytest.raises(HTTPException) as refused:
+        main._refuse_connection_edits([host_row], move, user="mallory@example.com")
+    assert refused.value.status_code == 403
+    main._refuse_connection_edits([uc_row], [{"id": 2, "changes": {"task_collection": ["g1", "g2"]}}],
+                                  user="mallory@example.com")
+    managers.add("ann@example.com")
+    main._refuse_connection_edits([host_row], move, user="ann@example.com")
+
+
 # ---- a job's secret_scope ------------------------------------------------------------------------------------------
 
 def test_a_scope_parameter_set_or_changed_needs_a_manager_and_one_kept_does_not(managers):
