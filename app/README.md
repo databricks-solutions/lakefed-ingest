@@ -1,9 +1,10 @@
-# lakefed_ingest operations app (optional)
+# lakefed_ingest operations app
 
-A Databricks App for operating the root implementation of lakefed_ingest. It's a separate, optional
-bundle: deploy it only if your workspace allows Databricks Apps. The ingestion bundle at the repo
-root doesn't depend on it, and everything the app does can also be done with SQL and the Jobs UI
-(see [../docs/monitoring.md](../docs/monitoring.md) and [../docs/lakebase_schema.md](../docs/lakebase_schema.md)).
+A Databricks App for operating the default version of lakefed_ingest. It is part of the bundle at the repository
+root, so `databricks bundle deploy` deploys and starts it with the rest (see [Deploy](#deploy)); the workspace must
+allow Databricks Apps. The ingestion jobs don't depend on it, and everything the app does can also be done with SQL
+and the Jobs UI (see [../docs/monitoring.md](../docs/monitoring.md) and
+[../docs/lakebase_schema.md](../docs/lakebase_schema.md)).
 
 | Page | What it does |
 |---|---|
@@ -136,7 +137,7 @@ wrapper jobs are synced and any cluster copies run has ended; a copies run that 
 
 ## Discovery through the SQL warehouse
 
-Discover on a source runs on a small serverless SQL warehouse the app bundle makes (`lakefed_ingest discovery`), not on
+Discover on a source runs on a small serverless SQL warehouse the bundle makes (`lakefed_ingest discovery`), not on
 the discovery job's cluster, so each step answers in seconds rather than waiting minutes for a cluster. Every statement
 is plain SQL sent to SQL Server through the Unity Catalog connection (`remote_query`); the app can't open the
 connection itself (Unity Catalog lends its login only to Databricks compute), so the warehouse does it, as the app's
@@ -286,7 +287,7 @@ Logins below, and that goes only into the dedicated login scope.
 - **Logins:** under a connection's secret key the form has a user name and a password field. The fields show only when
   the connection's secret scope is the dedicated login scope, since that is where the login is written, and a key with
   `{database}` in it asks which database the login is for. Save the login writes
-  `{"user": ..., "password": ...}` as one JSON secret into the dedicated login scope (`JDBC_LOGIN_SCOPE`, set by the app bundle's
+  `{"user": ..., "password": ...}` as one JSON secret into the dedicated login scope (`JDBC_LOGIN_SCOPE`, set by the bundle's
   `jdbc_login_scope` variable, whose default is `lakefed_ingest_jdbc_logins`; blank, the app refuses to save a login). The write goes through the Secrets
   API as the app's service principal, so it shows under the app's identity and never the user's token. The grant job
   (under Deploy) gives that principal `WRITE` on this one scope and nothing else: not `MANAGE`, which would let it change
@@ -309,7 +310,7 @@ Logins below, and that goes only into the dedicated login scope.
   - **Never kept:** the password is not stored in Lakebase, not logged, and not returned. The form clears it after a save and
     never prefills it. Error text and the 422 for this route keep the password out.
   - **Who reads it:** the ingestion jobs read the login as the identity they run as, normally the deployer, which must be
-    the person who deployed the app bundle, since that person is the scope's creator. See the grant bullet below.
+    the person who deployed the bundle, since that person is the scope's creator. See the grant bullet below.
   - **Audit log:** checked on 30 Oct 2026 by writing a throwaway secret with a marker value: the audit log's
     `putSecret` record (`system.access.audit`, service `secrets`) shows `string_value` as `REDACTED`, and the marker
     appears nowhere in the record. Its `user_identity` and `identity_metadata` name the identity that wrote it.
@@ -524,7 +525,7 @@ The app runs as its own service principal (created with the app):
   each listed database is then read through the connection, and one the login can't open fails on its own.
 - **JDBC secret scopes:** `READ` on each scope a JDBC connection names, for the identity its jobs run as (normally the
   deployer). The app never holds it and its grant job doesn't give it, so a job reading a scope it can't read fails on
-  its first run. The app bundle creates the dedicated login scope with no permission on it, and the grant job gives the
+  its first run. The bundle creates the dedicated login scope with no permission on it, and the grant job gives the
   app `WRITE` there and nothing else (see Lakebase above). The app makes no other scope and writes no other secret.
   See [JDBC connections](#jdbc-connections-entered-by-hand).
 - **Who can act:** every action on an existing ingestion job follows the signed-in user's own Databricks
@@ -567,53 +568,61 @@ everywhere.
 
 ## Deploy
 
-Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakebase schema exists).
+The app is deployed with everything else, from the repository root, by one command (see the
+[deployment guide](../docs/deploy.md)):
 
-1. Add a target to `app/databricks.yml` for your workspace (the committed `dev` / `prod` hosts are
-   placeholders). Set the variables that differ from the defaults:
-   - `lakebase_instance`, `lakebase_database`: the ingestion bundle's values.
-   - `ingest_job_id`, `setup_job_id`, `discover_job_id`, `check_job_id`, `cluster_copies_job_id`, `delete_job_id`:
-     looked up by job name, so deploy the ingestion bundle first. In development mode the ingestion
-     bundle prefixes job names (`[dev your_name] lakefed_ingest`), so set the ids or the prefixed
-     names for dev targets.
-   - `app_name`: 30 characters max.
-   - `app_managers`: who sees Manage besides workspace admins, users or groups, comma separated; by default the user
-     who deploys.
-   - `app_version`: what Manage shows as the version, by default the git commit deployed from. It is blank when the
-     bundle is deployed from a folder that isn't a git checkout: pass `--var app_version=<commit>` there.
-   - `app_warehouse_id`: a Pro or serverless SQL warehouse (version 2025.35 or above) of your own for the app's
-     queries, when serverless can't reach the sources; blank keeps the bundle's own (see A warehouse of your own,
-     under Discovery through the SQL warehouse).
-2. Deploy and start the app, then run the grant job. Run these from `app/`, as the user who manages the Lakebase
-   instance and owns the tables (whoever ran the ingestion setup). On a first deploy the order matters: the grant job
-   needs the app's service principal, which exists only once the app is deployed.
+```bash
+databricks bundle deploy -t <target> -p <profile>
+```
 
-   ```bash
-   cd app
-   databricks bundle deploy -t <target>
-   databricks bundle run lakefed_ingest_app -t <target>          # deploys the code and starts the app
-   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access, USE CONNECTION on source_connections, WRITE on the login scope, CAN_USE on app_warehouse_id
-   ```
-3. Check the login scope's access list. The grant job sets the app's `WRITE` there (the bundle declares no permission on
+Run it as the user who manages the Lakebase instance and owns the tables, who should also be the user the ingestion
+jobs run as (the login scope below). In order, the deploy applies the Lakebase schema (the `lakefed_ingest_setup`
+run), creates the app and starts it with its code, then runs `lakefed_ingest_app_grants`, which gives the app's
+service principal its access: Lakebase, `USE CONNECTION` on `source_connections`, `WRITE` on the login scope, and
+`CAN_USE` on `app_warehouse_id` when it is set. The grant job needs the app's service principal, which exists only
+once the app does, so it always comes last. It runs on every deploy, so a recreated app (a new service principal) or a
+changed `source_connections` or `app_warehouse_id` is granted by the next deploy.
+
+The app's settings are variables of the bundle (`databricks.yml`), set in your target:
+- `app_name`: lowercase letters, digits and dashes, 30 characters max. Development mode doesn't prefix an app's
+  name, so give each copy in one workspace its own.
+- `app_managers`: who sees Manage besides workspace admins, users or groups, comma separated; by default the user
+  who deploys.
+- `app_version`: what Manage shows as the version, by default the git commit deployed from. It is blank when the
+  bundle is deployed from a folder that isn't a git checkout: pass `--var app_version=<commit>` there.
+- `source_connections`: the Unity Catalog connections discovery reads through, comma separated.
+- `jdbc_login_scope`: the dedicated login scope (default `lakefed_ingest_jdbc_logins`); give each copy in one
+  workspace its own.
+- `app_warehouse_id`: a Pro or serverless SQL warehouse (version 2025.35 or above) of your own for the app's
+  queries, when serverless can't reach the sources; blank keeps the bundle's own (see A warehouse of your own,
+  under Discovery through the SQL warehouse).
+
+The app is told the ingestion jobs' ids and the Lakebase instance and database by the bundle itself, so there is
+nothing to look up.
+
+After the first deploy:
+1. Check the login scope's access list. The grant job sets the app's `WRITE` there (the bundle declares no permission on
    the scope), so the list should show the app's service principal with `WRITE`, the deployer with `MANAGE`, and nothing
    else: `databricks secrets list-acls lakefed_ingest_jdbc_logins -p <profile>`.
-4. Grant `CAN_USE` on the app to your operators, then open the URL printed by `bundle run`.
+2. Grant `CAN_USE` on the app to your operators, then open its URL (`databricks apps get <app_name> -p <profile>`).
 
-Re-run the grant job if the app is recreated (new service principal), or after changing `app_warehouse_id`. It also sets the new principal's `WRITE` on the
-login scope; the old principal's entry stays until you remove it (`databricks secrets delete-acl
-lakefed_ingest_jdbc_logins <old service principal>`). Default privileges cover tables the same owner adds later, so
-schema upgrades don't need it.
+A deploy whose app settings changed, which includes every new commit through `app_version`, deploys the app's code
+again and restarts it once. To deploy the code alone, say from a folder that isn't a git checkout, run
+`databricks bundle run lakefed_ingest_app -t <target> -p <profile>`. When the app is recreated, the old principal's
+`WRITE` on the login scope stays until you remove it (`databricks secrets delete-acl lakefed_ingest_jdbc_logins <old
+service principal>`). Default privileges cover tables the same owner adds later, so schema upgrades need nothing more.
 
-**Schema upgrades.** When the app starts and finds the state database behind the schema version its code expects
-(`schema_upgrade.SCHEMA_VERSION`), it starts the setup job once, under an advisory lock and only if no setup run is
-going, and logs it in the change log (`schema_upgrade`). Manage shows the database's version against the app's, and
-**Upgrading the state database** with the run's link while it runs. The next ingestion or check run also migrates a
-database behind, as before. A first install, with no schema at all, is left to the deploy steps: the grant job and
-the app's own Postgres role need the schema to exist first. `SCHEMA_UPGRADE=0` turns the check off.
+**Schema upgrades.** The deploy applies the schema before it starts the new app. The app also checks for itself: when
+it starts and finds the state database behind the schema version its code expects (`schema_upgrade.SCHEMA_VERSION`),
+it starts the setup job once, under an advisory lock and only if no setup run is going, and logs it in the change log
+(`schema_upgrade`). Manage shows the database's version against the app's, and **Upgrading the state database** with
+the run's link while it runs. The next ingestion or check run also migrates a database behind, as before. A database
+with no schema at all is left to the deploy's setup run: the grant job and the app's own Postgres role need the
+schema to exist first. `SCHEMA_UPGRADE=0` turns the check off.
 
 The grant job defaults to serverless jobs compute (it only calls the workspace APIs and Lakebase). If
 the workspace doesn't have serverless jobs, run it on an existing all-purpose cluster in your target
-(it's a one-time job, so a running cluster beats waiting for a job cluster to start):
+(it's a short job, so a running cluster beats waiting for a job cluster to start):
 
 ```yaml
 targets:

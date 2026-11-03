@@ -1,4 +1,4 @@
-"""CAN_USE for the app's service principal on a SQL warehouse of the customer's own, named in the app bundle's
+"""CAN_USE for the app's service principal on a SQL warehouse of the customer's own, named in the bundle's
 app_warehouse_id variable, which the app then runs its queries on (warehouse.py). The bundle's own warehouse needs no
 grant here: the app holds CAN_USE on it as an app resource. A warehouse the bundle doesn't make can't be an app
 resource that a variable switches, so the app's grants job (notebooks/grant_app_access.ipynb) grants it instead, as

@@ -6787,7 +6787,7 @@ def write_jdbc_login(body: jl.JdbcLoginRequest, request: Request):
     is never stored, logged or returned."""
     scope = jl.dedicated_scope()
     if not scope:
-        raise HTTPException(503, f"no dedicated login scope is set ({jl.SCOPE_ENV}): deploy the app bundle")
+        raise HTTPException(503, f"no dedicated login scope is set ({jl.SCOPE_ENV}): deploy the bundle")
     password = body.password.get_secret_value()
     entered_by = _user(request)
     _refuse(_signed_in_refusal(entered_by))
@@ -6904,7 +6904,7 @@ def last_jdbc_login(secret_key: str = Query(default="", max_length=128)):
     scope alone, before a key is named, to know which scope its logins go to."""
     scope = jl.dedicated_scope()
     if not scope:
-        raise HTTPException(503, f"no dedicated login scope is set ({jl.SCOPE_ENV}): deploy the app bundle")
+        raise HTTPException(503, f"no dedicated login scope is set ({jl.SCOPE_ENV}): deploy the bundle")
     if not secret_key:
         return {"scope": scope, "secret_key": "", "login": None}
     rows = db.query(q.jdbc_login_latest_sql(), (scope, secret_key))

@@ -2,7 +2,7 @@
 
 A user gives a JDBC connection, the secret key (the connection's key, which holds one login per database when it has
 {database} in it) and a user name and password. The app writes them as one JSON secret, {"user": ..., "password": ...},
-into the scope the app bundle created for this (JDBC_LOGIN_SCOPE). The write goes through the Secrets API with the app's
+into the scope the bundle created for this (JDBC_LOGIN_SCOPE). The write goes through the Secrets API with the app's
 own workspace client, so it shows under the app's service principal, never under the user's token. The app keeps one
 jdbc_login_write row per write: who entered it, when, and whether it replaced an earlier login for the same scope and
 key ('rotated').
@@ -31,7 +31,7 @@ REDACTED = "***"
 
 
 def dedicated_scope() -> str:
-    """The scope logins are written into: the app bundle's jdbc_login_scope, read from the environment."""
+    """The scope logins are written into: the bundle's jdbc_login_scope, read from the environment."""
     return os.environ.get(SCOPE_ENV, "").strip()
 
 
@@ -122,7 +122,7 @@ def write_refusal(error: Exception, scope: str, secret_key: str, secrets: Iterab
     """The HTTP status and the message for a failed secret write, with the secrets it carried redacted."""
     if getattr(error, "status_code", None) == 403:
         return 403, (f"the app's service principal can't write to the secret scope {scope}: it needs WRITE on it, which "
-                     "the app bundle grants. Nothing was saved.")
+                     "the bundle's grant job gives it. Nothing was saved.")
     first_line = redact(str(error).strip().split("\n")[0], *secrets)[:300]
     return 502, (f"Databricks refused the write to {scope}/{secret_key} ({first_line}). The login may not be saved; "
                  "try again.")

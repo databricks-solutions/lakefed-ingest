@@ -1,16 +1,18 @@
 # Deploying lakefed_ingest
 
-Everything the root implementation needs is a resource in its bundle (`lakefed_ingest_v2`, at the repo
-root): the Lakebase instance and its UC-registered database, the secret scope, and its jobs
-(`resources/lakefed_ingest*.yml`). The ingestion job runs on job clusters; the setup, check, cluster-copies and
-delete jobs on serverless; discovery on the bundle's single-node `lakefed_ingest utility` cluster. `databricks
-bundle deploy` is idempotent for resources the bundle owns. This page covers the steps the bundle can't do. Run all
-commands from the repo root. (The job orchestration implementation is a separate bundle; see
-[`../job_orchestration/README.md`](../job_orchestration/README.md).)
+Everything the default version needs is a resource in one bundle (`lakefed_ingest_v2`, at the repo root): the
+Lakebase instance and its UC-registered database, the secret scope, the jobs (`resources/lakefed_ingest*.yml`), and
+the operations app with its SQL warehouse, login scope and grant job (`app/resources/lakefed_ingest_app.yml`). The
+ingestion job runs on job clusters; the setup, check, cluster-copies, delete and grant jobs on serverless; discovery
+on the bundle's single-node `lakefed_ingest utility` cluster. One `databricks bundle deploy` creates everything,
+applies the Lakebase schema, starts the app and gives it its access, and is idempotent for resources the bundle owns.
+This page covers the settings and the steps the bundle can't do. Run all commands from the repo root. (The legacy
+version is a separate bundle in `job_orchestration/`; see [`../job_orchestration/README.md`](../job_orchestration/README.md).)
 
 ## Before you start
 
-On your machine: Git, a Databricks CLI version that supports bundles, and a profile logged in to the workspace:
+On your machine: Git, Databricks CLI 1.13.0 or above (the bundle refuses an older one), and a profile logged in to
+the workspace:
 
 ```bash
 git clone https://github.com/databricks-solutions/lakefed-ingest.git
@@ -23,7 +25,7 @@ In the workspace:
 | What | How |
 |---|---|
 | Lakebase instance, database, UC catalog | Bundle resources in `resources/lakefed_ingest_setup.yml`, created on deploy (billable), or adopt existing ones with `bundle deployment bind` (step 1) |
-| Schema | The `lakefed_ingest_setup` job on a new deployment (idempotent); after an upgrade the first run migrates the schema itself ([Upgrading](#upgrading)) |
+| Schema | The `lakefed_ingest_setup` job, run by every deploy (idempotent): it creates the schema on a new deployment and migrates it after an upgrade ([Upgrading](#upgrading)) |
 | Lakebase auth | An SDK-minted OAuth token at runtime: the identity the jobs run as must be a Postgres role on the instance |
 | Job clusters to Lakebase (port 5432) | The workspace IP access list must allow the clusters' egress, or use Private Link. Verify first (step 3) |
 | Job clusters to each source (SQL Server 1433, Oracle 1521, PostgreSQL 5432, MySQL 3306) | Your network |
@@ -31,7 +33,7 @@ In the workspace:
 | A way into each source | A Unity Catalog connection with `USE CONNECTION` and `MANAGE` for the jobs' identity, or one JSON secret `{"user","password"}` per source database in the `secret_scope` (step 3). The app's [JDBC connections](../app/README.md#jdbc-connections-entered-by-hand) keep their logins the same way |
 | `ct` source tables | Change Tracking on the database and the table, a primary key, and a `CHANGE_RETENTION` longer than the seed takes |
 | Oracle or MySQL sources | Their JDBC driver library on the job cluster (step 3) |
-| The operations app (optional) | Databricks Apps allowed in the workspace. The app bundle makes its own serverless Pro SQL warehouse for discovery, or uses one you name ([The app's SQL warehouse](#the-apps-sql-warehouse)) |
+| The operations app | Databricks Apps allowed in the workspace: the deploy creates and starts the app, so it fails where Apps are off. The bundle makes its own serverless Pro SQL warehouse for discovery, or uses one you name ([The app's SQL warehouse](#the-apps-sql-warehouse)) |
 
 The engine itself needs no SQL warehouse; only the app's discovery does.
 
@@ -55,6 +57,10 @@ targets:
       # lakebase_database: lakefed_ingest
       # lakebase_catalog: lakefed_ingest_lakebase
       # secret_scope: lakefed_ingest
+      # The operations app (app/README.md, Deploy):
+      # app_name: lakefed-ingest-ops
+      # source_connections: ""              # UC connections discovery reads through, comma separated
+      # jdbc_login_scope: lakefed_ingest_jdbc_logins
       # Ingestion job parameter examples for a large estate, not the defaults (see how-it-works.md, "Large estates"):
       # append_batch_size: "16"                # default "4"
       # max_seeds_per_run: "10000"             # default "0", no limit
@@ -65,6 +71,10 @@ targets:
 
 The default compute needs ~32 cores; a subscription with a small vCPU quota must use smaller nodes
 or raise the quota first.
+
+**A second copy in the same workspace.** Development mode prefixes job, cluster and warehouse names with the target,
+but not the app, the secret scopes or the Lakebase names, so a second target in one workspace sets its own
+`app_name`, `jdbc_login_scope`, `secret_scope`, `lakebase_instance`, `lakebase_database` and `lakebase_catalog`.
 
 **Already have a Lakebase instance or secret scope?** Adopt it instead of creating a new one:
 `bind` works for the instance, its database catalog, and the secret scope:
@@ -87,13 +97,23 @@ Upgrading an earlier preview of this version? Its Lakebase resources sit in anot
 catalog. If the database is already registered (for example by a catalog created by hand), bind that
 catalog or set `lakebase_catalog` to its name; creating a second catalog for it fails.
 
-## 2. Deploy and apply the schema
+## 2. Deploy
 
 ```bash
 databricks bundle validate -t dev           # checks the target and its variables before anything is created
 databricks bundle deploy -t dev
-databricks bundle run lakefed_ingest_setup -t dev   # idempotent
 ```
+
+The deploy creates the resources and then, in this order, waiting for each:
+
+1. runs `lakefed_ingest_setup` once the Lakebase database exists, which creates the schema (or migrates it);
+2. creates the operations app and starts it with its code;
+3. runs `lakefed_ingest_app_grants`, which gives the app's service principal its access (it needs the principal, which
+   exists only once the app does).
+
+A run that fails stops the deploy with the failed task's error and its run page; fix the cause and deploy again, and
+the next deploy runs it again. Both runs also run on every later deploy. A first deploy takes several minutes longer
+than the resources alone: the Lakebase instance, the app's compute and the two serverless runs.
 
 > Deploying creates a **billable** Lakebase instance (unless you bound an existing one).
 
@@ -110,7 +130,7 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   without use. Deploying creates it, and Databricks starts a new cluster on creation. To use a cluster
   you already have, override the task's `existing_cluster_id` in your target. A source that is paused
   or resuming (Azure SQL serverless) is retried three times, with pauses doubling from 15-30 s.
-  With the operations app, Discover on a source runs on the app bundle's small serverless SQL warehouse
+  With the operations app, Discover on a source runs on the bundle's small serverless SQL warehouse
   instead (`lakefed_ingest discovery`, 2X-Small, up to 2 clusters, stopping after 5 idle minutes: bundle variables
   `discovery_warehouse_size`, `discovery_warehouse_max_clusters`, `discovery_warehouse_auto_stop_mins`), through the
   Unity Catalog connection, so the test, the database list and the table reads answer in seconds; the warehouse
@@ -127,18 +147,16 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   then the daily run purges it, or Delete now purges it at once. The purge deletes the job's groups' rows in
   Lakebase (it owns the state database; the app has no `DELETE` privilege) and, when asked, drops the target tables
   only those groups write, so the deployer needs to be able to drop those tables (`MANAGE` or ownership in Unity
-  Catalog). Deploy this bundle before the app, which looks both jobs up by name.
+  Catalog).
   The same job also removes one table from a live job (the Failing tables list's Remove), with its `control_ids`
-  parameter: the table's control row, checkpoint and reseed rows go, its target table stays. The app's Remove needs
-  this bundle, so deploy it first. A Remove started before it fails and removes nothing: the older job refuses a
-  live job's run, and the app records the failure on the row.
-- **The operations app's login scope** (the app bundle's `jdbc_login_scope`, default `lakefed_ingest_jdbc_logins`) holds
-  the JDBC logins typed into the app. The app bundle creates it, and its deployer becomes the scope's creator and holds
+  parameter: the table's control row, checkpoint and reseed rows go, its target table stays.
+- **The operations app's login scope** (the bundle's `jdbc_login_scope`, default `lakefed_ingest_jdbc_logins`) holds
+  the JDBC logins typed into the app. The bundle creates it, and its deployer becomes the scope's creator and holds
   `MANAGE`. The app's service principal gets `WRITE` on that one scope and nothing else: not `MANAGE`, which would let
   it change who reads the scope, and not `READ`. The `lakefed_ingest_app_grants` job sets that grant through the Secrets
   API, as the deployer. The bundle declares no permission on the scope, because one naming the app's service principal
-  fails at deploy, before the app exists. The scope has `prevent_destroy`, so destroying the app bundle won't delete the
-  logins. This assumes the ingestion jobs run as that same deployer, so they can read the logins; deploy the app bundle
+  fails at deploy, before the app exists. The scope has `prevent_destroy`, so destroying the bundle won't delete the
+  logins. This assumes the ingestion jobs run as that same deployer, so they can read the logins; deploy the bundle
   as the user who runs the ingestion jobs, and check the jobs' run-as identity on your deployment. The audit log records
   each write with the value redacted (checked 30 Oct 2026). See the app's README, "JDBC connections entered by hand".
 - **The check** (`lakefed_ingest_check`) runs on serverless by default and reads every source database it checks,
@@ -258,14 +276,14 @@ environment, so no app code holds a warehouse ID.
 
 By default it is the bundle's own warehouse, `lakefed_ingest discovery`: Pro, serverless, sized by
 `discovery_warehouse_size`, `discovery_warehouse_max_clusters` and `discovery_warehouse_auto_stop_mins` in
-`app/databricks.yml`. It auto-stops when idle. The app gets its ID as `WAREHOUSE_ID`, from the app resource
+`databricks.yml`. It auto-stops when idle. The app gets its ID as `WAREHOUSE_ID`, from the app resource
 `discovery-warehouse` in `app/resources/lakefed_ingest_app.yml`, which also gives the app `CAN_USE` on it.
 
 To run the app's queries on a warehouse of your own instead, say a Pro warehouse that runs in your network and
-reaches sources serverless can't, set the `app_warehouse_id` variable in your target of `app/databricks.yml`:
+reaches sources serverless can't, set the `app_warehouse_id` variable in your target:
 
 ```yaml
-# app/databricks.yml
+# databricks.yml
 targets:
   dev:                                           # your target
     variables:
@@ -283,7 +301,7 @@ own warehouse. The app reads the setting as `APP_WAREHOUSE_ID` and uses it in pl
 - The `lakefed_ingest_app_grants` job gives the app's service principal `CAN_USE` on that warehouse. It adds one
   entry to the warehouse's access list and leaves the others as they are. Whoever runs the job needs `CAN_MANAGE`
   on the warehouse; without it the job fails and says so, and the warehouse's owner or a workspace admin grants
-  `CAN_USE` to the app's service principal instead. Run the job again after changing `app_warehouse_id`.
+  `CAN_USE` to the app's service principal instead. Every deploy runs the job, so the deploy fails in that case too.
 - Manage shows the warehouse in use, read only: its name and ID, Pro or serverless, its state, and which setting
   chose it. It says so plainly when the warehouse is Classic or can't be read. The app still starts either way.
 - The bundle's own warehouse is still defined and created, and the app keeps `CAN_USE` on it through its resource
@@ -330,11 +348,9 @@ own warehouse. The app reads the setting as `APP_WAREHOUSE_ID` and uses it in pl
      `false`, `require` otherwise.
    - MySQL: `src_schema` = the database; `sslMode=VERIFY_IDENTITY` / `REQUIRED` likewise.
 
-6. **The operations app (optional), first deploy.** In this order: deploy the ingestion bundle (step 2 above); deploy
-   the app bundle and start the app (`app/README.md`, Deploy); run `databricks bundle run lakefed_ingest_app_grants -t
-   <target>` from `app/`, which needs the app's service principal to exist; then check the login scope's access list with
+6. **The operations app, after the first deploy.** Check the login scope's access list with
    `databricks secrets list-acls lakefed_ingest_jdbc_logins -p <profile>`. It should show the app's service principal
-   with `WRITE`, the deployer with `MANAGE`, and no other entry.
+   with `WRITE`, the deployer with `MANAGE`, and no other entry. Then grant `CAN_USE` on the app to your operators.
 
 ## 4. First run and verification
 
@@ -371,13 +387,14 @@ deploy automation to `cd job_orchestration` first. If you deployed a preview of 
 
 ### Upgrading an existing deployment
 
-Pull and deploy both bundles. The database records its schema version (`schema_version`), and the next
-ingestion run whose code needs a newer one migrates the schema before it starts, in one transaction, while runs
+Pull and deploy. The deploy's setup run migrates the schema before the new app starts. The database records its
+schema version (`schema_version`), and an ingestion run whose code needs a newer one also migrates the schema before it
+starts, in one transaction, while runs
 of other collections wait for it. If the migration fails (for example, existing rows break a new constraint),
 nothing changes and the run fails with the cause; fix it and run again. If it can't get its locks within its
 retries, the run ingests nothing and ends `migration_waiting` (see
 [Locks and waiting](lakebase_schema.md#locks-and-waiting)); the next run tries again. The app, when it starts and
-finds the database behind, starts the setup job once to migrate it. To migrate before the next run instead, run `lakefed_ingest_setup`.
+finds the database behind, starts the setup job once to migrate it. A setup run that fails this way fails the deploy.
 Either way the migration needs the schema's owner: the deployer, unless the jobs run as another
 identity. From an early deploy, it renames the `ct_checkpoint` / `sweep_run` tables and their
 CT-specific columns to the generic `checkpoint` / `ingest_run` names in place (data kept).
@@ -412,6 +429,41 @@ create index concurrently if not exists ingest_event_control_started_idx
 Check that it is valid: `select indisvalid from pg_index where indexrelid = 'lakefed_ingest.ingest_event_control_started_idx'::regclass;`
 must return `true`. A concurrent build that fails leaves an invalid index under the same name, which the migration
 would skip, so drop it (`drop index concurrently lakefed_ingest.ingest_event_control_started_idx;`) and build it again.
+
+### Upgrading a deployment with a separate app bundle
+
+Earlier releases deployed the operations app as a second bundle from `app/` (`lakefed_ingest_app`). Its app, SQL
+warehouse, login scope and grant job are recorded in that bundle's state, so a deploy of this bundle to the same
+workspace would try to create an app of the same name and fail. Move them into this bundle once, before you deploy:
+
+```bash
+# 1. Release them from the app bundle's state: from a checkout of the earlier release, in app/, with your app target.
+cd app
+databricks bundle deployment unbind lakefed_ingest_app        -t <app target>
+databricks bundle deployment unbind lakefed_ingest_discovery  -t <app target>
+databricks bundle deployment unbind jdbc_logins               -t <app target>
+databricks bundle deployment unbind lakefed_ingest_app_grants -t <app target>
+cd ..
+```
+
+2. In this release's `databricks.yml`, add your app target's variables to your target (`app_name`,
+   `source_connections`, `jdbc_login_scope`, `app_warehouse_id` and the others you set). Leave out the six
+   `*_job_id` variables, which no longer exist.
+3. Bind the same four here, by their names and ids in the workspace, then check the plan:
+
+   ```bash
+   databricks bundle deployment bind lakefed_ingest_app        <app name>            -t <target>
+   databricks bundle deployment bind lakefed_ingest_discovery  <warehouse id>        -t <target>
+   databricks bundle deployment bind jdbc_logins               <login scope name>    -t <target>
+   databricks bundle deployment bind lakefed_ingest_app_grants <grant job id>        -t <target>
+   databricks bundle plan -t <target>        # must show 0 to delete
+   ```
+
+4. Deploy. The app keeps its service principal, grants, logins and database; its code is deployed again from this
+   bundle, so it restarts once.
+
+Don't run `bundle destroy` for the old app bundle afterwards. If `unbind` reports that a key isn't in the state, that
+resource was never deployed by the app bundle, so skip it and its `bind`.
 
 ### Upgrading a preview deployment
 

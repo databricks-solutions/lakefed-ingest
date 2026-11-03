@@ -1,6 +1,6 @@
 """WRITE on the dedicated JDBC login scope for the app's service principal, and nothing else. The app saves the logins
 typed into it, so WRITE is all it needs: MANAGE would let it change who reads the scope, and READ is not needed to
-write. The app bundle creates the scope, so its deployer holds MANAGE; the app's grants job
+write. The bundle creates the scope, so its deployer holds MANAGE; the app's grants job
 (notebooks/grant_app_access.ipynb) runs as that deployer and makes this grant. Only the app's own entry is set; the
 other principals on the scope are left as they are."""
 from databricks.sdk.service.workspace import AclPermission

@@ -3,30 +3,21 @@
 `lakefed-ingest` copies tables from external databases (SQL Server, Oracle, PostgreSQL, MySQL) into Delta tables on
 Databricks, and keeps them up to date. You describe the tables to copy as rows of metadata; it reads each source,
 writes its Delta tables and records where each one is, so the next run reads only what changed. It is built for
-estates of many databases: thousands of source databases and hundreds of thousands of tables. An optional
-**operations app** lets you find the tables on a source, make ingestion jobs from them and watch them run, without
+estates of many databases: thousands of source databases and hundreds of thousands of tables. The
+**operations app**, deployed with the rest, lets you find the tables on a source, make ingestion jobs from them and watch them run, without
 writing SQL.
 
-## Choose an implementation
+## The legacy version
 
-This repository holds two implementations, each deployed as its own bundle. This README covers the **root
-implementation**, the default, at the repository root. The **job orchestration implementation** is in
-[`job_orchestration/`](job_orchestration/README.md), and the operations app is a separate bundle in [`app/`](app/README.md).
-
-| | **Root implementation** | **Job orchestration implementation** |
-|---|---|---|
-| Best for | Many source databases or tables, logins per database, many databases written into shared tables, or SQL Server Change Tracking (incremental loads with deletes, no watermark column needed) | Warehouse-only compute, watermark loads from a source other than SQL Server, or a source only it supports (Redshift, Synapse, IBM Db2) |
-| Incremental options | SQL Server Change Tracking, or a watermark column, on SQL Server; a full reload for every source | A watermark column on any source it supports |
-| Compute model | One job task copies a whole group of tables on a job cluster | One task run per table or partition, on a SQL warehouse |
-
-The full comparison (where the metadata lives, how each reads a source, the bundles) is in
-[How a run works](docs/how-it-works.md#the-two-implementations). Upgrading from a release where the repository
-root was the job orchestration implementation? Read
-[Upgrading from an earlier release](docs/deploy.md#upgrading-from-an-earlier-release) before you deploy anything.
+The repository root holds the default version, which this README covers. [`job_orchestration/`](job_orchestration/README.md)
+holds the legacy version, the original one built on job tasks and a SQL warehouse. It is kept for existing
+deployments, and all new development goes into the default version. Upgrading from a release where the repository
+root was the legacy version? Read [Upgrading from an earlier release](docs/deploy.md#upgrading-from-an-earlier-release)
+before you deploy anything.
 
 ## How it works
 
-![How the parts fit: sources are read by the check and ingest jobs, which write Delta tables and record their state in Lakebase; the optional app reads table lists through its SQL warehouse and writes the control rows](docs/images/how-it-fits.svg)
+![How the parts fit: sources are read by the check and ingest jobs, which write Delta tables and record their state in Lakebase; the app reads table lists through its SQL warehouse and writes the control rows](docs/images/how-it-fits.svg)
 
 1. **Tables to copy.** Each table is a row in Lakebase, a Postgres database on Databricks: where the table is, how
    to load it and which Delta table it writes. These *control rows* are grouped into *ingestion groups*, and an
@@ -56,36 +47,31 @@ The details (load types, tables shared by many databases, concurrency, retries, 
   for the dedicated job cluster), or one secret per source database (`{"user", "password"}`) in a secret scope.
 - For SQL Server Change Tracking tables: Change Tracking on, a primary key, and a change retention longer than the
   first full copy takes.
-- For the app: Databricks Apps allowed in the workspace. The app's bundle makes its own small serverless SQL
-  warehouse, which reads table lists and columns from the sources; it never reads table data.
+- Databricks Apps allowed in the workspace, for the operations app. The bundle makes its own small serverless SQL
+  warehouse for it, which reads table lists and columns from the sources; it never reads table data.
+- Databricks CLI 1.13.0 or above (`databricks --version`).
 
 The full list, with how to check each one, is in the [deployment guide](docs/deploy.md#before-you-start).
 
 ## Deploy
 
-First, clone the repository, install a Databricks CLI version that supports bundles, and log in to the workspace
-as a profile (`databricks auth login --host <workspace-url> -p <profile>`). Add a target for your workspace to both
-`databricks.yml` and `app/databricks.yml` (the committed hosts are placeholders), or let the profile supply the host,
-and check each bundle with `databricks bundle validate -t <target> -p <profile>`. The
-[deployment guide](docs/deploy.md) has every step, setting and check. Then:
+Clone the repository and log in to the workspace as a profile (`databricks auth login --host <workspace-url> -p
+<profile>`). Add a target for your workspace to `databricks.yml` (the committed hosts are placeholders), or let the
+profile supply the host. Then, from the repository root:
 
 ```bash
-# 1. The ingestion bundle, from the repository root (bundle lakefed_ingest_v2; compute defaults to Azure node types).
+databricks bundle validate -t <target> -p <profile>
 databricks bundle deploy -t <target> -p <profile>
-databricks bundle run lakefed_ingest_setup -t <target> -p <profile>   # once: creates the Lakebase schema
-
-# 2. The operations app (optional), from app/, after the ingestion bundle.
-cd app
-databricks bundle deploy -t <target> -p <profile>
-databricks bundle run lakefed_ingest_app -t <target> -p <profile>          # deploys the code and starts the app
-databricks bundle run lakefed_ingest_app_grants -t <target> -p <profile>   # gives the app its access
 ```
 
-Then grant `CAN_USE` on the app to the people who run ingestion, and open the URL `bundle run` printed. The app's
-own settings (job ids, who manages it, its SQL warehouse) are in [the operations app's deploy steps](app/README.md#deploy).
+The one deploy creates everything (the Lakebase instance and database, the jobs, the app and its SQL warehouse),
+applies the Lakebase schema, starts the app with its code and gives the app its access. It waits for each of these
+and stops at the first that fails, naming it; the next deploy picks up from there. Then grant `CAN_USE` on the app to
+the people who run ingestion and open its URL (`databricks apps get <app_name> -p <profile>`). The settings a target
+can change (names, compute, who manages the app, its SQL warehouse) are in the [deployment guide](docs/deploy.md).
 
-Upgrades are deploy only: pull, deploy both bundles, and the Lakebase schema migrates itself on the next run (see
-[Upgrading](docs/deploy.md#upgrading)).
+Upgrades are the same command: pull and deploy. The deploy migrates the Lakebase schema before it starts the new app
+(see [Upgrading](docs/deploy.md#upgrading)).
 
 ## Use the app
 
@@ -139,8 +125,8 @@ The unit tests need no cluster or database. From the repository root:
 python3 -m venv .venv
 .venv/bin/pip install pytest httpx -r app/src/requirements.txt
 .venv/bin/pytest                              # every suite (test paths in pytest.ini)
-.venv/bin/pytest tests                        # the root implementation only
-.venv/bin/pytest job_orchestration/tests      # the job orchestration implementation only
+.venv/bin/pytest tests                        # the default version only
+.venv/bin/pytest job_orchestration/tests      # the legacy version only
 ```
 
 Some tests are skipped unless their outside system is given: the Postgres tests (`*_pg_test.py`) need
