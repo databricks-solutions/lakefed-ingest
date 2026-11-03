@@ -145,7 +145,7 @@ def test_an_unlisted_user_is_refused_plainly_when_the_access_list_cant_be_read(m
 
 
 def test_the_bundle_lists_the_deployer_as_the_apps_manager_by_default():
-    bundle = (Path(main.__file__).parent.parent / "databricks.yml").read_text()
+    bundle = (Path(main.__file__).resolve().parents[2] / "databricks.yml").read_text()
     app = (Path(main.__file__).parent.parent / "resources" / "lakefed_ingest_app.yml").read_text()
     assert "app_managers:" in bundle and "default: ${workspace.current_user.userName}" in bundle
     assert "- name: APP_MANAGERS\n            value: ${var.app_managers}" in app
