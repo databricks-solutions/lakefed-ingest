@@ -219,25 +219,55 @@ def _refuse_mixed_sinks(cur, rows):
                                  "a sink is either dedicated to one source table or shared by client_id")
 
 
-def _refuse_split_databases(cur, rows):
-    """After writing control rows, in the same transaction: refuse when a database they belong to would
-    have tables in more than one collection. Its run locks one collection, and the check job reads each
-    database once for its collection, so the database's other tables would be checked and ingested apart."""
+def _split_database_warnings(cur, rows) -> List[dict]:
+    """After writing control rows, in the same transaction: a warning, as a list of at most one, when a database they
+    belong to now has tables in more than one ingestion group. The write stands. A split database is checked and
+    loaded correctly (tests/split_database_test.py): each group asks it for changes to its own tables and loads only
+    those. What it costs is extra work on the source, which the warning names."""
     keys = sorted({q.database_key(r) for r in rows})
     if not keys:
-        return
+        return []
     cur.execute(q.split_databases_sql(), (keys,))
     split = cur.fetchall()
-    if split:
-        cur.execute(q.clash_jobs_sql(), (sorted({group for row in split for group in row[2]}),))
-        jobs = [{"id": row[0], "name": row[1]} for row in cur.fetchall()]
-        raise HTTPException(409, {"message": _split_message(split, [job["name"] for job in jobs]), "jobs": jobs})
+    if not split:
+        return []
+    cur.execute(q.clash_jobs_sql(), (sorted({group for row in split for group in row[2]}),))
+    jobs = [{"id": row[0], "name": row[1]} for row in cur.fetchall()]
+    return [_split_warning([{"database": row[1], "groups": list(row[2])} for row in split], jobs)]
+
+
+def _split_warning(databases: List[dict], jobs: List[dict]) -> dict:
+    """The warning for databases with tables in more than one group: its text, the databases with their groups, and
+    the live jobs holding those groups (each linked where the warning is shown)."""
+    split = [("", item["database"], item["groups"]) for item in databases]
+    return {"kind": SPLIT_DATABASE_WARNING, "message": _split_message(split, [job["name"] for job in jobs]),
+            "databases": databases, "jobs": jobs}
+
+
+SPLIT_DATABASE_WARNING = "split_database"
+
+
+def _merged_warnings(warnings: List[dict]) -> List[dict]:
+    """Split-database warnings of several transactions of one write (a large Create or Add writes a chunk of databases
+    at a time) as one warning naming every database and job once."""
+    databases: Dict[str, List[str]] = {}
+    jobs: Dict[object, dict] = {}
+    for warning in warnings:
+        for item in warning.get("databases", []):
+            databases[item["database"]] = sorted(set(databases.get(item["database"], [])) | set(item["groups"]))
+        for job in warning.get("jobs", []):
+            jobs.setdefault(job["id"], job)
+    if not databases:
+        return []
+    ordered_jobs = sorted(jobs.values(), key=lambda job: (str(job["name"]), str(job["id"])))
+    return [_split_warning([{"database": name, "groups": groups} for name, groups in sorted(databases.items())],
+                           ordered_jobs)]
 
 
 def _split_message(split, job_names=()) -> str:
-    """The refusal for databases with tables in more than one ingestion group: the one database and its groups, or the
-    first three databases and a count for the rest. When live jobs hold some of those groups, it names them too. Only
-    names already read are used; the write is rolled back."""
+    """The warning for databases with tables in more than one ingestion group: the one database and its groups, or the
+    first three databases and a count for the rest, the live jobs holding those groups when there are any, and what a
+    split costs on the source. Only names already read are used."""
     def first_three(names):
         shown = ", ".join(names[:3])
         return f"{shown} and {len(names) - 3} more" if len(names) > 3 else shown
@@ -247,12 +277,12 @@ def _split_message(split, job_names=()) -> str:
     if job_names:
         kind = "job" if len(job_names) == 1 else "jobs"
         holders = f" Some of these groups are in ingestion {kind} {first_three(job_names)}."
+    cost = ("Each group checks the database for changes to its own tables and loads only those, so each extra group "
+            "adds its own change queries on the server every cycle and more connections to it at once.")
     if len(databases) == 1:
-        return (f"Database {databases[0]} has tables in more than one ingestion group ({groups}).{holders} "
-                "Move all of its tables into one group. Nothing was written.")
+        return f"Database {databases[0]} has tables in more than one ingestion group ({groups}).{holders} {cost}"
     count, names = len(databases), first_three(databases)
-    return (f"{count} databases have tables in more than one ingestion group: {names}.{holders} "
-            "Move all of each database's tables into one group. Nothing was written.")
+    return f"{count} databases have tables in more than one ingestion group: {names}.{holders} {cost}"
 
 
 def _refuse_deleted_databases(cur, rows):
@@ -382,10 +412,10 @@ def _rewrite_rollups_for_groups(cur, groups) -> None:
         _rewrite_rollups(cur, cur.fetchall())
 
 
-def _apply_plans(cur, rows, plans, user, batch):
+def _apply_plans(cur, rows, plans, user, batch) -> List[dict]:
     """Write planned edits (queries.plan_edit) inside the caller's transaction: each changed field, its change log
-    line, a reseed where the plan needs one, then the mixed-sink and split-database checks over the rows as they
-    now are."""
+    line, a reseed where the plan needs one, then the mixed-sink check over the rows as they now are. Returns the
+    split-database warnings for the rows as they now are (_split_database_warnings)."""
     _refuse_connection_edits(rows, plans, cur=cur, user=user)
     by_id = {r["id"]: r for r in rows}
     before = [(by_id[p["id"]]["task_collection"], by_id[p["id"]].get("src_database")) for p in plans]
@@ -404,7 +434,7 @@ def _apply_plans(cur, rows, plans, user, batch):
     edited = [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans]
     _rewrite_rollups(cur, before + [(row["task_collection"], row.get("src_database")) for row in edited])
     _refuse_mixed_sinks(cur, edited)
-    _refuse_split_databases(cur, edited)
+    return _split_database_warnings(cur, edited)
 
 
 def _locked_rows(cur, ids):
@@ -2394,10 +2424,10 @@ def edit_job_table(job_id: int, body: JobTableEditRequest, request: Request):
             cur.connection.rollback()
             return {"summary": summary, "plans": plans[:200]}
         _lock_collections(cur, [r["task_collection"] for r in rows])
-        _apply_plans(cur, rows, plans, _user(request), uuid.uuid4().hex[:12])
+        warnings = _apply_plans(cur, rows, plans, _user(request), uuid.uuid4().hex[:12])
         _touch(cur, _user(request), [job_id])
         summary["applied"] = True
-        return {"summary": summary, "plans": plans[:200]}
+        return {"summary": summary, "plans": plans[:200], "warnings": warnings}
 
 
 class JobDatabasesRequest(BaseModel):
@@ -2479,7 +2509,7 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
                     _log_lines(cur, [(user, "enable" if enabled else "disable", i, None, "task_enabled", not enabled,
                                       enabled, None, batch) for i in ids])
             _refuse_mixed_sinks(cur, plan["new"])
-            _refuse_split_databases(cur, plan["new"])
+            warnings = _split_database_warnings(cur, plan["new"])
             if plan["new_groups"]:
                 _, members = _load_schedule(job_id, cur)
                 active = [m for m in members if m["removed_at"] is None]
@@ -2489,7 +2519,7 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
                     cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
             _touch(cur, user, [job_id])
             summary.update(applied=True, new_tables=len(written), skipped=len(plan["new"]) - len(written))
-            result = {"summary": summary}
+            result = {"summary": summary, "warnings": warnings}
             _task_written(cur, task_id, {**result, "new_groups": plan["new_groups"]}, job_id, len(plan["new"]))
         return {**result, "new_groups": plan["new_groups"]}
 
@@ -2665,11 +2695,11 @@ class JobTablesRequest(_TablesFrom):
 
 
 def _write_planned_tables(cur, job: dict, plan: dict, user: str, batch: str, progress=None,
-                          skip_taken: bool = False, reader: Optional[str] = None) -> List[tuple]:
+                          skip_taken: bool = False, reader: Optional[str] = None) -> Tuple[List[tuple], List[dict]]:
     """Inside the caller's transaction, with the job's groups locked: the plan's valid lines as control rows (each with
-    its change log line), their groups' run locks, the mixed-sink and split-database checks, and the job's new groups
-    as members with offsets. Returns the (row, id) pairs written; skip_taken leaves out a row whose target another
-    table writes, instead of refusing the lot."""
+    its change log line), their groups' run locks, the mixed-sink check, and the job's new groups as members with
+    offsets. Returns the (row, id) pairs written and the split-database warnings; skip_taken leaves out a row whose
+    target another table writes, instead of refusing the lot."""
     job_id = int(job["id"])
     _lock_collections(cur, plan["groups"])
     rows = [line["row"] for line in plan["lines"] if line["status"] == "valid"]
@@ -2680,7 +2710,7 @@ def _write_planned_tables(cur, job: dict, plan: dict, user: str, batch: str, pro
         _refuse_host_reads(rows, reader or user, {})
     written = _insert_controls(cur, rows, user, batch, skip_taken=skip_taken, progress=progress)
     _refuse_mixed_sinks(cur, [row for row, _ in written])
-    _refuse_split_databases(cur, [row for row, _ in written])
+    warnings = _split_database_warnings(cur, [row for row, _ in written])
     if plan["new_groups"]:
         _, members = _load_schedule(job_id, cur)
         active = [m for m in members if m["removed_at"] is None]
@@ -2688,7 +2718,7 @@ def _write_planned_tables(cur, job: dict, plan: dict, user: str, batch: str, pro
                            int(job["cadence_minutes"]), bool(job.get("stagger")), sch.start_minute(job))
         for g in plan["new_groups"]:
             cur.execute(q.insert_member_sql(), (job_id, g, offs[g]))
-    return written
+    return written, warnings
 
 
 @app.post("/api/ingestion-jobs/{job_id}/tables")
@@ -2771,12 +2801,12 @@ def _add_job_tables(job_id: int, body: "JobTablesRequest", request: Request, inl
             summary = nj.summary(plan)
             if summary["invalid"]:
                 return {"summary": summary, "applied": False, "new_groups": []}
-            written = _write_planned_tables(cur, job, plan, user, batch, progress=progress)
+            written, warnings = _write_planned_tables(cur, job, plan, user, batch, progress=progress)
             if explicit:
                 cur.execute(q.clear_exclusions_sql(), (table_removal.line_keys(plan["lines"]), int(job_id)))
             _keep_selection(cur, job_id, selected, user)
             _touch(cur, user, [job_id])
-            result = {"summary": summary, "applied": True}
+            result = {"summary": summary, "applied": True, "warnings": warnings}
             _task_written(cur, task_id, {**result, "new_groups": plan["new_groups"]}, job_id, len(written))
         return {**result, "new_groups": plan["new_groups"]}
 
@@ -3110,10 +3140,10 @@ def add_table(row: dict, request: Request):
         new_id = cur.fetchone()[0]
         _rewrite_rollups(cur, [(row.get("task_collection"), row.get("src_database"))])
         _refuse_mixed_sinks(cur, [row])
-        _refuse_split_databases(cur, [row])
+        warnings = _split_database_warnings(cur, [row])
         _log(cur, _user(request), "add", new_id, row.get("task_collection"))
         _touch(cur, _user(request), groups=[row.get("task_collection")])
-    return {"id": new_id}
+    return {"id": new_id, "warnings": warnings}
 
 
 @app.get("/api/tables/{control_id}")
@@ -3157,10 +3187,10 @@ def edit_tables(body: EditRequest, request: Request):
                 return {"summary": summary, "plans": plans}
             _recheck_locked_rows(rows, checked, request)
             _lock_collections(cur, [r["task_collection"] for r in rows] + ([new_coll] if new_coll else []))
-            _apply_plans(cur, rows, plans, _user(request), batch)
+            warnings = _apply_plans(cur, rows, plans, _user(request), batch)
             _touch(cur, _user(request), groups=[r["task_collection"] for r in rows] + [new_coll])
             summary["applied"] = True
-            return {"summary": summary, "plans": plans}
+            return {"summary": summary, "plans": plans, "warnings": warnings}
     except psycopg.errors.UniqueViolation:
         raise HTTPException(409, "another control row already writes that sink (or that sink and client_id); "
                                  "nothing was changed")
@@ -4192,6 +4222,7 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
             results.append({"table": name, "status": "invalid", "errors": errs})
         else:
             valid.append((name, row))
+    warnings: List[dict] = []
     if not body.dry_run and valid:
         _refuse_groups_outside_jobs([body.task_collection])
         _refuse_groups([body.task_collection], request)
@@ -4212,14 +4243,14 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
                                 "errors": [] if res else ["sink already used by another control row"]})
             _rewrite_rollups(cur, [(row.get("task_collection"), row.get("src_database")) for _, row in valid])
             _refuse_mixed_sinks(cur, [row for _, row in valid])     # all or nothing, like an edit
-            _refuse_split_databases(cur, [row for _, row in valid])
+            warnings = _split_database_warnings(cur, [row for _, row in valid])
             _touch(cur, _user(request), groups=[body.task_collection])
     else:
         results += [{"table": name, "status": "valid", "errors": []} for name, _ in valid]
     counts = {}
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
-    return {"selected": len(chosen), "counts": counts, "results": results}
+    return {"selected": len(chosen), "counts": counts, "results": results, "warnings": warnings}
 
 
 # ---- configuration import ----------------------------------------------------------------------
@@ -4260,6 +4291,7 @@ def import_csv(body: ImportRequest, request: Request):
             counts[line["status"]] = counts.get(line["status"], 0) + 1
         return counts
 
+    warnings: List[dict] = []
     if body.dry_run:
         plan = planned(db.query(q.collection_control_rows_sql(), (group,)))
     else:
@@ -4290,10 +4322,10 @@ def import_csv(body: ImportRequest, request: Request):
             imported = [line["row"] for line in plan["lines"] if line["status"] == "imported"]
             _rewrite_rollups(cur, [(row.get("task_collection"), row.get("src_database")) for row in imported])
             _refuse_mixed_sinks(cur, imported)
-            _refuse_split_databases(cur, imported)
+            warnings = _split_database_warnings(cur, imported)
             _touch(cur, _user(request), groups=[group])
     return {"task_collection": group, "settings": plan["settings"], "counts": counted(plan["lines"]),
-            "lines": [{k: v for k, v in line.items() if k != "row"} for line in plan["lines"]]}
+            "lines": [{k: v for k, v in line.items() if k != "row"} for line in plan["lines"]], "warnings": warnings}
 
 
 @app.get("/api/collections/{name}/settings")
@@ -4668,12 +4700,12 @@ def _schedule_create_line(job: ChunkJob, group: str) -> tuple:
     return (job.user, "schedule_create", None, group, "schedule", None, f"{job.name} ({described})", None, job.batch)
 
 
-def _write_chunk(cur, plans: List[dict], job: ChunkJob, state: dict) -> None:
+def _write_chunk(cur, plans: List[dict], job: ChunkJob, state: dict) -> List[dict]:
     """The writes of one transaction, for the databases of a chunk (their plans), in the caller's transaction: each
     group's run lock once, the valid lines the chunk's databases do not have yet (a resumed write skips the rows a
     committed transaction wrote; a table the job already writes is left) with their change log lines in one statement,
-    the mixed and split checks once, the members its groups are missing, and the task's progress. The tables counted
-    are the valid lines reached, so a resumed write reports the whole."""
+    the mixed-sink check once, the members its groups are missing, and the task's progress. The tables counted are the
+    valid lines reached, so a resumed write reports the whole. Returns the chunk's split-database warnings."""
     groups = sorted({group for plan in plans for group in plan["groups"]})
     _lock_collections_together(cur, groups)
     lines = [(line, line["row"]) for plan in plans for line in plan["lines"] if line["status"] == "valid"]
@@ -4693,7 +4725,9 @@ def _write_chunk(cur, plans: List[dict], job: ChunkJob, state: dict) -> None:
             _refuse_job_rows(todo, job.connection, job.user, cur=cur)
         _insert_controls(cur, todo, job.user, job.batch, log_per_statement=by_database.TABLES_PER_TRANSACTION)
         _refuse_mixed_sinks(cur, todo)
-        _refuse_split_databases(cur, todo)
+        warnings = _split_database_warnings(cur, todo)
+    else:
+        warnings = []
     if groups:
         cur.execute(q.insert_members_if_absent_sql(),
                     (job.sid, groups, [job.offsets.get(group, 0) for group in groups]))
@@ -4704,6 +4738,7 @@ def _write_chunk(cur, plans: List[dict], job: ChunkJob, state: dict) -> None:
     state["tables_written"] += len(lines)
     state["seconds"] = job.stages.seconds()
     cur.execute(q.task_progress_json_sql(), (json.dumps(state), state["tables_written"], job.task_id))
+    return warnings
 
 
 def _rows_of_units(kind, param, units: List) -> List[Tuple[object, List[dict]]]:
@@ -4838,13 +4873,15 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
                 raise HTTPException(409, f"an ingestion job named '{name}' already exists")
         job = ChunkJob(sid=sid, name=name, user=user, batch=batch, cadence_minutes=run.cadence_minutes,
                        timezone=timezone_, offsets=offs, task_id=task_id, stages=stages, connection=connection)
+        warnings: List[dict] = []
         for chunk in by_database.transactions_of(counted):
             plans = [checked.plan for checked in chunk] if keep else [
                 plan_of(rows, own, stages) for _, rows in read_of([checked.unit for checked in chunk], stages) if rows]
             if plans:
                 with _write() as cur:
-                    _write_chunk(cur, plans, job, state)
-        result = {"id": sid, "summary": summary, "settings": settings, "created": True}
+                    warnings += _write_chunk(cur, plans, job, state)
+        result = {"id": sid, "summary": summary, "settings": settings, "created": True,
+                  "warnings": _merged_warnings(warnings)}
         with _write() as cur:
             _task_written(cur, task_id, result, sid, state["tables_written"])
         return result
@@ -4969,19 +5006,20 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
         chunk_job = ChunkJob(sid=job_id, name=job["name"], user=user, batch=batch,
                              cadence_minutes=int(job["cadence_minutes"]), timezone=job["timezone"], offsets=offs,
                              task_id=task_id, stages=stages, log_members=False, connection=connection)
+        warnings: List[dict] = []
         for chunk in by_database.transactions_of(counted):
             plans = ([checked.plan for checked in chunk] if keep
                      else plans_of([checked.unit for checked in chunk], stages))
             if plans:
                 with _write() as cur:
                     _lock_job(cur, job_id)
-                    _write_chunk(cur, plans, chunk_job, state)
+                    warnings += _write_chunk(cur, plans, chunk_job, state)
                     if explicit:
                         cur.execute(q.clear_exclusions_sql(),
                                     (table_removal.line_keys([line for plan in plans for line in plan["lines"]]),
                                      int(job_id)))
         result = {"summary": {**found, "tables": state["tables_written"], "by_database": True, "checked": True},
-                  "applied": True, "databases": state["databases_written"]}
+                  "applied": True, "databases": state["databases_written"], "warnings": _merged_warnings(warnings)}
         with _write() as cur:
             _keep_selection(cur, job_id, {"parts": parts, "kind": kind, "source_id": source_id}, user)
             _touch(cur, user, [job_id])
@@ -5198,7 +5236,7 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
                 sid = cur.fetchone()[0]
                 _insert_controls(cur, rows, user, batch, progress=progress)
                 _refuse_mixed_sinks(cur, rows)
-                _refuse_split_databases(cur, rows)
+                warnings = _split_database_warnings(cur, rows)
                 for group in plan["groups"]:
                     cur.execute(q.insert_member_sql(), (sid, group, offs[group]))
                 _log_lines(cur, [(user, "schedule_create", None, group, "schedule", None,
@@ -5206,7 +5244,8 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
                                  for group in plan["groups"]])
                 _keep_selection(cur, sid, selected, user)
                 _touch(cur, user, [sid])
-                result = {"id": sid, "summary": summary, "settings": plan["settings"], "created": True}
+                result = {"id": sid, "summary": summary, "settings": plan["settings"], "created": True,
+                          "warnings": warnings}
                 _task_written(cur, task_id, result, sid, len(rows))
         except psycopg.errors.UniqueViolation:
             raise HTTPException(409, f"an ingestion job named '{name}' already exists")
@@ -6241,6 +6280,7 @@ def _prepare_write(sid: int, task_id: int, owner: str, held: threading.Event, jo
         try:
             with _write() as cur:
                 _prepare_fence(cur, sid, task_id, owner)
+                # A preparation has no page waiting for its answer: the job page's tree flags a split database instead.
                 _write_chunk(cur, [plan for _, plan in pairs], chunk_job, state)
                 _move_prepare(sid, progress={"tables_written": state["tables_written"], "tables_total": total,
                                              "percent": preparing.percent(state["tables_written"], total)}, cur=cur)
@@ -7151,11 +7191,12 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
                                    "ct", job_rows, None, taken, unity_catalog=_unity_catalog(job))
             if plan["errors"]:
                 raise HTTPException(422, {"errors": plan["errors"]})
-            written = _write_planned_tables(cur, job, plan, user, batch, skip_taken=True,
-                                            reader=job.get("created_by") or "")
+            written, warnings = _write_planned_tables(cur, job, plan, user, batch, skip_taken=True,
+                                                      reader=job.get("created_by") or "")
             if written:
                 _touch(cur, user, [sid])
             outcome["added"] = len(written)
+            outcome["warnings"] = warnings
             outcome["skipped"] = len(picked["add"]) - len(written)
             outcome["skipped_tables"] = [{"table": line["table"], "errors": line["errors"]}
                                          for line in plan["lines"] if line["status"] == "invalid"][:limit]

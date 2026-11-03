@@ -118,7 +118,7 @@ def _write_job(cur, plan: dict, selected: dict, name: str, user: str, batch: str
     schedule_id = cur.fetchone()[0]
     app._insert_controls(cur, rows, user, batch)
     app._refuse_mixed_sinks(cur, rows)
-    app._refuse_split_databases(cur, rows)
+    app._split_database_warnings(cur, rows)
     for group in plan["groups"]:
         cur.execute(q.insert_member_sql(), (schedule_id, group, 0))
     app._log_lines(cur, [(user, "schedule_create", None, group, "schedule", None, name, None, batch)
@@ -275,7 +275,7 @@ def create_by_database(catalog: server_catalog.ServerCatalog) -> ByDatabaseRun:
                     rows_todo = [line["row"] for line in plan["lines"]]
                     app._insert_controls(cur, rows_todo, SCALE_USER, SCALE_BATCH)
                     app._refuse_mixed_sinks(cur, rows_todo)
-                    app._refuse_split_databases(cur, rows_todo)
+                    app._split_database_warnings(cur, rows_todo)
                     for group in database_groups:
                         cur.execute(q.insert_member_if_absent_sql(), (schedule_id, group, 0))
                         if cur.fetchone():

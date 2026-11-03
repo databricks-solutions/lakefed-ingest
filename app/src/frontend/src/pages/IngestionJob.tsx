@@ -1,6 +1,6 @@
 import { Fragment, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type ApiError, type Row } from "../api";
 import { Refused } from "../permissions";
 import { changeInProgress, deleteNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, runButton, runTimeoutNotice,
@@ -11,7 +11,7 @@ import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { FailingTables } from "./FailingTables";
 import { RunningTasks } from "./tasks";
-import { Busy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateSummary, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest, Twisty } from "../components";
+import { Busy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateSummary, WriteWarnings, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest, Twisty } from "../components";
 
 const PAGE = 25;
 
@@ -278,6 +278,8 @@ function TargetNames({ jobId, stored, onClose }: { jobId: string; stored: Row; o
 export default function IngestionJob() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
+  // The warnings of the Create that landed here (NewJob.tsx), shown once, where the Create ends.
+  const createWarnings: Row[] = ((useLocation().state as Row | null)?.warnings ?? []) as Row[];
   const [pages, setPages] = useState<string[]>([]);
   const before = pages[pages.length - 1];
   const qc = useQueryClient();
@@ -371,6 +373,7 @@ export default function IngestionJob() {
       {j && <p className="muted small">Created by {j.created_by ?? "unknown"}{j.created_at ? `, ${fmtTime(j.created_at)}` : ""} ·
         Last updated by {j.updated_by ?? "unknown"}{j.updated_at ? `, ${fmtTime(j.updated_at)}` : ""}</p>}
       {confirm.dialog}
+      <WriteWarnings warnings={createWarnings} />
       <RunningTasks jobId={id} />
       {j?.prepare && j.prepare.state !== "ready" && !j.delete
         && <Preparation jobId={id} deleteRefusal={j.delete_blocked} onDelete={() => setDeleting(true)} />}
@@ -493,6 +496,7 @@ function RediscoveryLast({ last }: { last: Row }) {
         {errors.length > 0 && <li>Could not be read: {errors.join("; ")}</li>}
         {skipped.length > 0 && <li>Not added: {skipped.map((s) => `${s.table} (${(s.errors ?? []).join(", ")})`).join("; ")}</li>}
       </ul>}
+      {last.status === "done" && <WriteWarnings warnings={last.warnings} />}
     </div>
   );
 }

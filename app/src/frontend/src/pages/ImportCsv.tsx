@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
-import { ConfirmButton, ErrorBox, PageHead, Section, Tag, ToastOn, fmtInt, plural } from "../components";
+import { ConfirmButton, ErrorBox, PageHead, Section, Tag, ToastOn, WriteWarnings, fmtInt, plural } from "../components";
 import { groupsRefusal, usePermissions } from "../permissions";
 
 /** The group settings the import fills each row with, in the order config_import.SETTINGS gives them. */
@@ -113,6 +113,7 @@ export default function ImportCsv() {
         </div>
         {locked && <p className="muted small">Import: {locked}.</p>}
         <ErrorBox error={preview.error ?? apply.error} />
+        <WriteWarnings warnings={apply.data?.warnings} />
         <ToastOn text={apply.data ? `Imported ${fmtInt(counts.imported ?? 0)} ${plural(counts.imported ?? 0, "table")} into ${apply.data.task_collection}`
           + (counts.skipped ? `; ${fmtInt(counts.skipped)} skipped (already registered)` : "") : null} />
       </Section>

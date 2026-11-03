@@ -475,27 +475,32 @@ def test_tables_come_a_page_at_a_time_with_the_cursor_of_the_next(monkeypatch):
 
 
 
-# ---- a database's tables share one collection ------------------------------------------------------
+# ---- a database split over more than one collection is written, with a warning --------------------------
 
-def test_adding_a_table_that_would_put_its_database_in_a_second_collection_is_refused(client):
-    assert client.post("/api/tables", json=ROW).status_code == 200
+def test_adding_a_table_that_puts_its_database_in_a_second_collection_is_written_with_a_warning(client):
+    first = client.post("/api/tables", json=ROW)
+    assert first.status_code == 200 and first.json()["warnings"] == []
     assert client.db.of(q.split_databases_sql()) == [([q.database_key(ROW)],)]
     client.db.split = {q.database_key(ROW)}
     r = client.post("/api/tables", json=ROW)
-    assert r.status_code == 409 and "db1" in r.json()["detail"]["message"] and "c1, c2" in r.json()["detail"]["message"]
+    assert r.status_code == 200 and r.json()["id"]
+    [warning] = r.json()["warnings"]
+    assert warning["kind"] == "split_database" and warning["databases"] == [{"database": "db1", "groups": ["c1", "c2"]}]
+    assert "db1" in warning["message"] and "c1, c2" in warning["message"]
 
 
-def test_moving_some_of_a_databases_tables_to_another_collection_is_refused(client):
+def test_moving_some_of_a_databases_tables_to_another_collection_is_applied_with_a_warning(client):
     client.db.split = {q.database_key(CONTROL[7])}
     r = client.post("/api/tables/edit", json={"ids": [7], "changes": {"task_collection": "c2"}, "dry_run": False})
-    assert r.status_code == 409 and "more than one ingestion group" in r.json()["detail"]["message"]
+    assert r.status_code == 200 and r.json()["summary"]["applied"] is True
+    assert "more than one ingestion group" in r.json()["warnings"][0]["message"]
 
 
-def test_registering_tables_into_another_collection_than_their_database_is_refused(client):
+def test_registering_tables_into_another_collection_than_their_database_is_written_with_a_warning(client):
     body = {"task_collection": "c9", "shared": {"sink_schema": "bronze"}}
     client.db.split = {q.database_key(dict(DISCOVERED[0], task_collection="c9"))}
     r = client.post("/api/discoveries/d1/register", json=body)
-    assert r.status_code == 409 and "db1" in r.json()["detail"]["message"]
+    assert r.status_code == 200 and "db1" in r.json()["warnings"][0]["message"]
 
 
 
