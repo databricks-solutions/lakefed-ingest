@@ -6,7 +6,7 @@ import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
 import { CreateConnectionChoices } from "./CreateConnectionChoices";
 import { accessOf, countsText, likeContaining, readable, selectionCounts, serverRowPick, underFilter, type Pick, type ServerCount } from "./pickState";
-import { connectionFailure, connectionNextBlock, connectionNextLabel, readsDone, waitLine, type ErrorCodes } from "../pending";
+import { connectionFailure, connectionNextBlock, connectionNextLabel, MASTER_ACCESS, readsDone, waitLine, type ErrorCodes } from "../pending";
 
 // Add tables, Discover on a source: as Lakeflow Connect's Connection and Source steps. Step 1 is the Unity Catalog
 // connection, tested by Next before anything is discovered; step 2 picks the whole server, whole databases or single tables in
@@ -137,17 +137,16 @@ export function TriBox({ pick, label, onClick }: { pick: Pick; label: string; on
 /** A test that failed because the login can't open master, where SQL Server lists its databases. */
 const cantList = (error: unknown) => /FAILED_JDBC\.CONNECTION|Login failed|Cannot open database|HV000/i.test(String((error as Error)?.message ?? error));
 
-/** A failed connection test: its codes, the source's message and what to do. When the login may not open master, the
- *  databases can still be typed below. */
+/** A failed connection test: its codes, the source's message and what to do. When the login may not open master, it
+ *  needs the access Lakeflow Connect asks for, or the databases can be typed below. */
 function TestFailed({ error }: { error: unknown }) {
   const failure = connectionFailure(String((error as Error)?.message ?? error), (error as SourceError)?.codes);
   return <Notice tone="bad">
     <p><b>The connection failed its test</b>{failure.code && <>: <span className="mono">{failure.code}</span></>}</p>
     <p className="mono">{failure.message}</p>
     <p>{failure.hint}</p>
-    {cantList(error) && failure.code !== "SQL Server error 4060" && <p>If the login can't open master, where the server lists its
-      databases, they may still be readable through the connection: type them below. Or give the login a user in master (VIEW ANY
-      DATABASE) and test again.</p>}</Notice>;
+    {cantList(error) && failure.code !== "SQL Server error 4060" && <p>The login may not be able to open master, where the
+      server lists its databases. {MASTER_ACCESS} Then test again, or type the databases below.</p>}</Notice>;
 }
 
 /** The databases typed by hand, for a login that can't list the server's. */

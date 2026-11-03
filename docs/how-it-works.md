@@ -386,8 +386,10 @@ recommended settings (load type from Change Tracking / rowversion / primary key,
 column), into Lakebase, for the app's Bulk import page, or, without the app, for you to query `discovered_table`
 and insert control rows yourself. Check constraints reject invalid combinations (e.g.
 `ct` on a non-SQL Server source). See `notebooks/load_control_example.ipynb`.
-A whole server's databases are listed through `master` (the spec's `pattern` is a LIKE filter).
-Databases named in the spec are read by name and never need `master`.
+A whole server's databases are listed through `master` (the spec's `pattern` is a LIKE filter), so the login needs
+the access Lakeflow Connect asks of its SQL Server database user ("Microsoft SQL Server database user requirements"):
+`VIEW ANY DATABASE` and `SELECT` on `sys.databases` in `master`, or on Azure SQL Database membership in the
+`##MS_DatabaseConnector##` server role. Databases named in the spec are read by name and never need `master`.
 
 **Schema changes.** Writes use schema evolution. Adding a column to `select_list` adds it to the
 sink and reseeds that table so historical rows are backfilled. With the job parameter

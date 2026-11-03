@@ -113,7 +113,9 @@ def test_the_backend_names_the_databricks_job():
 
 def test_discover_says_when_the_login_cant_open_master_and_takes_typed_databases():
     discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
-    assert "If the login can't open master" in discover and "VIEW ANY" in discover
+    pending = (FRONTEND / "pending.ts").read_text()
+    assert "The login may not be able to open master" in discover and "{MASTER_ACCESS}" in discover
+    assert "VIEW ANY DATABASE" in pending and "##MS_DatabaseConnector##" in pending and "sys.databases" in pending
     assert "function TypedDatabases" in discover and "Databases typed by hand are read by name" in discover
 
 
