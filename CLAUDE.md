@@ -131,7 +131,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   With `runs_by` `changes` (`group`, the default until its lab proof, keeps one run per collection with work)
   the cycle is shared out by its changes (`initial_check.plan_cycle`, `launcher.cycle_requests`): each database's
   tables with work (`check_collection`'s `weights`), as many runs as those tables over the job's group size (its tables over its
-  groups, `group_size_of`), each database whole on one run, a collection with a first load on a run of its own.
+  groups, `group_size_of`), each collection's part of a database whole on one run (a database split over collections
+  is one part per collection, checked, locked and stamped per collection), a collection with a first load on a run of
+  its own.
   The check then holds each collection shared and each database it checks exclusively (`share_locks`), leaving out
   the databases a run still holds; a database a run going was given waits for it (`deferred`). A run spanning
   collections gets `task_collection` blank and its `work_id`: `ingest.ipynb` takes its collections in turn on its

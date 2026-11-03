@@ -1,10 +1,18 @@
 """Which group each database of a job goes to. A server gets one group for about every tables-per-group of its tables
 (the job's own, or TABLES_PER_GROUP), with no group of its own for a small remainder, or a number of groups an older
-caller sets. Its databases are spread
-so each group has about the same number of tables: the biggest first, each into the group with the fewest tables so
-far. A database is never split: all its tables are in one group. Databases added to a job later each join their
-server's group with the fewest tables at that time, and nothing already placed moves. Pure, so it is tested without a
-database."""
+caller sets. Its databases are spread so each group has about the same number of tables: the biggest first, each into
+the group with the fewest tables so far.
+
+A database that fits in a group goes whole into one group. A database with more tables than a group holds (by the same
+rule: more than the tables per group, plus a small remainder) is spread over as many groups as it needs, as evenly as
+possible: its tables, in name order, are cut into that many parts that differ by at most one table, each part into one
+of the groups with the fewest tables. Each group then checks the database for changes to its own tables and loads only
+those, which costs more queries and connections on its server (tests/split_database_test.py proves the loads stay
+right). A job sized by a number of groups (an older caller) keeps every database whole.
+
+Databases added to a job later each join their server's group with the fewest tables at that time (a database too big
+for one group, the groups with the fewest), and nothing already placed moves. A regroup moves each part of a split
+database as a unit of its own. Pure, so it is tested without a database."""
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
@@ -48,39 +56,87 @@ def sizing(groups_per_server: Optional[int], tables_per_group: Optional[int], jo
     return TablesPerGroup(int(size)) if size else None
 
 
-def even(databases: Iterable[Tuple[str, int]], groups: int) -> Dict[str, int]:
+def split_size(groups: Groups = None) -> Optional[int]:
+    """The tables per group a database is measured against to decide whether it is spread over several groups: the
+    job's own size, or TABLES_PER_GROUP by default. None for a job sized by a number of groups (an older caller's
+    groups_per_server), whose databases always stay whole."""
+    if isinstance(groups, TablesPerGroup):
+        return int(groups.tables)
+    return None if groups else TABLES_PER_GROUP
+
+
+def parts_for(tables: int, per_group: Optional[int], groups: int) -> int:
+    """How many groups a database's tables go to: one while it fits in a group (groups_for_tables' rule, a small
+    remainder included), else as many as its tables need, never more than the server has groups."""
+    if not per_group:
+        return 1
+    return max(1, min(int(groups), groups_for_tables(tables, per_group)))
+
+
+def part_of(ordinal: int, tables: int, parts: int) -> int:
+    """Which part, from 0, the table at ``ordinal`` (its place among the database's tables in name order, from 0) is in,
+    when ``tables`` tables are cut into ``parts`` parts that differ by at most one table."""
+    return min(parts - 1, int(ordinal) * int(parts) // max(1, int(tables)))
+
+
+def part_sizes(tables: int, parts: int) -> List[int]:
+    """The tables in each part, as part_of cuts them."""
+    sizes = [0] * max(1, int(parts))
+    for ordinal in range(int(tables)):
+        sizes[part_of(ordinal, tables, len(sizes))] += 1
+    return sizes
+
+
+# Where a database goes: one group's index, or for a spread database the indexes of its groups, its first part first.
+Place = Union[int, Tuple[int, ...]]
+
+
+def indexes(place: Place) -> Tuple[int, ...]:
+    """A placement's group indexes, one for a database that goes whole."""
+    return tuple(place) if isinstance(place, tuple) else (int(place),)
+
+
+def even(databases: Iterable[Tuple[str, int]], groups: int, per_group: Optional[int] = None) -> Dict[str, Place]:
     """{database name, lower case: its group's index, from 0}, for a new job's databases of one server, given as
     (name, tables). The biggest database goes first, each into the group with the fewest tables so far, the lowest
-    index on a tie, so the same databases always land the same way (a resumed Create places them again identically)."""
+    index on a tie, so the same databases always land the same way (a resumed Create places them again identically).
+    With ``per_group`` (split_size), a database with more tables than a group holds gets the indexes of the groups its
+    parts go to instead (parts_for), the groups with the fewest tables, in index order."""
     sizes: Dict[str, int] = {}
     for name, tables in databases:
         key = str(name or "").lower()
         sizes[key] = sizes.get(key, 0) + int(tables or 0)
     loads = [0] * max(1, int(groups))
-    out: Dict[str, int] = {}
+    out: Dict[str, Place] = {}
     for name, tables in sorted(sizes.items(), key=lambda item: (-item[1], item[0])):
-        index = min(range(len(loads)), key=lambda i: (loads[i], i))
-        out[name] = index
-        loads[index] += tables
+        parts = parts_for(tables, per_group, len(loads))
+        lightest = sorted(sorted(range(len(loads)), key=lambda i: (loads[i], i))[:parts])
+        for index, share in zip(lightest, part_sizes(tables, parts)):
+            loads[index] += share
+        out[name] = lightest[0] if parts == 1 else tuple(lightest)
     return out
 
 
-def server_placements(rows: Iterable[Tuple[str, str, int]], groups: Dict[str, int]) -> Dict[str, Dict[str, int]]:
+def server_placements(rows: Iterable[Tuple[str, str, int]], groups: Dict[str, int],
+                      per_group: Optional[int] = None) -> Dict[str, Dict[str, Place]]:
     """{server: even placement of its databases}, from (server, database, tables) rows and {server: its groups}."""
     by_server: Dict[str, List[Tuple[str, int]]] = {}
     for server, database, tables in rows:
         by_server.setdefault(server, []).append((database, tables))
-    return {server: even(databases, groups.get(server, 1)) for server, databases in by_server.items()}
+    return {server: even(databases, groups.get(server, 1), per_group) for server, databases in by_server.items()}
 
 
 class Lightest:
     """Places the databases added to an existing job: each new one joins its server's group with the fewest tables now
     (the first by name on a tie), and every table of it counts there, so the next new database sees it. place() is
-    called once per table, as a plan reads its lines; a database already placed keeps its group."""
+    called once per table, as a plan reads its lines; a database already placed keeps its group. A database with more
+    tables than a group holds (per_group, split_size) is placed once, whole, by spread() instead."""
 
-    def __init__(self, tables_by_group: Dict[str, Dict[str, int]]):
+    def __init__(self, tables_by_group: Dict[str, Dict[str, int]], per_group: Optional[int] = None):
         self._loads = {server: dict(groups) for server, groups in tables_by_group.items()}
         self._placed: Dict[Tuple[str, str], str] = {}
+        self._spread: Dict[Tuple[str, str], List[str]] = {}
+        self.per_group = per_group
 
     def knows(self, server: str) -> bool:
         return bool(self._loads.get(server))
@@ -98,6 +154,30 @@ class Lightest:
             self._placed[key] = group
         loads[group] += tables
         return group
+
+    def parts(self, server: str, tables: int) -> int:
+        """How many of the server's groups a new database with ``tables`` tables needs (parts_for); 1 when it fits."""
+        return parts_for(tables, self.per_group, len(self._loads.get(server) or {}) or 1)
+
+    def spread(self, server: str, database: str, tables: int) -> Optional[List[str]]:
+        """The groups of a new database with ``tables`` tables, its first part first: the server's groups with the
+        fewest tables now, as many as it needs (parts_for), each counting its part. One group for a database that fits,
+        as place() gives it. None when the server has no group in the job yet. A database spread already keeps its
+        groups."""
+        loads = self._loads.get(server)
+        if not loads:
+            return None
+        key = (server, str(database or "").lower())
+        if key in self._spread:
+            return self._spread[key]
+        parts = parts_for(tables, self.per_group, len(loads))
+        if parts == 1:
+            return [self.place(server, database, tables)]
+        chosen = sorted(sorted(sorted(loads), key=lambda name: loads[name])[:parts])
+        for group, share in zip(chosen, part_sizes(tables, parts)):
+            loads[group] += share
+        self._spread[key] = chosen
+        return chosen
 
 
 def _group_number(name: str) -> Optional[int]:

@@ -2538,11 +2538,22 @@ class JobGroupsRequest(BaseModel):
 def _regroup_plan(job_name: str, rows: List[dict], groups_per_server: Optional[int]) -> dict:
     """What a new number of groups per server does to a job, server by server (placement.regroup): a server whose
     number is unchanged is left alone. Returns {"servers": a line per server, "moves": [(control id, group before,
-    group after, src_database)], "new": groups made, "emptied": groups left with no table, "summary"}."""
+    group after, src_database)], "new": groups made, "emptied": groups left with no table, "summary"}. A database whose
+    tables are in more than one group (a split one) moves part by part: each of its groups' tables is a unit of its
+    own (_regroup_unit), so a regroup never gathers a split database into one group unasked."""
+    groups_of_database: Dict[Tuple[str, str], set] = {}
+    for r in rows:
+        groups_of_database.setdefault((js.server_of(r), str(r.get("src_database") or "").lower()), set()).add(
+            r["task_collection"])
+
+    def unit_of(r) -> str:
+        server, database = js.server_of(r), str(r.get("src_database") or "").lower()
+        return _regroup_unit(database, r["task_collection"], len(groups_of_database[(server, database)]) > 1)
+
     by_server: Dict[str, Dict[str, Tuple[str, int]]] = {}
     for r in rows:
         databases = by_server.setdefault(js.server_of(r), {})
-        key = str(r.get("src_database") or "").lower()
+        key = unit_of(r)
         group, tables = databases.get(key, (r["task_collection"], 0))
         databases[key] = (group, tables + 1)
     servers, target, new, emptied = [], {}, [], []
@@ -2551,25 +2562,35 @@ def _regroup_plan(job_name: str, rows: List[dict], groups_per_server: Optional[i
         now = sorted({group for group, _ in databases.values()})
         tables = sum(n for _, n in databases.values())
         count = placement.group_count(tables, groups_per_server)
-        line = {"server": server, "databases": len(databases), "tables": tables, "groups_before": len(now),
-                "groups_after": count, "databases_moving": 0, "tables_moving": 0}
+        line = {"server": server, "databases": len({name.split(REGROUP_PART)[0] for name in databases}),
+                "tables": tables, "groups_before": len(now), "groups_after": count, "databases_moving": 0,
+                "tables_moving": 0}
         if count != len(now):
             plan = placement.regroup(f"{q.identifier(job_name)}_{q.identifier(server)}", databases, count)
             target.update({(server, name): group for name, group in plan["group_of"].items()})
             new += plan["new"]
             emptied += plan["emptied"]
-            line.update(databases_moving=len(plan["moves"]),
+            line.update(databases_moving=len({name.split(REGROUP_PART)[0] for name in plan["moves"]}),
                         tables_moving=sum(databases[name][1] for name in plan["moves"]))
         servers.append(line)
     moves = []
     for r in rows:
-        after = target.get((js.server_of(r), str(r.get("src_database") or "").lower()))
+        after = target.get((js.server_of(r), unit_of(r)))
         if after and after != r["task_collection"]:
             moves.append((r["id"], r["task_collection"], after, r.get("src_database") or ""))
     summary = {"servers": servers, "databases_moving": sum(line["databases_moving"] for line in servers),
                "tables_moving": len(moves), "new_groups": sorted(new), "emptied_groups": sorted(emptied),
                "unchanged": not moves and not new and not emptied, "applied": False}
     return {"servers": servers, "moves": moves, "new": sorted(new), "emptied": sorted(emptied), "summary": summary}
+
+
+# Between a split database's name and its group in the name of one of its parts, as a regroup moves it.
+REGROUP_PART = "\x1f"
+
+
+def _regroup_unit(database: str, group: str, split: bool) -> str:
+    """What a regroup moves as one: a database, or one group's part of a database split over several."""
+    return f"{database}{REGROUP_PART}{group}" if split else database
 
 
 def _regroup_blocker(job: dict, members: List[dict]) -> Optional[str]:
@@ -2586,8 +2607,8 @@ def _regroup_blocker(job: dict, members: List[dict]) -> Optional[str]:
 @app.post("/api/ingestion-jobs/{job_id}/groups")
 def regroup_job(job_id: int, body: JobGroupsRequest, request: Request):
     """Preview (dry_run, the default) or apply a new number of groups per server for a job. Each server's databases are
-    spread again over its new number of groups, moving as few as can be (placement.regroup); a database is never
-    split. Applying is one transaction under the job's schedule lock and every group's run lock: the moved tables'
+    spread again over its new number of groups, moving as few as can be (placement.regroup); a split database moves
+    part by part, and a regroup splits none. Applying is one transaction under the job's schedule lock and every group's run lock: the moved tables'
     control rows, their databases' check stamps, the rollups of both groups, the job's members (new groups added,
     emptied ones removed) and a change log line per table; then the job's Databricks jobs are synced. Each table keeps
     its checkpoint (by control id), so nothing reloads. Refused while a run or a write of the job is going."""
@@ -4811,7 +4832,7 @@ def _create_by_database(body: NewJobRequest, request: Request, selection: Select
 
     sizes = db.query(q.selected_databases_sql(kind), (param, *rest))
     group_of = by_database.group_of_placement(name, placement.server_placements(
-        ((r["server"], r["src_database"], r["tables"]) for r in sizes), groups_of))
+        ((r["server"], r["src_database"], r["tables"]) for r in sizes), groups_of, placement.split_size(_sizing(body))))
 
     def plan_of(rows, own, stages):
         with stages.timed("plan"):
@@ -4914,7 +4935,7 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
     _refuse_job_tables(job, groups, request)
     connection = _job_connection_row(job_id)
     inputs = nj.job_inputs(job["name"], db.query(q.groups_control_rows_sql(), (groups,)) if groups else [],
-                           body.groups_per_server, unity_catalog=_unity_catalog(job))
+                           _sizing(body, job), unity_catalog=_unity_catalog(job))
     if inputs["errors"]:
         raise HTTPException(422, {"errors": inputs["errors"]})
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
@@ -4930,7 +4951,8 @@ def _add_by_database(job_id: int, body: "JobTablesRequest", request: Request, ki
                                                _sizing(body, job))
     sizes = db.query(q.selected_databases_sql(kind), (param, *rest)) if new_servers else []
     spread = by_database.group_of_placement(job["name"], placement.server_placements(
-        ((r["server"], r["src_database"], r["tables"]) for r in sizes if r["server"] in new_servers), new_servers))
+        ((r["server"], r["src_database"], r["tables"]) for r in sizes if r["server"] in new_servers), new_servers,
+        placement.split_size(_sizing(body, job))))
 
     def group_of(server, database):
         return inputs["group_of"](server, database) or (spread(server, database) if server in new_servers else None)
@@ -6150,7 +6172,7 @@ def _prepare_databases(sid: int, held: threading.Event, job: dict, source: Prepa
     groups_of = by_database.groups_by_server(servers, source.sizing)
     sizes = db.query(q.selected_databases_sql(kind), (param, *rest))
     group_of = by_database.group_of_placement(job["name"], placement.server_placements(
-        ((r["server"], r["src_database"], r["tables"]) for r in sizes), groups_of))
+        ((r["server"], r["src_database"], r["tables"]) for r in sizes), groups_of, placement.split_size(source.sizing)))
     own = set(_job_groups(sid))
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
     columns = _source_columns(kind, param)

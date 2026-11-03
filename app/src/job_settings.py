@@ -386,7 +386,8 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
         groups.setdefault(server, set()).add(r["task_collection"])
         loads.setdefault(server, {}).setdefault(r["task_collection"], 0)
         loads[server][r["task_collection"]] += 1
-    lightest = placement.Lightest(loads)
+    per_group = placement.split_size(groups_per_server)
+    lightest = placement.Lightest(loads, per_group)
     # A server new to the job: its new databases, each taking the job's tables, spread evenly over its new groups.
     src_type = str(next(iter(models.values())).get("src_type") or "sqlserver").lower()
     new_entries = [(_server_key(e["server"], src_type, servers), e["database"]) for e in entries]
@@ -396,7 +397,7 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
         new_tables[server] = new_tables.get(server, 0) + len(models)
     new_spread = placement.server_placements(((server, database, len(models)) for server, database in new_entries),
                                              {server: placement.group_count(tables, groups_per_server)
-                                              for server, tables in new_tables.items()})
+                                              for server, tables in new_tables.items()}, per_group)
     known = set(by_database)
     listed: Dict[tuple, bool] = {}
     secret_templates: Dict[str, Optional[str]] = {}
@@ -433,15 +434,23 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
                                          "pattern; add this database by Import CSV, with its secret")
                     continue
                 reach["secret_key"] = render(secrets, {**source, "src_database": e["database"]})
-            group = lightest.place(key[0], e["database"], len(models))
+            if lightest.parts(key[0], len(models)) > 1:
+                groups_now = lightest.spread(key[0], e["database"], len(models))
+            else:
+                groups_now = [lightest.place(key[0], e["database"], len(models))]
         else:
             reach = {"src_connection": e["server"], "use_remote_query": True, "src_host": None, "src_port": None,
                      "secret_key": None}
-            index = new_spread.get(key[0], {}).get(str(e["database"]).lower(), 0)
-            group = f"{q.identifier(job_name)}_{q.identifier(e['server'])}_c{index + 1:02d}"
-            new_groups.add(group)
+            place = new_spread.get(key[0], {}).get(str(e["database"]).lower(), 0)
+            groups_now = [f"{q.identifier(job_name)}_{q.identifier(e['server'])}_c{index + 1:02d}"
+                          for index in placement.indexes(place)]
+            new_groups.update(groups_now)
         planned = []
-        for model in models.values():
+        # A database with more tables than a group holds is spread: each table to one of its groups by its place among
+        # the job's tables in name order (placement.part_of).
+        for ordinal, model_key in enumerate(sorted(models)):
+            model = models[model_key]
+            group = groups_now[placement.part_of(ordinal, len(models), len(groups_now))]
             row = {f: model.get(f) for f in _TABLE_COPY}
             row.update(reach, src_database=e["database"], task_collection=group, task_enabled=e["enabled"])
             if not row.get("src_type"):

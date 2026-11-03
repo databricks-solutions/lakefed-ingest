@@ -369,6 +369,18 @@ no schema change):
 
 A job with no record, every job made before it, is Ready.
 
+**Groups and their databases.** A job's groups are sized by its tables per group (10,000 by default): each server
+gets one group for about that many of its tables, and its databases are spread so the groups hold about the same number
+of tables. A database that fits goes whole into one group. A database with more tables than a group holds (with the
+same small remainder a server's groups allow) is spread by the app over as many of its server's groups as it needs, its
+tables cut in name order into parts that differ by at most one table. A database can also be split by hand: an edit, an
+add or a registration that leaves one database's tables in more than one group is written, and its answer warns,
+naming the database, its groups and the live jobs holding them; the job page's tree marks a split database. A split
+database loads correctly (each group checks it for changes to its own tables and loads only those;
+`tests/split_database_test.py`), but each extra group adds its own change queries on the database's server every
+cycle, and its group runs open more connections to that server at the same time. Nothing already placed moves when a
+job grows, and a regroup moves a split database part by part, splitting none further.
+
 **Create at once.** A Create from CSV lines in the request, or from a source whose tables are all read, of 5,000 tables
 or fewer, writes every table before it answers, as before, and the job is Ready at once. Any other Create (its tables
 still being read, a database that couldn't be read, more than 5,000 tables, or a file with database-only lines)

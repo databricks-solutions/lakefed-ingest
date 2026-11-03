@@ -675,8 +675,8 @@ function Groups({ jobId, locked, saved }: { jobId: string; locked: Locked; saved
   return (
     <div className="compute">
       <h3>Groups<Info label="About changing the groups">Changing the size spreads each server's databases again over its new
-        number of groups, moving as few databases as it can and never splitting one. Each table keeps its progress, so nothing
-        reloads.</Info></h3>
+        number of groups, moving as few databases as it can; a database already split moves part by part, and none is split
+        further. Each table keeps its progress, so nothing reloads.</Info></h3>
       <div className="form-grid">
         <TablesPerGroup value={size} saved={saved} onChange={(next) => { setSize(next); setPreview(null); }} />
       </div>
@@ -724,7 +724,8 @@ export function TablesPerGroup({ value, onChange, saved }: { value: number | nul
   };
   return (
     <label><span>Tables per group<Info label="About tables per group">Each server's databases are split into groups of about this many
-      tables, each database whole in one group and spread evenly; a group runs on its own cluster.</Info>
+      tables, spread evenly; a group runs on its own cluster. A database that fits goes whole into one group, and a bigger one
+      is spread over as many groups as it needs, each group loading its own part.</Info>
       {Number(text) !== DEFAULT_TABLES_PER_GROUP && <button className="ghost link reset"
         onClick={() => commit(String(DEFAULT_TABLES_PER_GROUP))}>Reset</button>}</span>
       <input type="number" min={MIN_TABLES_PER_GROUP} max={MAX_TABLES_PER_GROUP} step={100} value={text}
