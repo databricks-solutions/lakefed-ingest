@@ -147,7 +147,8 @@ def split_sql_statements(ddl: str) -> List[str]:
 #   15 = databricks_run.cancel_requested_at (a Cancel run is recorded as cancelled, not failed)
 #   16 = jdbc_connection (JDBC connections entered by hand in the operations app: a host, port, secret scope and key)
 #   17 = jdbc_login_write (who wrote each JDBC login into the dedicated secret scope, and whether it rotated one)
-SCHEMA_VERSION = 17
+#   18 = checkpoint.key_collation (the sink's text keys compare like the source's collation)
+SCHEMA_VERSION = 18
 # Advisory lock that serializes migrations (the setup job and ingestion runs of any collection): two
 # int keys, so it can't collide with a collection's one-key lock whatever the collection is named,
 # and a class of its own (not SOURCE_LOCK_CLASS).
@@ -538,8 +539,8 @@ def get_checkpoints_sql() -> str:
     """Checkpoints for MANY control tasks in one round trip (the sweep's planning phase).
     Param: list of control ids (bound as a Postgres array)."""
     return (f"select control_id, position, phase, status, select_list, strategy, ct_begin_version, "
-            f"pending_position, pending_run_id, last_success_at, source_identity, sink_identity, merge_key "
-            f"from {CHECKPOINT_TABLE} where control_id = any(%s)")
+            f"pending_position, pending_run_id, last_success_at, source_identity, sink_identity, merge_key, "
+            f"key_collation from {CHECKPOINT_TABLE} where control_id = any(%s)")
 
 
 def upsert_checkpoint_sql() -> str:
@@ -550,20 +551,21 @@ def upsert_checkpoint_sql() -> str:
     append (see ``record_pending_sql``): the checkpoint now says where the sink is.
 
     Params: control_id, src_database, src_schema, src_table, strategy, position, phase, status,
-    detail, select_list, source_identity, sink_identity, merge_key.
+    detail, select_list, source_identity, sink_identity, merge_key, key_collation (kept when NULL is passed).
     """
     return (
         f"insert into {CHECKPOINT_TABLE} "
         "(control_id, src_database, src_schema, src_table, strategy, position, phase, status, detail, "
-        "select_list, source_identity, sink_identity, merge_key, updated_at) "
-        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
+        "select_list, source_identity, sink_identity, merge_key, key_collation, updated_at) "
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
         "on conflict (control_id) do update set "
         "strategy = excluded.strategy, position = excluded.position, phase = excluded.phase, "
         "status = excluded.status, detail = excluded.detail, "
         f"select_list = coalesce(excluded.select_list, checkpoint.select_list), "
         "pending_position = null, pending_run_id = null, "
         "source_identity = excluded.source_identity, sink_identity = excluded.sink_identity, "
-        "merge_key = excluded.merge_key, updated_at = now()"
+        "merge_key = excluded.merge_key, key_collation = coalesce(excluded.key_collation, checkpoint.key_collation), "
+        "updated_at = now()"
     )
 
 
@@ -1412,18 +1414,19 @@ class StateStore:
         return {int(r[0]): {"position": r[1], "phase": r[2], "status": r[3], "select_list": r[4],
                             "strategy": r[5], "ct_begin_version": r[6], "pending_position": r[7],
                             "pending_run_id": r[8], "last_success_at": r[9], "source_identity": r[10],
-                            "sink_identity": r[11], "merge_key": r[12]} for r in rows}
+                            "sink_identity": r[11], "merge_key": r[12], "key_collation": r[13]} for r in rows}
 
     def advance_checkpoint(self, cfg: dict, position, phase=INCREMENTAL, status="ok", detail=None,
-                           select_list=None, strategy=None):
+                           select_list=None, strategy=None, key_collation=None):
         """Persist a new checkpoint for control row ``cfg``. Call ONLY after the bronze write has
         committed (cross-system at-least-once: re-reading one window on crash is harmless).
         ``position`` is stored as text (None -> NULL); ``strategy`` defaults to the row's load_type.
-        ``select_list`` records the columns the sink was written with (None keeps the old value)."""
+        ``select_list`` records the columns the sink was written with, ``key_collation`` the collation
+        its text keys were checked for (None keeps the old value of either)."""
         with self._cursor() as cur:
             cur.execute(upsert_checkpoint_sql(),
                         (*task_identity(cfg), strategy or strategy_name(cfg), position_text(position),
-                         phase, status, detail, select_list, *identity_values(cfg)))
+                         phase, status, detail, select_list, *identity_values(cfg), key_collation))
 
     def record_pending(self, cfg: dict, position, run_id) -> None:
         """Record an append write about to start (see ``record_pending_sql``). Call BEFORE the write."""
@@ -1443,7 +1446,7 @@ class StateStore:
         """``advance_checkpoint`` (status ok, recording each row's select_list) for many rows:
         items = [(cfg, position, phase, detail)]. Call ONLY after their write committed."""
         params = [(*task_identity(cfg), strategy_name(cfg), position_text(pos), phase, "ok", detail,
-                   cfg.get("select_list"), *identity_values(cfg)) for cfg, pos, phase, detail in items]
+                   cfg.get("select_list"), *identity_values(cfg), None) for cfg, pos, phase, detail in items]
         if params:
             with self._cursor() as cur:
                 cur.executemany(upsert_checkpoint_sql(), params)
@@ -1601,7 +1604,7 @@ class StateStore:
             cur.execute(enqueue_reseed_sql(), (*ident, reason))
             cur.execute(upsert_checkpoint_sql(),
                         (*ident, strategy_name(cfg), None, SEEDING, "reseed_queued", reason, None,
-                         *identity_values(cfg)))
+                         *identity_values(cfg), None))
 
     # ---- Observability / telemetry -----------------------------------------------------
     def start_run(self, task_collection, job_run_id, cluster_id, parallelism, planned=None, work_id=None) -> int:

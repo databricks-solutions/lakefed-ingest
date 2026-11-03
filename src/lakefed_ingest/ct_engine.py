@@ -148,18 +148,30 @@ def ct_read_query(cfg: dict, from_version: int, to_version: Optional[int] = None
     )
 
 
-def merge_on(primary_key: str) -> str:
-    """MERGE ON clause (Delta backtick-quoted) keyed on the (composite) PK."""
-    return " AND ".join(f"tgt.{delta_column(c)} = s.{delta_column(c)}" for c in _split(primary_key))
+def merge_on(primary_key: str, collations: Optional[dict] = None) -> str:
+    """MERGE ON clause (Delta backtick-quoted) keyed on the (composite) PK. A key column the sink holds
+    under a collation (``collations``: {column: collation}, see ``sink_key_collations``) is compared under
+    it: ``tgt.k = s.k COLLATE <c>``. The explicit COLLATE is needed because the source side (a JDBC
+    DataFrame) is UTF8_BINARY, and a collated column = a binary one has no determinate collation."""
+    coll = {str(k).lower(): v for k, v in (collations or {}).items() if v}
+
+    def eq(c):
+        x = coll.get(c.lower())
+        return f"tgt.{delta_column(c)} = s.{delta_column(c)}" + (f" COLLATE {x}" if x else "")
+    return " AND ".join(eq(c) for c in _split(primary_key))
 
 
-def merge_set(select_list: str, primary_key: str) -> str:
-    """UPDATE SET of the non-PK columns; degenerate all-PK table -> harmless no-op SET on the PK.
+def merge_set(select_list: str, primary_key: str, collations: Optional[dict] = None) -> str:
+    """UPDATE SET of the non-PK columns; degenerate all-PK table -> harmless no-op SET on the PK. A
+    collated key column (``collations``) is set too: it matched under its collation, so the source's
+    spelling (a key whose case changed) replaces the sink's.
 
     Targets are UNQUALIFIED (`` `c` = s.`c` ``): under ``MERGE WITH SCHEMA EVOLUTION`` a column the
     target doesn't have yet only resolves unqualified (``tgt.`c` `` fails on DBR 18)."""
-    non_pk = _without(_split(select_list), _split(primary_key))
-    cols = non_pk or _split(primary_key)
+    pk = _split(primary_key)
+    non_pk = _without(_split(select_list), pk)
+    collated = {str(k).lower() for k, v in (collations or {}).items() if v}
+    cols = non_pk + [c for c in pk if c.lower() in collated] if non_pk else pk
     return ", ".join(f"{delta_column(c)} = s.{delta_column(c)}" for c in cols)
 
 
@@ -561,11 +573,11 @@ def append_meta(cfg: dict, run_id=None, version=None, changes: bool = False) -> 
                    _lit(run_id, "bigint").alias(RUN_ID_COLUMN)]
 
 
-def merge_on_cfg(cfg: dict) -> str:
-    """MERGE ON for a control row: the match keys, plus — consolidated sink — a LITERAL client
-    predicate on the target, so Delta prunes to this client's (clustered) files and scopes conflict
-    detection to them instead of every client's rows."""
-    on = merge_on(", ".join(merge_keys(cfg)))
+def merge_on_cfg(cfg: dict, collations: Optional[dict] = None) -> str:
+    """MERGE ON for a control row: the match keys (compared under the sink's key ``collations``), plus —
+    consolidated sink — a LITERAL client predicate on the target, so Delta prunes to this client's
+    (clustered) files and scopes conflict detection to them instead of every client's rows."""
+    on = merge_on(", ".join(merge_keys(cfg)), collations)
     return f"{on} AND tgt.{client_predicate(cfg)}" if client_id(cfg) else on
 
 
@@ -762,6 +774,8 @@ def check_sink_mode(cfg: dict, sink_fqn: str, sink_columns: List[str]) -> None:
 # each sink once per run instead of once per batch. Each run starts with forget_sinks().
 _known_sinks: dict = {}
 _known_schemas: set = set()
+# ... and the collation of each sink's string columns ({sink: {column (lower-cased): collation}}).
+_sink_collations: dict = {}
 
 # A target schema the first run can't make: it is made as the identity the ingestion job runs as, which needs these.
 SCHEMA_CREATE_MSG = ("can't create the target schema {schema}: the identity this job runs as needs USE CATALOG and "
@@ -773,6 +787,7 @@ def forget_sinks() -> None:
     """Start a run: the next ``ensure_sink_table`` of every sink asks the catalog again."""
     _known_sinks.clear()
     _known_schemas.clear()
+    _sink_collations.clear()
 
 
 def ensure_sink_schema(spark, cfg: dict) -> None:
@@ -824,9 +839,148 @@ def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
                 finally:
                     spark.catalog.dropTempView(view)
         with_write_retry(create, what=f"create {sink_fqn}")
-    columns = list(spark.table(sink_fqn).columns)
+    table = spark.table(sink_fqn)
+    columns = list(table.columns)
     check_sink_mode(cfg, sink_fqn, columns)
     _known_sinks[sink_fqn] = columns
+    _sink_collations[sink_fqn] = string_collations(table)
+
+
+# ---- key collation ---------------------------------------------------------------------------------
+# SQL Server compares a text key by its column's collation: usually case-insensitive, and always ignoring
+# trailing spaces. Delta compares strings exactly. A key whose case changes at the source is reported by
+# Change Tracking under its old spelling once, then under the new one, so an exact MERGE adds a second row
+# for it. A sink's text key columns therefore carry the Databricks collation that compares like the
+# source's (``databricks_collation``), set when the table is seeded and, for a table seeded before, on its
+# next write (``source_key_collations``, ``apply_key_collations``), and every MERGE matches under it.
+COLLATION_CI = "UTF8_LCASE_RTRIM"            # case-insensitive, accent-sensitive (SQL Server's default *_CI_AS)
+COLLATION_CI_AI = "UNICODE_CI_AI_RTRIM"      # case- and accent-insensitive (*_CI_AI)
+COLLATION_EXACT = "UTF8_BINARY_RTRIM"        # case-sensitive or binary: exact, but trailing spaces still ignored
+BINARY = "UTF8_BINARY"                       # Delta's default: no collation
+
+
+def databricks_collation(sql_server_collation) -> Optional[str]:
+    """The Databricks collation that compares like a SQL Server column collation, or None for a column
+    without one (not a text column). Kana and width sensitivity (_KS, _WS) are not mapped."""
+    if not sql_server_collation:
+        return None
+    parts = str(sql_server_collation).upper().split("_")
+    if any(p.startswith("BIN") for p in parts) or "CS" in parts:
+        return COLLATION_EXACT
+    if "CI" in parts:
+        return COLLATION_CI_AI if "AI" in parts else COLLATION_CI
+    return COLLATION_EXACT
+
+
+def key_collations_sql(cfg: dict) -> str:
+    """The source table's columns with their collation (NULL for a non-text column), SQL Server."""
+    obj = quote_nstr(f"{quote_ident(cfg['src_schema'])}.{quote_ident(cfg['src_table'])}")
+    return f"SELECT c.name AS col, c.collation_name AS coll FROM sys.columns c WHERE c.object_id = OBJECT_ID({obj})"
+
+
+def source_key_collations(spark, cfg: dict, slots=None) -> dict:
+    """{primary key column: Databricks collation, or None for a non-text column}, read from the source in
+    ONE query. Only SQL Server is mapped today; any other source returns {} (its keys stay exact)."""
+    if source_adapters.for_cfg(cfg).src_type != source_adapters.SQLSERVER:
+        return {}
+    with _unit(slots, cfg):
+        rows = _read(spark, cfg, key_collations_sql(cfg)).collect()
+    found = {str(r["col"]).lower(): databricks_collation(r["coll"]) for r in rows}
+    return {c: found.get(c.lower()) for c in _split(cfg.get("primary_key"))}
+
+
+def _collation_of(data_type) -> Optional[str]:
+    """A Spark type's collation: the collation name for a string type (UTF8_BINARY when none is set),
+    None for any other type."""
+    if getattr(data_type, "typeName", lambda: "")() != "string":
+        return None
+    named = getattr(data_type, "collation", None)
+    if isinstance(named, str) and named:
+        return named.upper() if named.upper() != "UTF8_BINARY" else BINARY
+    found = re.search(r"collate\s+([A-Za-z0-9_]+)", data_type.simpleString(), re.I)
+    return found.group(1).upper() if found else BINARY
+
+
+def string_collations(table) -> dict:
+    """{column (lower-cased): collation} of a DataFrame's (a sink's) string columns."""
+    try:
+        fields = table.schema.fields
+    except Exception:            # no schema to read (a test double): nothing is collated
+        return {}
+    return {f.name.lower(): c for f in fields for c in [_collation_of(f.dataType)] if c is not None}
+
+
+def sink_key_collations(sink_fqn: str) -> dict:
+    """{column: collation} of the sink's string columns that carry a collation other than Delta's
+    default, as found by ``ensure_sink_table`` this run: what MERGE compares keys under."""
+    return {c: x for c, x in (_sink_collations.get(sink_fqn) or {}).items() if x != BINARY}
+
+
+def alter_collation_sql(sink_fqn: str, column: str, collation: str) -> str:
+    return f"ALTER TABLE {sink_fqn} ALTER COLUMN {delta_column(column)} TYPE STRING COLLATE {collation}"
+
+
+def apply_key_collations(spark, sink_fqn: str, wanted: dict, analyze: bool = True) -> List[str]:
+    """Give the sink's key columns the collation ``wanted`` asks for ({column: collation or None}), where
+    the sink still has Delta's default: a metadata change, so existing rows aren't rewritten. A column
+    another collation was already set on keeps it (a sink shared by databases follows the first). Returns
+    the columns changed. Call after ``ensure_sink_table`` (which reads the sink's collations).
+
+    The existing files' statistics were collected for exact comparison, so filters on a re-collated column
+    skip no files until they are collected again: with ``analyze``, a sink that holds data has its Delta
+    statistics recomputed (ANALYZE ... COMPUTE DELTA STATISTICS, once per sink). Pass False when the caller
+    rewrites every file next anyway (a dedicated sink about to be seeded)."""
+    have = _sink_collations.get(sink_fqn) or {}
+    changed = []
+    for column, collation in wanted.items():
+        if collation and have.get(column.lower()) == BINARY:
+            with_write_retry(lambda c=column, x=collation: spark.sql(alter_collation_sql(sink_fqn, c, x)),
+                             what=f"collate {sink_fqn}.{column}")
+            changed.append(column)
+    if changed:
+        _sink_collations[sink_fqn] = string_collations(spark.table(sink_fqn))
+        if analyze and _has_files(spark, sink_fqn):
+            spark.sql(f"ANALYZE TABLE {sink_fqn} COMPUTE DELTA STATISTICS")
+    return changed
+
+
+def _has_files(spark, sink_fqn: str) -> bool:
+    try:
+        return int(spark.sql(f"DESCRIBE DETAIL {sink_fqn}").first()["numFiles"] or 0) > 0
+    except Exception:            # unknown: recompute (it only costs time)
+        return True
+
+
+def key_collation_marker(wanted: dict) -> str:
+    """What checkpoint.key_collation records: the text key columns and their collation
+    (``id=UTF8_LCASE_RTRIM``), '' for a table without text keys. Any value (not NULL) means checked."""
+    return ",".join(f"{c.lower()}={x}" for c, x in sorted(wanted.items(), key=lambda i: i[0].lower()) if x)
+
+
+def merge_collated(spark, sink_fqn: str, build):
+    """Run the MERGE ``build(collations)`` makes, under the sink's key collations as this run knows them. If
+    another run collated the sink's keys since (a sink shared by collections), the MERGE can't resolve its
+    comparison (INDETERMINATE_COLLATION): read the sink's collations again and run it once more."""
+    try:
+        return spark.sql(build(sink_key_collations(sink_fqn))).first()
+    except Exception as e:
+        if "INDETERMINATE_COLLATION" not in str(e):
+            raise
+        _sink_collations[sink_fqn] = string_collations(spark.table(sink_fqn))
+        return spark.sql(build(sink_key_collations(sink_fqn))).first()
+
+
+def duplicate_keys_sql(cfg: dict, sink_fqn: str) -> str:
+    """How many keys the sink holds more than once under its key collations (this client's rows only,
+    in a consolidated sink): rows written under two spellings of one key before the collation was set."""
+    keys = ", ".join(delta_column(c) for c in merge_keys(cfg))
+    where = f" WHERE {client_predicate(cfg)}" if client_id(cfg) else ""
+    return (f"SELECT COUNT(*) AS n FROM (SELECT 1 FROM {sink_fqn}{where} GROUP BY {keys} "
+            "HAVING COUNT(*) > 1) AS dup")
+
+
+def duplicate_keys(spark, cfg: dict, sink_fqn: str) -> int:
+    return int(spark.sql(duplicate_keys_sql(cfg, sink_fqn)).first()["n"] or 0)
 
 
 def _bare_ident(name) -> str:
@@ -1263,8 +1417,9 @@ def _partitioned_seed(spark, cfg: dict, sink_fqn: str, slots, executor, guard=No
     return int(rows or 0)
 
 
-def merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
-    """Idempotent I/U/D MERGE of the staged CT rows (temp view ``view``) into the sink, by PK.
+def merge_sql(cfg: dict, sink_fqn: str, view: str, collations: Optional[dict] = None) -> str:
+    """Idempotent I/U/D MERGE of the staged CT rows (temp view ``view``) into the sink, by PK, compared
+    under the sink's key ``collations`` (``sink_key_collations``).
 
     ``WITH SCHEMA EVOLUTION`` (per statement — never the session-wide autoMerge conf, which the
     threaded sweep would share): select_list columns the sink lacks are added, and with type widening
@@ -1272,9 +1427,9 @@ def merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
     ``op`` column out of bronze. ON keeps tgt./s. qualifiers; SET/INSERT targets are unqualified."""
     sl, keys = ", ".join(write_columns(cfg)), ", ".join(merge_keys(cfg))
     return (
-        f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s ON {merge_on_cfg(cfg)} "
+        f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s ON {merge_on_cfg(cfg, collations)} "
         "WHEN MATCHED AND s.op = 'D' THEN DELETE "
-        f"WHEN MATCHED THEN UPDATE SET {merge_set(sl, keys)} "
+        f"WHEN MATCHED THEN UPDATE SET {merge_set(sl, keys, collations)} "
         "WHEN NOT MATCHED AND s.op <> 'D' THEN "
         f"INSERT ({merge_insert_cols(sl)}) "
         f"VALUES ({merge_insert_vals(sl)})"
@@ -1302,7 +1457,7 @@ def read_and_merge_ct(spark, cfg: dict, sink_fqn: str, from_version: int,
             view = f"ct_staged_{uuid.uuid4().hex}"
             df.createOrReplaceTempView(view)
             try:
-                return spark.sql(merge_sql(cfg, sink_fqn, view)).first()
+                return merge_collated(spark, sink_fqn, lambda c: merge_sql(cfg, sink_fqn, view, c))
             finally:
                 spark.catalog.dropTempView(view)
     result = with_write_retry(once, what=f"merge {sink_fqn}")

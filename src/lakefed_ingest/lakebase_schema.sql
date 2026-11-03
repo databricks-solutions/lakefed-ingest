@@ -253,6 +253,11 @@ alter table lakefed_ingest.checkpoint add column if not exists ct_begin_version 
 alter table lakefed_ingest.checkpoint add column if not exists source_identity text;
 alter table lakefed_ingest.checkpoint add column if not exists sink_identity text;
 alter table lakefed_ingest.checkpoint add column if not exists merge_key text;
+-- The collation the sink's text key columns were checked for (ct_engine.key_collation_marker: column=collation
+-- pairs, '' for a table without text keys). SQL Server compares keys by collation (usually case-insensitive)
+-- and Delta exactly, so a key whose case changed would land as a second row. NULL = not checked yet: the next
+-- write looks up the source's collation, sets it on the sink and reseeds the table if it already has duplicates.
+alter table lakefed_ingest.checkpoint add column if not exists key_collation text;
 
 -- The select_list the sink was last written with. The sweep compares it with control.select_list:
 -- a column ADDED to the control row means the table is reseeded (CT returns changed rows only, so

@@ -145,14 +145,15 @@ def read_where(cfg: dict, typ: str, lo: Optional[str], hi: str) -> str:
     return upper if lo is None else f"{col} > {literal(lo, typ)} AND {upper}"
 
 
-def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str) -> str:
+def upsert_merge_sql(cfg: dict, sink_fqn: str, view: str, collations: Optional[dict] = None) -> str:
     """Idempotent upsert MERGE by PK — (__client_id__, PK) for a consolidated sink — with schema
-    evolution. A watermark read carries no deletes."""
+    evolution, keys compared under the sink's key ``collations`` (``ct_engine.sink_key_collations``).
+    A watermark read carries no deletes."""
     sl, keys = ", ".join(ct_engine.write_columns(cfg)), ", ".join(ct_engine.merge_keys(cfg))
     return (
         f"MERGE WITH SCHEMA EVOLUTION INTO {sink_fqn} AS tgt USING {view} AS s "
-        f"ON {ct_engine.merge_on_cfg(cfg)} "
-        f"WHEN MATCHED THEN UPDATE SET {ct_engine.merge_set(sl, keys)} "
+        f"ON {ct_engine.merge_on_cfg(cfg, collations)} "
+        f"WHEN MATCHED THEN UPDATE SET {ct_engine.merge_set(sl, keys, collations)} "
         f"WHEN NOT MATCHED THEN INSERT ({ct_engine.merge_insert_cols(sl)}) "
         f"VALUES ({ct_engine.merge_insert_vals(sl)})"
     )
@@ -203,7 +204,7 @@ def read_and_merge(spark, cfg: dict, sink_fqn: str, typ: str, lo: Optional[str],
             view = f"cursor_staged_{uuid.uuid4().hex}"
             df.createOrReplaceTempView(view)
             try:
-                return spark.sql(upsert_merge_sql(cfg, sink_fqn, view)).first()
+                return ct_engine.merge_collated(spark, sink_fqn, lambda c: upsert_merge_sql(cfg, sink_fqn, view, c))
             finally:
                 spark.catalog.dropTempView(view)
     result = ct_engine.with_write_retry(once, what=f"merge {sink_fqn}")
