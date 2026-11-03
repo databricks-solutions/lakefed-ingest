@@ -2,7 +2,14 @@
 began and how many runs failed it. The SQL that reads them runs against Postgres in failing_tables_pg_test.py."""
 from datetime import datetime, timezone
 
-import queries as q
+import pytest
+
+pytest.importorskip("fastapi")
+from fastapi.testclient import TestClient  # noqa: E402
+
+import lakebase  # noqa: E402
+import main  # noqa: E402
+import queries as q  # noqa: E402
 
 
 def _row(**changes):
@@ -14,7 +21,7 @@ def _row(**changes):
 
 
 def test_a_table_shows_the_engines_class_and_kind_with_its_latest_message_and_counts():
-    since = datetime(2026, 10, 27, 8, 0, tzinfo=timezone.utc)
+    since = "2026-10-27T08:00:00+00:00"
     [shaped] = q.failing_table_rows([_row(error="Login failed for user 'lakefed'", error_class="FAILED_JDBC.CONNECTION",
                                           error_kind="transient", failing_since=since, runs=3, failures=5)])
     assert shaped["table"] == "dbo.orders"
@@ -47,3 +54,15 @@ def test_a_long_message_is_cut_to_2000_characters():
 def test_the_rows_keep_their_order_and_each_table_is_one_row():
     rows = q.failing_table_rows([_row(control_id=1, src_table="a"), _row(control_id=2, src_table="b")])
     assert [(r["control_id"], r["table"]) for r in rows] == [(1, "dbo.a"), (2, "dbo.b")]
+
+
+def test_the_endpoint_lists_a_failing_table_whose_failing_since_came_from_the_database(monkeypatch):
+    stored = _row(error="Login failed", failing_since=datetime(2026, 10, 27, 8, 0, tzinfo=timezone.utc), runs=2, failures=2)
+    as_db_query_returns = {column: lakebase._jsonable(value) for column, value in stored.items()}
+    job = {"id": 1, "name": "Hourly", "deleted_at": None, "job_variant": "default", "options": {}}
+    members = [{"schedule_id": 1, "task_collection": "sales", "removed_at": None}]
+    monkeypatch.setattr(main, "_load_schedule", lambda job_id, cur=None: (job, members))
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): [as_db_query_returns] if sql == q.failing_tables_sql() else [])
+    response = TestClient(main.app).get("/api/ingestion-jobs/1/failing-tables")
+    assert response.status_code == 200
+    assert [row["failing_since"] for row in response.json()["tables"]] == ["2026-10-27T08:00:00+00:00"]
