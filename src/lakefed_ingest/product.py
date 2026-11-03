@@ -7,7 +7,7 @@ Every Databricks SDK client the engine makes is built by ``workspace_client``, s
 Keep PRODUCT_VERSION in step with app/src/app_product.py (tests/product_test.py pins the two together).
 """
 PRODUCT_NAME = "ingestion-workbench"
-PRODUCT_VERSION = "0.2.0"
+PRODUCT_VERSION = "0.1.0"
 
 
 def workspace_client(**kwargs):

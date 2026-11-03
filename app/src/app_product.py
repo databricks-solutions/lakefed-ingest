@@ -8,7 +8,7 @@ Kept in step with the engine's src/lakefed_ingest/product.py (tests/product_test
 app_product so it can't be confused with the engine's product module when both are on a path).
 """
 PRODUCT_NAME = "ingestion-workbench"
-PRODUCT_VERSION = "0.2.0"
+PRODUCT_VERSION = "0.1.0"
 
 
 def query_tags(component: str) -> list:
