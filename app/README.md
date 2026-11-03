@@ -1,6 +1,6 @@
-# lakefed_ingest operations app (optional)
+# Ingestion Workbench operations app (optional)
 
-A Databricks App for operating the default version of lakefed_ingest. It's a separate, optional
+A Databricks App for operating the default version of Ingestion Workbench. It's a separate, optional
 bundle: deploy it only if your workspace allows Databricks Apps. The ingestion bundle at the repo
 root doesn't depend on it, and everything the app does can also be done with SQL and the Jobs UI
 (see [../docs/monitoring.md](../docs/monitoring.md) and [../docs/lakebase_schema.md](../docs/lakebase_schema.md)).

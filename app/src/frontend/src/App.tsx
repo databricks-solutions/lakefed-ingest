@@ -55,7 +55,7 @@ export default function App() {
       <PageStampContext.Provider value={setStamp}>
       <div className="layout">
         <aside className="sidebar">
-          <div className="brand"><div>Lakefed Ingest<small>Operations</small></div></div>
+          <div className="brand"><div>Ingestion Workbench<small>Operations</small></div></div>
           <nav>
             {nav.map(([to, label]) => (
               <NavLink key={to} to={to} end className={({ isActive }) =>

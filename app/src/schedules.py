@@ -493,7 +493,7 @@ def job_settings(schedule: dict, collection: str, offset: int, ingest_job_id: in
     params = run_parameters(schedule, collection)
     s = {
         "name": job_name(schedule["name"], collection),
-        "description": (f"Managed by the lakefed_ingest operations app (schedule '{schedule['name']}'). "
+        "description": (f"Managed by the Ingestion Workbench operations app (schedule '{schedule['name']}'). "
                         "Edit the schedule in the app: changes made here are reported as drift and undone "
                         "by the next sync."),
         "schedule": {"quartz_cron_expression": quartz_cron(int(schedule["cadence_minutes"]), offset),

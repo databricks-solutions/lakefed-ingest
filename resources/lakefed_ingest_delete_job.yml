@@ -48,7 +48,7 @@ resources:
               - "psycopg[binary]"
               - "databricks-sdk==0.145.0"
       tags:
-        project: lakefed_ingest
+        project: ${var.project_tag}
       parameters:
         # The deleted app job, and whether to drop its target tables too. The app passes both.
         - name: schedule_id

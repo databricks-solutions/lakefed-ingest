@@ -251,7 +251,7 @@ def test_reseed_counts_the_checkpoints_it_flipped_not_the_rollups_written_after_
 def test_static_files_never_leave_the_static_folder(client):
     for path in ("/%2e%2e/main.py", "/%2e%2e/%2e%2e/README.md", "/..%2fmain.py"):
         r = client.get(path)
-        assert "lakefed_ingest operations app" not in r.text and "fastapi" not in r.text.lower()[:200], path
+        assert "Ingestion Workbench operations app" not in r.text and "fastapi" not in r.text.lower()[:200], path
 
 
 ROW = dict(task_collection="c1", src_type="sqlserver", src_host="h", secret_key="k", src_database="db1", src_schema="dbo",

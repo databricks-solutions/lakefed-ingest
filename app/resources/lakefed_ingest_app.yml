@@ -115,7 +115,7 @@ resources:
       tags:
         custom_tags:
           - key: project
-            value: lakefed_ingest
+            value: ${var.project_tag}
 
   # The dedicated scope for JDBC logins that users type into the app (app/src/jdbc_logins.py). This bundle creates it,
   # so the deployer is its creator and holds MANAGE, and the ingestion jobs, which run as the deployer, read the logins

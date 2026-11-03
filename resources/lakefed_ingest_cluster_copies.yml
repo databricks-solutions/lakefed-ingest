@@ -31,7 +31,7 @@ resources:
               - "psycopg[binary]"
               - "databricks-sdk==0.145.0"
       tags:
-        project: lakefed_ingest
+        project: ${var.project_tag}
       parameters:
         # The schedule to copy for (blank = every schedule), and the app's service principal (its application id),
         # which gets Can Manage on each copy. The app passes both.

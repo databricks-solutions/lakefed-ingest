@@ -1,4 +1,6 @@
-# Lakehouse Federation Ingestion Framework
+# Ingestion Workbench
+
+*Formerly lakefed-ingest, and the EDW Ingestion Accelerator.*
 
 Metadata-driven ingestion from external databases into Delta tables on Databricks. This repo holds
 two versions:
@@ -576,6 +578,18 @@ tables, applies changes to it, and reconciles the sinks with the source; see
 
 The `cdc` load strategy (placeholder with a documented contract in `load_strategies.py`),
 `cursor` and `cdc` for sources other than SQL Server (placeholders), and production alerting.
+
+## Usage attribution
+
+So Databricks can see how widely the tool is used, it identifies itself in three ways. Nothing else is collected: no
+names, hosts, queries or data.
+
+- **API calls.** Every Databricks SDK client the jobs and the operations app make identifies itself as
+  `ingestion-workbench/<version>` in its user agent (`src/lakefed_ingest/product.py`, `app/src/app_product.py`).
+- **Resource tags.** Every job, job cluster, the discovery cluster and the app's SQL warehouse carry the tag
+  `project: ingestion-workbench` (bundle variable `project_tag`).
+- **Query tags.** The operations app's SQL warehouse statements carry the query tags `application:
+  ingestion-workbench` and `component: discovery`.
 
 ## Help
 

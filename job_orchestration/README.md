@@ -1,6 +1,8 @@
-# Lakehouse Federation Ingestion Framework (job orchestration version)
+# Ingestion Workbench (job orchestration version)
 
-> This is the **job orchestration** version of lakefed_ingest: Jobs `for_each` tasks, SQL warehouse,
+*Formerly lakefed-ingest, and the EDW Ingestion Accelerator.*
+
+> This is the **job orchestration** version of Ingestion Workbench: Jobs `for_each` tasks, SQL warehouse,
 > and a Delta control table. It is its own bundle (`lakefed_ingest`) — run every `databricks bundle`
 > command below from this `job_orchestration/` directory. The default version (Lakebase state,
 > in-process orchestration on cluster compute, SQL Server Change Tracking) lives at the repo root; see

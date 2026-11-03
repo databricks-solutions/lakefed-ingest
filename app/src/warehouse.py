@@ -17,6 +17,7 @@ no request waits long and any app instance can answer."""
 import os
 from typing import List, Mapping, Optional, Tuple
 
+import app_product
 from lakebase import workspace
 
 BUNDLES_OWN = "the bundle's own"
@@ -67,7 +68,8 @@ def start(statement: str, parameters: List[dict], wait_s: int = START_WAIT_S) ->
         statement=statement, warehouse_id=WAREHOUSE_ID, wait_timeout=f"{wait_s}s",
         on_wait_timeout=ExecuteStatementRequestOnWaitTimeout.CONTINUE, disposition=Disposition.INLINE,
         format=Format.JSON_ARRAY,
-        parameters=[StatementParameterListItem(name=p["name"], value=p["value"]) for p in parameters])
+        parameters=[StatementParameterListItem(name=p["name"], value=p["value"]) for p in parameters],
+        query_tags=app_product.query_tags("discovery"))
     return _view(answer)
 
 

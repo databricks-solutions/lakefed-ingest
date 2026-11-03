@@ -337,8 +337,8 @@ class SdkJobs:
 
     def __init__(self, client=None):
         if client is None:
-            from databricks.sdk import WorkspaceClient
-            client = WorkspaceClient()
+            import product
+            client = product.workspace_client()
         self.w = client
 
     def run_now(self, job_id: int, job_parameters: Dict[str, str], idempotency_token: str) -> int:
