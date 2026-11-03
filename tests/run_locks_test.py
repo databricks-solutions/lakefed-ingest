@@ -72,11 +72,24 @@ def test_a_database_another_run_holds_is_skipped_and_the_rest_kept():
 
 def test_a_run_is_alone_on_its_collection_only_when_no_other_session_holds_it():
     alone = _Cursor()
-    assert _store(alone).alone_on_collection("g1") is True
+    with _store(alone).alone_on_collection("g1") as is_alone:
+        assert is_alone is True
+        assert [sql for sql, _ in alone.calls] == [ss.try_lock_collection_sql()]    # still held inside the block
     assert [sql for sql, _ in alone.calls] == [ss.try_lock_collection_sql(), ss.unlock_collection_sql()]
     shared = _Cursor(shared_by_others=True)
-    assert _store(shared).alone_on_collection("g1") is False
+    with _store(shared).alone_on_collection("g1") as is_alone:
+        assert is_alone is False
     assert [sql for sql, _ in shared.calls] == [ss.try_lock_collection_sql()]       # nothing to let go of
+
+
+def test_the_exclusive_hold_is_let_go_even_when_the_close_inside_it_fails():
+    cursor = _Cursor()
+    try:
+        with _store(cursor).alone_on_collection("g1"):
+            raise RuntimeError("the close failed")
+    except RuntimeError:
+        pass
+    assert [sql for sql, _ in cursor.calls] == [ss.try_lock_collection_sql(), ss.unlock_collection_sql()]
 
 
 def test_the_rollup_lock_takes_each_group_once_in_order():
@@ -93,7 +106,8 @@ def test_the_run_holds_its_collection_shared_with_a_work_list_and_alone_without(
     assert ("locked = (lock_store.try_lock_collection_shared(task_collection) if work_id\n"
             "          else lock_store.try_lock_collection(task_collection))") in source
     assert "lock_store.try_lock_databases(database_locks)" in source
-    assert "work_id and not lock_store.alone_on_collection(task_collection)" in source
+    close = "closed_runs, closed_events = store.close_abandoned_runs(task_collection, run_id) if alone else (0, 0)"
+    assert "with lock_store.alone_on_collection(task_collection) as alone:\n            " + close in source
     # The databases are locked before the rows are narrowed to them, and an all-taken list is a skip, not a failure.
     assert source.index("try_lock_databases") < source.index("configs = planner.select_work(configs, work)")
     assert 'status="skipped",\n                         detail="every database of the work list' in source

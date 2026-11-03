@@ -104,10 +104,21 @@ def test_two_runs_given_one_database_take_it_once_and_the_second_skips_it(sessio
 def test_a_run_closes_abandoned_runs_only_when_no_other_run_holds_the_collection(sessions):
     first, second = ss.StateStore(sessions()), ss.StateStore(sessions())
     assert first.try_lock_collection_shared("g1") and second.try_lock_collection_shared("g1")
-    assert first.alone_on_collection("g1") is False
+    with first.alone_on_collection("g1") as alone:
+        assert alone is False
     second.unlock_collection_shared("g1")
-    assert first.alone_on_collection("g1") is True
-    assert second.try_lock_collection_shared("g1") is True               # the exclusive try was let go at once
+    with first.alone_on_collection("g1") as alone:
+        assert alone is True
+    assert second.try_lock_collection_shared("g1") is True               # the exclusive try was let go at the end
+
+
+def test_a_run_cannot_take_the_collection_while_another_closes_abandoned_runs_under_it(sessions):
+    first, second = ss.StateStore(sessions()), ss.StateStore(sessions())
+    assert first.try_lock_collection_shared("g1")
+    with first.alone_on_collection("g1") as alone:
+        assert alone is True
+        assert second.try_lock_collection_shared("g1") is False          # it cannot open a run in the gap
+    assert second.try_lock_collection_shared("g1") is True               # and can once the close is done
 
 
 def test_two_runs_recounting_one_group_at_once_leave_it_exact(sessions):
