@@ -7,14 +7,6 @@ estates of many databases: thousands of source databases and hundreds of thousan
 **operations app**, deployed with the rest, lets you find the tables on a source, make ingestion jobs from them and watch them run, without
 writing SQL.
 
-## The legacy version
-
-The repository root holds the default version, which this README covers. [`job_orchestration/`](job_orchestration/README.md)
-holds the legacy version, the original one built on job tasks and a SQL warehouse. It is kept for existing
-deployments, and all new development goes into the default version. Upgrading from a release where the repository
-root was the legacy version? Read [Upgrading from an earlier release](docs/deploy.md#upgrading-from-an-earlier-release)
-before you deploy anything.
-
 ## How it works
 
 ![How the parts fit: sources are read by the check and ingest jobs, which write Delta tables and record their state in Lakebase; the app reads table lists through its SQL warehouse and writes the control rows](docs/images/how-it-fits.svg)
@@ -112,7 +104,7 @@ and starts an ingest only where something changed. Both jobs ship with paused sc
 | Page | What it covers |
 |---|---|
 | [Deployment guide](docs/deploy.md) | Every deploy step and setting, compute choices, steps outside the bundle, the first run, upgrades and schema changes |
-| [How a run works](docs/how-it-works.md) | The two implementations compared, load types, change detection, shared and append tables, concurrency, table retries, settings for large estates, control rows |
+| [How a run works](docs/how-it-works.md) | Load types, change detection, shared and append tables, concurrency, table retries, settings for large estates, control rows |
 | [Operations app](app/README.md) | The app's pages, discovery through the SQL warehouse, JDBC connections, re-discovery, a new job's preparation, the security model |
 | [Monitoring](docs/monitoring.md) | The telemetry tables and ready queries for failures, freshness and run history |
 | [Lakebase schema](docs/lakebase_schema.md) | Every Lakebase table and column, removing tables and old history, changing the schema |
@@ -127,8 +119,7 @@ The unit tests need no cluster or database. From the repository root:
 python3 -m venv .venv
 .venv/bin/pip install pytest httpx -r app/src/requirements.txt
 .venv/bin/pytest                              # every suite (test paths in pytest.ini)
-.venv/bin/pytest tests                        # the default version only
-.venv/bin/pytest job_orchestration/tests      # the legacy version only
+.venv/bin/pytest tests                        # the tests/ suite only
 ```
 
 Some tests are skipped unless their outside system is given: the Postgres tests (`*_pg_test.py`) need
