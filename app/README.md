@@ -237,9 +237,8 @@ checked, about 13 seconds at 8 at once (the server's cap) whatever the server's 
 about 2 to 5 seconds per database, about 2 to 4 hours for 22,000 at 8 at once; in New job it starts at the choice, so
 Create waits only for what is left when it is pressed. Without a warehouse set (`WAREHOUSE_ID` empty), Discover runs the discovery job as before.
 
-**What stays on the discovery job:** listing an Azure SQL server's databases through Azure (it takes a service
-credential only Databricks compute holds; the tables are then read through the warehouse), and sources read by host
-and password (no connection to send through). The job stays in the bundle for those.
+**What stays on the discovery job:** sources read by host and password (no connection to send through). The job stays
+in the bundle for those.
 
 ## JDBC connections entered by hand
 
@@ -326,7 +325,7 @@ A job made from a discovery can add new databases and tables by itself. On its E
 Once a day at that hour, the scheduler in the app process (a thread; `REDISCOVERY_TICK_S`, default 300 seconds, 0
 turns it off) reads the job's selection again and adds what the rules allow. A server reached through a connection is
 read through the discovery warehouse, as Add tables reads it (its databases listed again for a whole-server part,
-then each database's tables); one listed through Azure, or read by host and password, runs the discovery job:
+then each database's tables); one read by host and password runs the discovery job:
 
 | The job was chosen as | Re-discovery adds |
 |---|---|
@@ -348,7 +347,8 @@ pending from the discovery run in the poller, then **adding tables**, then done 
 with the reason. Run it now stays off until the run has ended; a discovery run past its wait is not confirmed, not done.
 
 A whole-server part reads its servers again from `discovery.listing` (how the discovery listed databases: the LIKE
-pattern, the Azure resource and the host secret template, never a secret). A discovery made before schema version
+pattern and the host secret template, never a secret; the Azure settings an older listing may hold are ignored, so
+the server is listed through master). A discovery made before schema version
 12 has no listing, so discover that server again from Add tables. A host whose databases take different secrets, with
 no template recorded, can't have a whole-server part read again (discover it from Add tables); its whole-database
 parts are read once per secret.
@@ -519,12 +519,6 @@ The app runs as its own service principal (created with the app):
   needs `CAN_MANAGE` on it. The grant adds the app's entry to the warehouse's access list (the Permissions API's
   update, not its replace), so the other entries stay. A job that may not grant it fails, after the grants above,
   and says that the warehouse's owner or a workspace admin grants it instead. Blank, nothing is granted.
-- **Azure SQL listing (optional):** for a login that can't open master, Discover's connection test can have the
-  discovery job list an Azure SQL server's (or Managed Instance's) databases through Azure Resource Manager instead.
-  It takes a Unity Catalog service credential (Catalog Explorer, External data, Credentials) on an access connector
-  whose managed identity has Reader on the server, `ACCESS` on that credential for whoever runs the discovery job,
-  and the server's resource id, both typed under Azure SQL on the connection step. The app never calls Azure;
-  each listed database is then read through the connection, and one the login can't open fails on its own.
 - **JDBC secret scopes:** `READ` on each scope a JDBC connection names, for the identity its jobs run as (normally the
   deployer). The app never holds it and its grant job doesn't give it, so a job reading a scope it can't read fails on
   its first run. The bundle creates the dedicated login scope with no permission on it, and the grant job gives the

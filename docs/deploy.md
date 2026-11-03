@@ -146,7 +146,7 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   warehouse of your own that has one (see [The app's SQL warehouse](#the-apps-sql-warehouse)). The app checks and
   reads at most 8 databases of one source server at once, one fixed number (bundle variable `reads_cap`, from 4 to
   256), shared by the page's checks and the background reads. The discovery job
-  stays for listing through Azure and for sources read by host and password. See [app/README.md](../app/README.md),
+  stays for sources read by host and password. See [app/README.md](../app/README.md),
   Discovery through the SQL warehouse.
 - **Ingestion** runs on job clusters with the source network path (scheduled, recurring work).
 - **The operations app's helper jobs**, `lakefed_ingest_cluster_copies` and `lakefed_ingest_delete_job`, run on

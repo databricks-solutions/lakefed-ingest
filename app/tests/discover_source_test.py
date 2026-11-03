@@ -80,20 +80,11 @@ def test_a_name_filter_goes_with_the_listing_and_the_whole_server(client):
     assert r.status_code == 422 and len(client.started) == 2
 
 
-def test_an_azure_sql_servers_databases_can_be_listed_through_azure_by_the_discovery_job(client):
-    server = "/subscriptions/0000-1111/resourceGroups/rg-lab/providers/Microsoft.Sql/servers/lab-sql"
-    through_azure = {"azure_credential": "lab_reader", "azure_resource_id": server}
-    client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "list", **through_azure})
-    assert {k: _spec(client)[1].get(k) for k in through_azure} == through_azure
-    client.post("/api/discoveries/source", json={"src_connection": "sql_a", "whole_server": True, "pattern": "eng_%",
-                                                 **through_azure})
-    assert _spec(client)[1]["databases"] == "*" and _spec(client)[1]["azure_resource_id"] == server
-    client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "list"})
-    assert "azure_credential" not in _spec(client)[1]
-    for wrong in [{"azure_credential": "lab_reader"}, {"azure_resource_id": server},
-                  {"azure_credential": "lab reader", "azure_resource_id": server},
-                  {"azure_credential": "lab_reader", "azure_resource_id": server + "/../../x"},
-                  {"azure_credential": "lab_reader", "azure_resource_id": "https://elsewhere.example.com" + server}]:
-        r = client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "list", **wrong})
-        assert r.status_code == 422, wrong
-    assert len(client.started) == 3
+def test_the_old_azure_settings_in_a_request_are_ignored_and_not_passed_to_the_job(client):
+    old = {"azure_credential": "lab_reader",
+           "azure_resource_id": "/subscriptions/0000-1111/resourceGroups/rg-lab/providers/Microsoft.Sql/servers/lab-sql"}
+    client.post("/api/discoveries/source", json={"src_connection": "sql_a", "kind": "list", **old})
+    client.post("/api/discoveries/source", json={"src_connection": "sql_a", "whole_server": True, **old})
+    assert len(client.started) == 2
+    for _, params in client.started:
+        assert not set(old) & set(json.loads(params["spec"]))

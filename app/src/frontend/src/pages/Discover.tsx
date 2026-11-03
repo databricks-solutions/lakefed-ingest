@@ -27,11 +27,6 @@ class SourceError extends Error {
   constructor(message: string, codes?: ErrorCodes | null) { super(message); this.codes = codes ?? null; }
 }
 
-/** For an Azure SQL server: a service credential with Reader on it and its resource id, so the discovery job lists the
- *  databases through Azure instead of master. Both or neither. */
-const azureOf = (credential: string, resource: string): Row => credential.trim() && resource.trim()
-  ? { azure_credential: credential.trim(), azure_resource_id: resource.trim() } : {};
-
 /** A discovery that has ended: its id, whether it ran through the SQL warehouse, and for a whole-server read there how
  *  many databases it left out because the login can't open them. */
 type Discovered = { id: string; via: string; leftOut: number };
@@ -143,7 +138,7 @@ export function TriBox({ pick, label, onClick }: { pick: Pick; label: string; on
 const cantList = (error: unknown) => /FAILED_JDBC\.CONNECTION|Login failed|Cannot open database|HV000/i.test(String((error as Error)?.message ?? error));
 
 /** A failed connection test: its codes, the source's message and what to do. When the login may not open master, the
- *  databases can still be typed below, or listed through Azure. */
+ *  databases can still be typed below. */
 function TestFailed({ error }: { error: unknown }) {
   const failure = connectionFailure(String((error as Error)?.message ?? error), (error as SourceError)?.codes);
   return <Notice tone="bad">
@@ -152,7 +147,7 @@ function TestFailed({ error }: { error: unknown }) {
     <p>{failure.hint}</p>
     {cantList(error) && failure.code !== "SQL Server error 4060" && <p>If the login can't open master, where the server lists its
       databases, they may still be readable through the connection: type them below. Or give the login a user in master (VIEW ANY
-      DATABASE) and test again. On Azure SQL, Azure can list them instead: see Azure SQL below.</p>}</Notice>;
+      DATABASE) and test again.</p>}</Notice>;
 }
 
 /** The databases typed by hand, for a login that can't list the server's. */
@@ -170,15 +165,12 @@ function TypedDatabases({ onUse }: { onUse: (names: string[]) => void }) {
   );
 }
 
-function Step1({ chosen, setChosen, tested, setTested, testing, error, setError, azureCredential, setAzureCredential,
-                 azureResource, setAzureResource }: { chosen: string; setChosen: (c: string) => void; tested: Row | null;
-                 setTested: (t: Row | null) => void; testing: boolean; error: unknown; setError: (e: unknown) => void;
-                 azureCredential: string; setAzureCredential: (c: string) => void; azureResource: string;
-                 setAzureResource: (r: string) => void }) {
+function Step1({ chosen, setChosen, tested, setTested, testing, error, setError }: { chosen: string; setChosen: (c: string) => void;
+                 tested: Row | null; setTested: (t: Row | null) => void; testing: boolean; error: unknown;
+                 setError: (e: unknown) => void }) {
   const { config } = useSettings();
   const [how, setHow] = useState<"existing" | "create">("existing");
   const [search, setSearch] = useState("");
-  const azure = azureOf(azureCredential, azureResource);
   const qc = useQueryClient();
   const list = useQuery({ queryKey: ["connections"], queryFn: () => api.get<Row>("/connections") });
   const [refreshing, setRefreshing] = useState(false);
@@ -223,23 +215,6 @@ function Step1({ chosen, setChosen, tested, setTested, testing, error, setError,
             {tested.typed ? "uses" : "reads"} {fmtInt(tested.databases.length)} {plural(tested.databases.length, "database")} through {chosen}
           </span></span></div>}
           {error != null && <TestFailed error={error} />}
-          <details className="advanced">
-            <summary><b>Azure SQL</b> <span className="muted">list the databases through Azure instead of master
-              {azure.azure_credential ? <>: on, with {azure.azure_credential}</> : ", for a login that can't open master"}</span></summary>
-            <p className="muted">Azure SQL Database and Managed Instance only. <Info>The server's databases are listed through
-              Azure with a Unity Catalog service credential (Catalog Explorer, External data, Credentials) whose managed identity
-              has Reader on the server, then each database is read through the connection. Whoever adds the tables needs ACCESS
-              on the credential.</Info></p>
-            <div className="toolbar">
-              <label className="inline">Service credential<input className="search" placeholder="e.g. sql_reader" value={azureCredential}
-                disabled={testing} onChange={(e) => { setAzureCredential(e.target.value); setTested(null); setError(null); }} /></label>
-              <label className="inline">Server resource id<input className="search" size={60}
-                placeholder="/subscriptions/…/resourceGroups/…/providers/Microsoft.Sql/servers/…" value={azureResource}
-                disabled={testing} onChange={(e) => { setAzureResource(e.target.value); setTested(null); setError(null); }} /></label>
-            </div>
-            {Boolean(azureCredential.trim()) !== Boolean(azureResource.trim()) &&
-              <span className="muted">Both are needed; with one, the databases are listed through master.</span>}
-          </details>
           {error != null && cantList(error) && <TypedDatabases onUse={(names) => { setError(null); setTested({ discovery_id: null, databases: names, typed: true }); }} />}
         </div>
       )}
@@ -456,11 +431,9 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
   const [tested, setTested] = useState<Row | null>(null);
   const [testing, setTesting] = useState(false);
   const [testError, setTestError] = useState<unknown>(null);
-  const [azureCredential, setAzureCredential] = useState("");
-  const [azureResource, setAzureResource] = useState("");
   const [picks, setPicks] = useState<Picks>({});
   const [wholeServer, setWholeServer] = useState<WholeServer>({ on: false, filter: "" });
-  // The whole server's discovery, read once (under its filter, through Azure if tested so); its databases aren't listed here.
+  // The whole server's discovery, read once (under its filter); its databases aren't listed here.
   const [serverRead, setServerRead] = useState<string | null>(null);
   const [read, setRead] = useState<Record<string, string>>({});
   const [failed, setFailed] = useState<[string, string][]>([]);
@@ -478,14 +451,13 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
   // passed for the connection chosen isn't run again; choosing another clears it.
   const testThenNext = async () => {
     if (tested) return setStep(2);
-    const azure = azureOf(azureCredential, azureResource);
     setTesting(true); setTestError(null);
     const asked = new Date();
     setWaiting({ asked, reading: "Testing the connection" });
     try {
-      const { id, via } = await discover(connection, { kind: "list", ...azure });
+      const { id, via } = await discover(connection, { kind: "list" });
       const rows = await api.get<Row[]>(`/discoveries/${id}/databases`);
-      setTested({ discovery_id: id, via, databases: rows.filter((r) => r.status === "listed").map((r) => r.src_database), azure });
+      setTested({ discovery_id: id, via, databases: rows.filter((r) => r.status === "listed").map((r) => r.src_database) });
       setStep(2);
     } catch (e) { setTestError(e); } finally { setTesting(false); setWaiting(null); }
   };
@@ -580,7 +552,7 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
         // can't open; through the discovery job, it is listed again under the filter's LIKE pattern.
         const pattern = likeContaining(wholeServer.filter);
         const request = throughWarehouse ? { whole_server: true, listing_id: discoveryId, filter: wholeServer.filter }
-          : { whole_server: true, ...(pattern ? { pattern } : {}), ...(tested?.azure ?? {}) };
+          : { whole_server: true, ...(pattern ? { pattern } : {}) };
         const got = await readTables(connection, request, onProgress);
         if (got.failed.length) { setFailed(() => got.failed); setStep(2); return; }
         readServer = got.id; setServerRead(got.id);
@@ -618,8 +590,7 @@ export function DiscoverDialog({ onClose, drafts = false }: { onClose: (pick: Di
       }}>
       <div className="discover">
         {step === 1 && <Step1 chosen={connection} setChosen={choose} tested={tested} setTested={setTested} testing={testing}
-          error={testError} setError={setTestError} azureCredential={azureCredential} setAzureCredential={setAzureCredential}
-          azureResource={azureResource} setAzureResource={setAzureResource} />}
+          error={testError} setError={setTestError} />}
         {step >= 2 && <Step2 connection={connection} discoveryId={discoveryId} checksOn={throughWarehouse} typedNames={typedNames}
           picks={picks} setPicks={setPicks} wholeServer={wholeServer} setWholeServer={setWholeServer} read={read} setRead={setRead}
           failed={failed} setFailed={setFailed} onCounts={setCounts} />}
