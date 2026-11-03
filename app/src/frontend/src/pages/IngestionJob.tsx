@@ -278,7 +278,7 @@ function TargetNames({ jobId, stored, onClose }: { jobId: string; stored: Row; o
 export default function IngestionJob() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
-  // The warnings of the Create that landed here (NewJob.tsx), shown once, where the Create ends.
+  // The warnings of the Create that landed here (NewJob.tsx), shown with the page the Create ends on.
   const createWarnings: Row[] = ((useLocation().state as Row | null)?.warnings ?? []) as Row[];
   const [pages, setPages] = useState<string[]>([]);
   const before = pages[pages.length - 1];
