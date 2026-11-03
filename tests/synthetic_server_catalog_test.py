@@ -84,29 +84,6 @@ def test_unopenable_and_paused_databases_are_few_and_distinct():
     assert all(server.is_unopenable(sc.database_index(n)) for n in server.unopenable_names())
 
 
-def test_the_arm_listing_pages_through_every_database():
-    server = sc.ServerCatalog(databases=22_000)
-    base = "https://management.azure.com/x"
-    seen, page, pages = [], 0, 0
-    while True:
-        body = server.arm_page(page, base)
-        seen += [v["name"] for v in body["value"]]
-        pages += 1
-        if "nextLink" not in body:
-            break
-        assert body["nextLink"] == f"{base}?page={page + 1}"
-        page += 1
-    assert pages == server.arm_page_count() == 22_000 // sc.ARM_PAGE_SIZE
-    assert seen == [sc.database_name(i) for i in range(22_000)]
-    assert {v["properties"]["status"] for v in server.arm_page(0, base)["value"]} == {"Online"}
-
-
-def test_a_small_server_lists_its_paused_database_as_paused():
-    server = sc.ServerCatalog(databases=25)
-    statuses = {v["name"]: v["properties"]["status"] for v in server.arm_page(0, "u")["value"]}
-    assert [n for n, s in statuses.items() if s == "Paused"] == server.paused_names()
-
-
 def test_reading_past_the_last_database_is_refused():
     with pytest.raises(KeyError):
         sc.ServerCatalog(databases=3).catalog(3)

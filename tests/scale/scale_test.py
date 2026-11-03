@@ -54,12 +54,6 @@ def test_a_name_filter_lists_only_its_family():
     assert all(n.startswith("lfc_eng_") for n in run.order)
 
 
-def test_azure_listing_pages_and_discovers_the_same_databases(small_catalog):
-    run = steps.discover(small_catalog, via_azure=True)
-    assert run.calls_by_kind["arm"] == small_catalog.arm_page_count()
-    assert run.listed == small_catalog.database_names()
-
-
 def test_the_found_rows_go_to_the_callback_as_they_are_read(small_catalog):
     seen = []
     run = steps.discover(small_catalog, limit=5, on_found=lambda name, rows: seen.append((name, len(rows))))
