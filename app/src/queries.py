@@ -1196,13 +1196,13 @@ order by s.failing_since nulls last, f.task_collection, f.server, f.src_database
 
 
 def failing_table_rows(rows: List[dict]) -> List[dict]:
-    """failing_tables_sql's rows as the job page shows them. The class is the engine's error class (a Spark error
-    class, or the exception's type) and the app's word for the cause when that is not recorded; the kind is transient,
-    permanent or unknown. The message is the latest failure's, else the checkpoint's note."""
+    """failing_tables_sql's rows, as db.query returns them (timestamps already ISO text), shaped as the job page shows
+    them. The class is the engine's error class (a Spark error class, or the exception's type) and the app's word for
+    the cause when that is not recorded; the kind is transient, permanent or unknown. The message is the latest
+    failure's, else the checkpoint's note."""
     out = []
     for r in rows:
         message = r.get("error") or r.get("checkpoint_detail") or ""
-        since = r.get("failing_since")
         out.append({
             "control_id": r["control_id"], "task_collection": r["task_collection"], "server": r["server"],
             "src_database": r["src_database"], "src_schema": r["src_schema"], "src_table": r["src_table"],
@@ -1210,7 +1210,7 @@ def failing_table_rows(rows: List[dict]) -> List[dict]:
             "error_class": r.get("error_class") or classify_error(message)[1],
             "error_kind": r.get("error_kind") or None,
             "message": message[:2000],
-            "failing_since": since.isoformat() if since else None,
+            "failing_since": r.get("failing_since") or None,
             "runs": int(r.get("runs") or 0),
             "failures": int(r.get("failures") or 0),
         })

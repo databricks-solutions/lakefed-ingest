@@ -1,6 +1,7 @@
 """The JDBC connection form's login part: the login fields show only when the secret scope is the app's login scope, the
 copy says any signed-in user may make a connection, and a key with {database} in it asks which database its login is
-for. Plain source checks, no app run."""
+for, and the trust choice is posted under the name the backend reads (trust_server_certificate). Plain source checks,
+no app run."""
 from pathlib import Path
 
 PAGES = Path(__file__).resolve().parents[1] / "src" / "frontend" / "src" / "pages"
@@ -34,3 +35,9 @@ def test_the_login_posts_the_key_as_typed_and_the_database_apart():
 
 def test_the_login_is_written_under_the_key_with_the_database_filled_in():
     assert "template.split(DATABASE_TOKEN).join(databaseName)" in LOGIN
+
+
+def test_the_trust_choice_is_posted_as_trust_server_certificate_and_not_under_the_forms_own_key():
+    assert "const { trust, ...fields } = form;" in FORM
+    assert "trust_server_certificate: trust }" in FORM
+    assert 'api.post<Row>("/jdbc-connections", body)' in FORM

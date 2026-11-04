@@ -1,6 +1,6 @@
 # Automated prerequisites: the Lakebase OLTP instance + its UC-registered database, the source
 # credential secret scope, and a setup job that applies / migrates the Lakebase schema (control,
-# checkpoints, reseed queue, telemetry).
+# checkpoints, reseed queue, telemetry), run by every deploy.
 #
 # NOTE: deploying this file CREATES BILLABLE INFRASTRUCTURE (a Lakebase instance). To reuse
 # pre-provisioned resources instead, adopt them with `databricks bundle deployment bind` before the
@@ -68,3 +68,19 @@ resources:
           default: ${var.lakebase_instance}
         - name: db_name
           default: ${var.lakebase_database}
+
+  # The deploy runs the setup job and waits for it, so the schema is applied (or migrated) before the app starts; a
+  # run that fails fails the deploy and is run again by the next one. db_name refers to the database catalog, which
+  # creates the database, so the run starts only once the database exists. queue: a setup run the app or a person
+  # started a moment before waits for that one instead of being skipped (the job runs one at a time).
+  job_runs:
+    lakefed_ingest_setup_run:
+      job_id: ${resources.jobs.lakefed_ingest_setup.id}
+      job_parameters:
+        db_instance: ${resources.database_instances.lakebase.name}
+        db_name: ${resources.database_catalogs.lakebase_catalog.database_name}
+      queue:
+        enabled: true
+      lifecycle:
+        triggers:
+          - on_bundle_deploy: true

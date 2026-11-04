@@ -16,7 +16,7 @@ that the ingested Delta tables match the source.
 
 The catalog models a property-management suite: 18 modules of 100 tables each, such as `prop_*`,
 `ar_*` and `gl_*`, all in schema `dbo`. About 15% are empty, 50% are lookup or config tables, 25%
-master/detail, 9% transaction/history, and 1% are very large. Tables have 10–60 columns (a few wide
+master/detail, 9% transaction/history, and 1% are very large. Tables have 10 to 60 columns (a few wide
 ones have more than 100), and about 15% have composite primary keys.
 
 The data is generated inside SQL Server with set-based `INSERT ... SELECT`, not pushed from Spark.
@@ -42,7 +42,7 @@ Use `scale_factor` 0.01 for a fast dev loop. Use 0.1 or more to exercise partiti
 - A login that can create tables and enable Change Tracking (`db_owner` on the database is simplest).
 - A secret holding JSON `{"user": "...", "password": "..."}`. It has the same format as the ingestion
   job's per-database secrets, so one secret can serve both.
-- For `load_type` `ct`, the ingestion prerequisites also apply (see the main README).
+- For `load_type` `ct`, the ingestion prerequisites also apply (see "Before you start" in docs/deploy.md).
 
 ## Run
 

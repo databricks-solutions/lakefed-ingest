@@ -3,15 +3,17 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 The repo is **Ingestion Workbench** (formerly lakefed-ingest and the EDW Ingestion Accelerator). It holds **two
-versions** of a metadata-driven framework that ingests external databases into Databricks Delta tables. Each is its own Databricks Asset Bundle:
+versions** of a metadata-driven framework that ingests external databases into Databricks Delta tables. Each is its own Databricks Asset Bundle. Job orchestration is the legacy version; all new
+development goes into the default version:
 
 | Version | Location | Bundle | Orchestration / compute / state |
 |---|---|---|---|
 | **Default** | repo root (`databricks.yml`, `resources/`, `src/lakefed_ingest/`, `tests/`) | `lakefed_ingest_v2` | One job task per `task_collection`, in-process threads + FAIR pools on a job cluster; Lakebase (Postgres) state; Spark JDBC; source adapters (SQL Server, Oracle, PostgreSQL, MySQL) + load strategies (SQL Server Change Tracking and watermark cursor, full reload) |
-| **Job orchestration** | `job_orchestration/` | `lakefed_ingest` | Jobs `for_each` tasks; SQL warehouse + notebooks; Delta control table; Lakehouse Federation / `remote_query` |
+| **Job orchestration** (legacy) | `job_orchestration/` | `lakefed_ingest` | Jobs `for_each` tasks; SQL warehouse + notebooks; Delta control table; Lakehouse Federation / `remote_query` |
 
-An optional operations app (Databricks App: FastAPI backend + React/TypeScript frontend) for the
-default version is its own bundle in `app/` (`lakefed_ingest_app`); see `app/README.md`. SQL lives in
+The operations app (Databricks App: FastAPI backend + React/TypeScript frontend) for the default version lives in
+`app/` and is part of the root bundle (`app/resources/lakefed_ingest_app.yml`, included by `databricks.yml`; the app
+is told the job ids by `${resources.jobs.<key>.id}`); see `app/README.md`. SQL lives in
 `app/src/queries.py` (unit-tested); Databricks Apps builds the frontend at deploy time. Schedules
 (`app/src/schedules.py`): one wrapper job per (schedule, collection), a cron + `run_job` task that starts the
 ingestion job with `task_collection`; `max_concurrent_runs` 1, no queue (overruns skip triggers). A schedule of
@@ -40,9 +42,9 @@ pytest job_orchestration/tests           # job orchestration version
 
 ### Deploy
 ```bash
-# Default version (repo root)
+# Default version (repo root): one deploy creates everything, runs lakefed_ingest_setup (job_runs), starts the app
+# (lifecycle.started) and runs lakefed_ingest_app_grants, in that order. Needs Databricks CLI 1.13.0 or above.
 databricks bundle deploy -t <target> -p <profile>
-databricks bundle run lakefed_ingest_setup -t <target> -p <profile>   # create the Lakebase schema (upgrades migrate on the next ingest run)
 databricks bundle run lakefed_ingest -t <target> -p <profile> --params task_collection=<name>
 
 # Job orchestration version

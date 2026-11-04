@@ -2,6 +2,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 import product
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,9 +36,20 @@ def test_workspace_client_passes_the_product(monkeypatch):
     assert seen == {"product": "ingestion-workbench", "product_version": product.PRODUCT_VERSION, "host": "h"}
 
 
+def test_every_job_carries_the_project_tag():
+    # Serverless jobs have no cluster to tag, so the job's own tag is what attributes their usage.
+    yaml = pytest.importorskip("yaml")
+    jobs = {}
+    for path in list((ROOT / "resources").glob("*.yml")) + [ROOT / "app" / "resources" / "lakefed_ingest_app.yml"]:
+        jobs.update((yaml.safe_load(path.read_text()).get("resources") or {}).get("jobs") or {})
+    assert len(jobs) >= 7
+    assert {name: (job.get("tags") or {}).get("project") for name, job in jobs.items()} == \
+        {name: "${var.project_tag}" for name in jobs}
+
+
 def test_every_bundle_resource_tag_names_the_product():
     for path in list((ROOT / "resources").glob("*.yml")) + [ROOT / "app" / "resources" / "lakefed_ingest_app.yml"]:
         text = path.read_text()
         assert "project: lakefed_ingest" not in text and "value: lakefed_ingest\n" not in text, path.name
-    for bundle in (ROOT / "databricks.yml", ROOT / "app" / "databricks.yml"):
-        assert re.search(r"^  project_tag:\n(?:    .*\n)+?    default: ingestion-workbench$", bundle.read_text(), re.M), bundle
+    # One bundle (the app's resources are included from the root), so one variable sets every tag.
+    assert re.search(r"^  project_tag:\n(?:    .*\n)+?    default: ingestion-workbench$", (ROOT / "databricks.yml").read_text(), re.M)

@@ -1,12 +1,16 @@
 # Scale simulation
 
+> **A dated report.** Written on 29 Oct 2026 (last changed at commit b8c5988) from a simulated catalog. Its figures are
+> estimates from plain Python runs, not current guidance; the last section lists what only a real deployment can measure.
+
 The scale harness (`tests/scale/`) runs the discover job, the operations app's create-by-reference and upload
 paths, and the monitoring pages' queries against a simulated 22,000-database SQL Server catalog
 (`tests/synthetic/server_catalog.py`, 240 tables each, 5,280,000 tables). Nothing connects to a database or a workspace:
 discovery reads go to a simulated server at the discovery boundary, and Lakebase statements go to recording fakes.
 
-This is a plain Python run on a laptop. It shows the code's call counts, statement counts and row counts, its
-Python time on this machine, and the wall time a given per-call latency would give. It does not measure Lakebase or
+These figures were produced by `tests/scale/run_scale.py` as plain Python runs on one developer machine, whose
+processor, memory and Python version weren't recorded. They show the code's call counts, statement counts and row counts,
+its Python time on that machine, and the wall time a given per-call latency would give. It does not measure Lakebase or
 SQL Server latency. The numbers that need a test on a real deployment are listed at the end.
 
 ## Running it
@@ -21,7 +25,7 @@ tests/scale` adds the 417-database and 22,000-database tests.
 
 ## Results
 
-Measured by `run_scale.py`, one process per size. "Python s" is the time the code took on this laptop. "Wall" is
+Measured by `run_scale.py`, one process per size. "Python s" is the time the code took on that machine. "Wall" is
 simulated from each database's catalog calls and the per-call latency (see the assumptions below).
 
 ### Discovery
@@ -39,12 +43,12 @@ Simulated wall time, in seconds, by per-call latency:
 
 | Databases | Workers | 0.25 s | 0.5 s | 0.9 s | 1.5 s | 2.0 s |
 |---|---|---|---|---|---|---|
-| 417 | 8 (notebook today) | 45.2 | 84.5 | 148.5 | 243.0 | 320.5 |
+| 417 | 8 (the notebook before the discovery fix) | 45.2 | 84.5 | 148.5 | 243.0 | 320.5 |
 | 417 | 32 (design) | 24.5 | 26.5 | 38.7 | 64.5 | 86.0 |
-| 22,000 | 8 (notebook today) | 2,068.8 | 4,131.5 | 7,432.2 | 12,382.5 | 16,508.0 |
+| 22,000 | 8 (the notebook before the discovery fix) | 2,068.8 | 4,131.5 | 7,432.2 | 12,382.5 | 16,508.0 |
 | 22,000 | 32 (design) | 517.8 | 1,034.0 | 1,859.4 | 3,097.5 | 4,130.0 |
 
-At 0.9 s a call the 22,000-database discovery takes 31 minutes at 32 workers and 2.1 hours at the notebook's 8.
+At 0.9 s a call the 22,000-database discovery takes 31 minutes at 32 workers and 2.1 hours at 8, the notebook's count before the discovery fix (it now takes `discover_workers`, default 32).
 
 ### Create by reference
 
@@ -79,14 +83,14 @@ twelve (285 over 23), and the reads of a whole batch are one statement. The roun
 databases.
 
 At 22,000 databases (5,279,280 tables), the before run was measured once with the pre-packing runner: 176,404 statements,
-21,999 transactions, 220,402 round trips, about 441 s at 2 ms. The after run was not made on the Mac: database-shaped
+21,999 transactions, 220,402 round trips, about 441 s at 2 ms. The after run was not made in the simulation: database-shaped
 runs are left to a real deployment. Packing predicts about 1,056 transactions and about 15,000 round trips at 5,000 tables a
-transaction, which is the same factor again, but that is an estimate until main's Databricks run measures it.
+transaction, which is the same factor again, but that is an estimate until a run on a real deployment measures it.
 
 ### Each statement of a database, at 1,000 tables a database
 
-The by-database create's statements, what each one does, and what it costs at 1,000 tables (the size the main test
-uses). "Before" is the per-database write. "After" is what each becomes once a transaction holds up to 5,000 tables.
+The by-database create's statements, what each one does, and what it costs at 1,000 tables (the size of the 100-database
+test upload named at the end). "Before" is the per-database write. "After" is what each becomes once a transaction holds up to 5,000 tables.
 
 | Statement | Before (per database) | Index used before | Cost at 1,000 tables before | After |
 |---|---|---|---|---|
@@ -99,7 +103,7 @@ uses). "Before" is the per-database write. "After" is what each becomes once a t
 | Group member | 1 | `schedule_member_uq` | cheap | one per transaction, in one statement for the groups it lacks |
 | Run lock | 1 per group | advisory key | cheap | one per transaction, for all its groups |
 | Task progress | 1 | primary key | cheap | one per transaction |
-| Rollup rewrite | none on this branch; one per database on the `fixes` branch and main | the rewrite joins `control` on `coalesce(t.src_database, '')`, so no index applies | scans all of `control` and joins `checkpoint` and `database_check`: the likely heavy statement on main | not on this branch; after packing, once per transaction on `fixes`, which still needs its join made exact |
+| Rollup rewrite | once per transaction: the packed create rewrites the rollups at the end of each | the rewrite joins `control` on `coalesce(t.src_database, '')`, so no index applies | scans all of `control` and joins `checkpoint` and `database_check`: the likely heavy statement | not in this simulation's counts, which predate it |
 
 The statements that scan a table are the ones that grow with the whole table rather than with the database, so they are
 the ones that make the cost rise faster than linearly. The control insert is the work the table really does, one index
@@ -108,9 +112,9 @@ entry per row for each of its indexes.
 ### Expected time for 100,000 and 5.28 million tables
 
 These are estimates, not measurements. Lakebase's per-statement time is not measured here, and the server's work per table
-is estimated, not timed. Main's real rerun is the test that decides.
+is estimated, not timed. A rerun on a test deployment is the test that decides.
 
-The model: round trips at 2 ms each, plus the server's work per table, which I estimate at 50 to 150 microseconds (a
+The model: round trips at 2 ms each, plus the server's work per table, estimated at 50 to 150 microseconds (a
 control row with its indexes, its change-log row, and its share of the upload read's index range).
 
 | Tables | Transactions | Round trips (about) | Round-trip time | Server work | Expected total |
@@ -131,9 +135,9 @@ figures assume three things that must hold on the real app:
   The fix is to push `src_database = any(...)` into the DISTINCT ON's inner filter, which the discovered table's primary
   key serves. It is not done here because it cannot be checked without a server.
 
-For main's own number: 84.2 s for 100,000 tables is 0.84 s a database, which is what one rollup rewrite per database
+For the one figure measured on a test deployment: 84.2 s for 100,000 tables is 0.84 s a database, which is what one rollup rewrite per database
 (a scan of `control` with its joins) would cost. Packing alone cuts the rewrites from 100 to 20, which would bring 84.2 s
-to about 20 s if the rewrite is the cost. Main can confirm it by timing a create with the rewrite skipped, or by
+to about 20 s if the rewrite is the cost. A test deployment can confirm it by timing a create with the rewrite skipped, or by
 `EXPLAIN (ANALYZE, BUFFERS)` on the rewrite. The exact join is what keeps the time linear in tables.
 
 The new statements have not run against Postgres here (the `_pg` tests skip without a server), so their plans are reasoned
@@ -186,11 +190,11 @@ The kinds are the statement verb and table, with the `lakefed_ingest.` schema le
   `steps.DiscoveryWriter`, and a test pins its column list to the notebook's.
 - **Lakebase rows.** The fake counts one row per statement for these statements (each carries one row), so rows equal
   statements in the discovery rows.
-- **Discovery Python time and peak memory.** Measured on this machine, including the simulated server's work and the
+- **Discovery Python time and peak memory.** Measured on the developer machine, including the simulated server's work and the
   writes' row construction. They exclude the network and the database.
 - **Wall time.** The listing and each database's catalog calls (calls x per-call latency, plus retry waits) are laid out
   on a pool in listing order, as a `ThreadPoolExecutor` takes them. The per-call latency is applied afterwards, so one
-  run gives every latency in the table. The 8 workers match the notebook (`min(8, databases)`); 32 is the design's cap.
+  run gives every latency in the table. The 8 workers match the notebook as it was (`min(8, databases)`); it now takes `discover_workers`, default 32, the design's cap.
 - **Per-call latency 0.25 to 2.0 s.** The design's 25 to 40 minutes at 32 workers for 22,000 databases implies
   0.7 to 1.2 s a call. The 0.9 s line is the middle of that range and gives 31 minutes. This is an assumption, not a
   measurement of the catalog's round trip.
@@ -210,7 +214,9 @@ The kinds are the statement verb and table, with the `lakefed_ingest.` schema le
 - **Peak memory.** Peak resident memory of the process (macOS `ru_maxrss`, cumulative for the process). The
   22,000-database create figure is extrapolated linearly from the 99,360-table run and is not measured.
 
-## Reruns after other pieces merge
+## When to rerun this benchmark
+
+Each of these areas changes what the simulation counts. After a change to one, rerun the parts named.
 
 - **Create by database.** Changes what the create plans (groups per database, not per server) and the writes it makes.
   Rerun the create rows and the statement counts; the 5,280,000-table create's refusal and its extrapolation move with
@@ -230,5 +236,5 @@ The kinds are the statement verb and table, with the `lakefed_ingest.` schema le
 - Peak memory of the create and the selection read at 5,280,000 tables, on the app's real compute.
 - Monitoring pages' latency with 22,000 databases and 5,280,000 control rows in Lakebase (the state scan's cost).
 - The upload route's real 413 behaviour through the Apps proxy, and the real request size with JSON encoding.
-- The by-database create's time with the packed path: main's upload of 100 databases x 1,000 tables, Create by reference
+- The by-database create's time with the packed path: a test deployment's upload of 100 databases x 1,000 tables, Create by reference
   over the whole server (84.2 s before the packing). The expected times in the section above are estimates until that rerun.

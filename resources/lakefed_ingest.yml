@@ -146,8 +146,8 @@ resources:
         - name: detection_chunk
           default: ${var.detection_chunk}
         # Concurrent queries per source server across every run of every collection: each run
-        # takes its share, this divided by the runs reading the server, at least 1 (README
-        # "Concurrency" has the limits). "0" = no cap.
+        # takes its share, this divided by the runs reading the server, at least 1 (docs/how-it-works.md,
+        # "Concurrency", has the limits). "0" = no cap.
         - name: max_queries_per_source
           default: ${var.max_queries_per_source}
         # Table retries: a table that fails with a transient source error (a refused or dropped

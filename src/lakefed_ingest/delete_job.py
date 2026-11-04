@@ -7,7 +7,8 @@ Restore can bring it back. This job runs as the deployer (the state database's o
 - **Which groups:** the deleted job's members that no other live job holds (a group is in one job, but a removed
   member could have joined another job since).
 - **When:** a job's delete run (its id given) purges it at once, from the app's Delete now. The daily run purges
-  every deleted job whose retention has run out (purge_expired), each in its own transaction.
+  every deleted job whose retention has run out (purge_expired), each in its own transaction. A job that fails is
+  recorded and the others go on; the run ends as failed if any job or any target drop failed.
 - **Finished:** the purge sets the job's options.delete_finished in the same transaction as the rows, so the app
   lists it as purged and refuses a Restore.
 - **What goes, in one transaction under each group's run lock:** the groups' control rows and what is keyed by them
@@ -51,18 +52,18 @@ def schedule_sql() -> str:
 
 
 def expired_jobs_sql() -> str:
-    """The deleted jobs whose retention has run out and whose delete hasn't finished, oldest first: their id, name and
-    whether they asked for their target tables to go. Param: retention days."""
-    return (f"select id, name, coalesce((options ->> 'delete_drop_targets')::boolean, false) as drop_targets "
-            f"from {SCHEMA}.schedule where deleted_at is not null and deleted_at <= now() - make_interval(days => %s) "
+    """The deleted jobs whose retention has run out and whose delete hasn't finished, oldest first: their id and name.
+    Param: retention days."""
+    return (f"select id, name from {SCHEMA}.schedule "
+            f"where deleted_at is not null and deleted_at <= now() - make_interval(days => %s) "
             f"and not coalesce((options ->> 'delete_finished')::boolean, false) order by deleted_at, id")
 
 
 def expired_check_sql() -> str:
     """One deleted job's row when its retention has run out and its delete hasn't finished, locked for this
-    transaction (a Restore waits for it), with whether it asked for its target tables to go. Params: schedule id,
-    retention days."""
-    return (f"select coalesce((options ->> 'delete_drop_targets')::boolean, false) from {SCHEMA}.schedule "
+    transaction (a Restore waits for it), with its delete_drop_targets option as the text it holds (asks_for_targets
+    reads it, so one job's bad value fails that job alone). Params: schedule id, retention days."""
+    return (f"select options ->> 'delete_drop_targets' from {SCHEMA}.schedule "
             f"where id = %s and deleted_at is not null and deleted_at <= now() - make_interval(days => %s) "
             f"and not coalesce((options ->> 'delete_finished')::boolean, false) for update")
 
@@ -261,9 +262,22 @@ def delete_table_rows(cur, schedule_id: int, control_ids) -> dict:
             "databases": len(databases), "targets": {"drop": [], "kept": kept}}
 
 
+def asks_for_targets(option) -> bool:
+    """Whether a job's delete_drop_targets option asks for its target tables to go: true or false as the app writes
+    them (text or a boolean), and false when it is not set. Raises ValueError for anything else."""
+    if option is None or isinstance(option, bool):
+        return bool(option)
+    word = str(option).strip().lower()
+    if word in ("true", "t", "yes", "on", "1"):
+        return True
+    if word in ("false", "f", "no", "off", "0"):
+        return False
+    raise ValueError(f"the job's delete_drop_targets option is {option!r}, not true or false: nothing was purged")
+
+
 def expired_jobs(cur, retention_days: int) -> List[dict]:
-    """Inside the caller's transaction: the deleted jobs whose retention has run out, as {"id", "name",
-    "drop_targets"} rows (see expired_jobs_sql)."""
+    """Inside the caller's transaction: the deleted jobs whose retention has run out, as {"id", "name"} rows (see
+    expired_jobs_sql)."""
     cur.execute(expired_jobs_sql(), (int(retention_days),))
     return _rows(cur)
 
@@ -271,25 +285,29 @@ def expired_jobs(cur, retention_days: int) -> List[dict]:
 def delete_expired(cur, schedule_id: int, retention_days: int) -> Optional[dict]:
     """Inside the caller's transaction: delete_rows for one deleted job whose retention has run out, with its
     ``drop_targets`` choice added. Returns None when it has no longer (a Restore, or its purge, came first): nothing
-    is deleted then. Raises RunGoing as delete_rows does."""
+    is deleted then. Raises RunGoing as delete_rows does, and ValueError when the job's delete_drop_targets option is
+    neither true nor false."""
     cur.execute(expired_check_sql(), (int(schedule_id), int(retention_days)))
     found = cur.fetchall()
     if not found:
         return None
+    drop_targets = asks_for_targets(found[0][0])
     result = delete_rows(cur, schedule_id)
-    result["drop_targets"] = bool(found[0][0])
+    result["drop_targets"] = drop_targets
     return result
 
 
 def purge_expired(transaction, retention_days: int, drop_tables) -> dict:
     """Purge every deleted job whose retention has run out, each in its own transaction, so one job's run going
-    doesn't hold up the others (a job whose group is loading waits for the next daily run). ``transaction()`` opens
-    one transaction and yields its cursor; ``drop_tables(tables)`` drops them after the commit and returns
-    {table: error} for the ones it couldn't. A job's target tables are dropped only if it asked for them.
-    Returns {"listed", "purged": [summary per job], "waiting": [{"job", "reason"}], "failed": {table: error}}."""
+    doesn't hold up the others (a job whose group is loading waits for the next daily run, and a job that fails for
+    any other reason is recorded and left for the next run). ``transaction()`` opens one transaction and yields its
+    cursor; ``drop_tables(tables)`` drops them after the commit and returns {table: error} for the ones it couldn't.
+    A job's target tables are dropped only if it asked for them.
+    Returns {"listed", "purged": [summary per job], "waiting": [{"job", "reason"}], "failed": {table: error},
+    "failed_jobs": [{"job", "reason"}]}."""
     with transaction() as cur:
         listed = expired_jobs(cur, retention_days)
-    purged, waiting, failed = [], [], {}
+    purged, waiting, failed, failed_jobs = [], [], {}, []
     for job in listed:
         try:
             with transaction() as cur:
@@ -297,13 +315,23 @@ def purge_expired(transaction, retention_days: int, drop_tables) -> dict:
         except RunGoing as error:
             waiting.append({"job": job["name"], "reason": str(error)})
             continue
+        except Exception as error:
+            failed_jobs.append({"job": job["name"], "reason": _reason(error)})
+            continue
         if result is None:
             continue
         to_drop = result["targets"]["drop"] if result["drop_targets"] else []
-        drop_failed = drop_tables(to_drop) if to_drop else {}
+        try:
+            drop_failed = drop_tables(to_drop) if to_drop else {}
+        except Exception as error:
+            drop_failed = {table: _reason(error) for table in to_drop}
         failed.update(drop_failed)
         purged.append(summary(result, [t for t in to_drop if t not in drop_failed], drop_failed))
-    return {"listed": len(listed), "purged": purged, "waiting": waiting, "failed": failed}
+    return {"listed": len(listed), "purged": purged, "waiting": waiting, "failed": failed, "failed_jobs": failed_jobs}
+
+
+def _reason(error: Exception) -> str:
+    return (str(error) or type(error).__name__)[:300]
 
 
 DRAFT_TTL_S = 2 * 3600
@@ -365,3 +393,16 @@ def failure_message(failed: Dict[str, str]) -> str:
     named = "; ".join(f"{table}: {error}" for table, error in list(failed.items())[:LISTED])
     more = f"; and {len(failed) - LISTED} more (the run's output lists them)" if len(failed) > LISTED else ""
     return f"the job's tables are deleted, but {len(failed)} target table(s) could not be dropped (drop them by hand): {named}{more}"
+
+
+def purge_failure_message(purged: dict) -> str:
+    """Why the daily run fails once every job has had its turn: the jobs it couldn't purge (their rows are still there
+    and the next daily run tries them again) and the target tables it couldn't drop (which a second run won't find)."""
+    parts = []
+    if purged["failed_jobs"]:
+        named = "; ".join(f"{entry['job']}: {entry['reason']}" for entry in purged["failed_jobs"][:LISTED])
+        parts.append(f"{len(purged['failed_jobs'])} job(s) could not be purged (the next daily run tries them again): "
+                     f"{named}")
+    if purged["failed"]:
+        parts.append(failure_message(purged["failed"]))
+    return " | ".join(parts)
