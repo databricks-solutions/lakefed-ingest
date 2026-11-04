@@ -41,7 +41,6 @@ a:hover { text-decoration: underline; }
 .brand { font-weight: var(--db-font-weight-semibold); font-size: 18px; padding: 0 var(--db-space-2); display: flex; align-items: center; gap: var(--db-space-2); }
 .brand .mark { width: 22px; height: 22px; border-radius: var(--db-shape-control); background: var(--db-negative-surface); display: inline-flex;
   align-items: center; justify-content: center; color: #fff; font-size: 12px; font-weight: 700; }
-.brand small { display: block; font-weight: var(--db-font-weight-normal); font-size: var(--db-font-size-sm); color: var(--muted); }
 .sidebar nav, .sidebar nav > div { display: flex; flex-direction: column; gap: 1px; }
 .nav-group { font-size: var(--db-font-size-xs); font-weight: var(--db-font-weight-semibold); text-transform: uppercase; letter-spacing: .04em;
   color: var(--muted); padding: var(--db-space-3) var(--db-space-2) var(--db-space-1); }
