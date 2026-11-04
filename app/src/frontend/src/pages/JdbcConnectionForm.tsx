@@ -46,7 +46,9 @@ export function JdbcConnectionForm(_props: ChoiceProps) {
     setSaving(true);
     setError(null);
     try {
-      const body = { ...form, src_port: form.src_port.trim() === "" ? null : Number(form.src_port) };
+      const { trust, ...fields } = form;
+      const body = { ...fields, src_port: form.src_port.trim() === "" ? null : Number(form.src_port),
+                     trust_server_certificate: trust };
       const saved = await api.post<Row>("/jdbc-connections", body);
       setMade(saved.connection.name);
       setForm(BLANK);

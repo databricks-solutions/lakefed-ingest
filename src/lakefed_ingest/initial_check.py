@@ -257,7 +257,11 @@ def run_check(store, lock_store, collections: List[str], detect_one: Callable, *
         try:
             # Marked as the check's own record from the start, so a monitor tells it from a group run while it runs.
             run_id = store.start_run(collection, job_run_id, cluster_id, parallelism, work_id=f"check-{job_run_id}")
-            if not share_locks or lock_store.alone_on_collection(collection):
+            if share_locks:
+                with lock_store.alone_on_collection(collection) as alone:
+                    if alone:
+                        _close_abandoned_runs(store, collection, run_id)
+            else:
                 _close_abandoned_runs(store, collection, run_id)
             configs = store.list_task_configs(collection)
             tables = len(configs)
