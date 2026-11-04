@@ -1,13 +1,13 @@
-"""The app bundle's reads_start_cap and reads_max_cap: variables (8 and 32 by default) passed to the app as
+"""The bundle's reads_start_cap and reads_max_cap: variables (8 and 32 by default) passed to the app as
 READS_START_CAP and READS_MAX_CAP, which warehouse_reads reads within bounds. Read as text, like the other bundle
 tests."""
 from pathlib import Path
 
 import warehouse_reads as wr
 
-APP_BUNDLE = Path(__file__).resolve().parents[1]
-VARIABLES = (APP_BUNDLE / "databricks.yml").read_text()
-RESOURCES = (APP_BUNDLE / "resources" / "lakefed_ingest_app.yml").read_text()
+REPO = Path(__file__).resolve().parents[2]
+VARIABLES = (REPO / "databricks.yml").read_text()
+RESOURCES = (REPO / "app" / "resources" / "lakefed_ingest_app.yml").read_text()
 
 
 def _block(name):

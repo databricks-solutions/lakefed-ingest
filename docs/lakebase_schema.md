@@ -1,6 +1,6 @@
 # Lakebase schema
 
-All state for the default version lives in one Lakebase (Postgres) database, schema
+All state for the root implementation lives in one Lakebase (Postgres) database, schema
 `lakefed_ingest`. The DDL is [`src/lakefed_ingest/lakebase_schema.sql`](../src/lakefed_ingest/lakebase_schema.sql),
 applied by the `lakefed_ingest_setup` job on a new deployment and migrated by the first ingestion run
 after an upgrade (see `schema_version` below). The database is registered in Unity Catalog
@@ -113,10 +113,10 @@ The diagram shows the key columns only; the full lists are below. The relationsh
 history behind, which is harmless: a row added again later gets a new `id`, so it seeds from
 scratch.
 
-## `control` — what to ingest
+## `control`: what to ingest
 
 One row per (source database, table). You maintain it; the job only reads it (one query per run,
-for the run's `task_collection`). See "Control rows" in the [README](../README.md) and
+for the run's `task_collection`). See [Control rows](how-it-works.md#control-rows) and
 `notebooks/load_control_example.ipynb`.
 
 | Column | Meaning |
@@ -139,13 +139,13 @@ for the run's `task_collection`). See "Control rows" in the [README](../README.m
 | `sink_catalog`, `sink_schema`, `sink_table` | Target Delta table |
 | `client_id` | Optional. Set it to share one sink across many source databases; written to the sink column `__client_id__` |
 | `client_attrs` | Optional JSON object `{column: value}`: identity columns written (as STRING) on every row, e.g. the tenant name or source server |
-| `write_mode` | `merge` (default): the sink mirrors the source table. `append` (`ct` and `full`): the sink is a change log (see "Append sinks" in the [README](../README.md)) |
+| `write_mode` | `merge` (default): the sink mirrors the source table. `append` (`ct` and `full`): the sink is a change log (see [Append sinks](how-it-works.md#append-sinks-optional)) |
 | `load_type` | Load strategy: `ct` \| `cursor` \| `full` (`cdc` is a placeholder) |
 | `cursor_column` | `cursor` only: the high-watermark column (rowversion recommended) |
 | `load_partitioned`, `partition_col`, `partition_size_mb` | Optional partitioned seed / full load for large tables |
 | `ct_enabled` | Informational for `ct` rows; the job checks Change Tracking on the source itself |
 | `cdc_capture_instance` | Reserved for the placeholder `cdc` strategy |
-| `job_name`, `src_catalog`, `warehouse_id`, `enable_iceberg_reads`, `sink_cluster_cols`, `source_instance_group` | Not used by this version (shared with the job orchestration version, or reserved). Leave NULL / default |
+| `job_name`, `src_catalog`, `warehouse_id`, `enable_iceberg_reads`, `sink_cluster_cols`, `source_instance_group` | Not used by this version (shared with the job orchestration implementation, or reserved). Leave NULL / default |
 
 **Constraints.** CHECK constraints reject invalid combinations, for example:
 - `ct` on a source other than SQL Server, or without a primary key;
@@ -160,7 +160,7 @@ for the run's `task_collection`). See "Control rows" in the [README](../README.m
 A unique index allows only one row per sink, or one row per (sink, `client_id`) for shared sinks,
 so two rows can never overwrite each other's data.
 
-## `checkpoint` — where each table is
+## `checkpoint`: where each table is
 
 One row per control row (`control_id` is the primary key), created on the table's first run and
 updated after every successful write. The job reads all of a collection's checkpoints in one query
@@ -176,7 +176,7 @@ at the start of a run.
 | `status`, `detail` | `ok` or `failed`, with the last error in `detail`. A table stopped by a cancel keeps its status: a cancel never writes `failed` here |
 | `select_list` | Columns the sink was last written with; compared with `control.select_list` to detect added columns |
 | `source_identity`, `sink_identity`, `merge_key` | What the checkpoint was written for: `engine://host:port/db/schema/table`, the sink (`catalog.schema.table`, plus `#client_id` for a shared sink) and the normalized primary key. A control row that now points elsewhere reseeds (`source_changed`, `sink_changed`, `primary_key_changed`). NULL until first recorded |
-| `key_collation` | The collation the sink's text key columns were set to compare under (`id=UTF8_LCASE_RTRIM`; `''` for a table without text keys), see [Text keys](../README.md#text-keys-compare-like-the-source). NULL: not checked yet. The next write looks up the source's collation, sets it on the sink and, if the sink already holds a key under two spellings, reseeds the table (reason `key_collation`) |
+| `key_collation` | The collation the sink's text key columns were set to compare under (`id=UTF8_LCASE_RTRIM`; `''` for a table without text keys), see [Text keys](how-it-works.md#text-keys-compare-like-the-source). NULL: not checked yet. The next write looks up the source's collation, sets it on the sink and, if the sink already holds a key under two spellings, reseeds the table (reason `key_collation`) |
 | `ct_begin_version` | `ct`: the table's Change Tracking begin version at seed time. A change means CT was turned off and on, so the table reseeds |
 | `pending_position`, `pending_run_id` | Append sinks (`ct`): set just before a change or seed append, to the position it reaches and the run writing it; cleared when the checkpoint advances. Set at the start of a run means the last run stopped in between: the job checks the sink for that run's rows before doing anything else with the table. A `full` append isn't marked: each run appends one complete snapshot tagged with its `__run_id`, so a run that stopped after its commit leaves a complete snapshot and the next run appends its own |
 | `last_success_at` | When the table last ingested successfully, used for freshness and lag. A `ct` table whose database has a vouching `database_check` stamp was last confirmed current at the later of the two (see below) |
@@ -238,14 +238,14 @@ starts that collection's run with the `work_id`; the run ingests only those data
 could not carry the list (job parameter values are at most 10,000 characters). The check deletes
 rows older than a week.
 
-## `reseed_queue` — reseed log
+## `reseed_queue`: reseed log
 
 One row every time the job queues a reseed: the table, its `control_id`, `reason`
 (`retention_miss`, `schema_change`, `ct_disabled`, `ct_reenabled`, `ct_version_reset`) and
 `enqueued_at`. It's an audit log. The reseed itself happens because the same step sets the
 checkpoint's phase to `seeding`. `processed` / `processed_at` are reserved and not currently set.
 
-## `ingest_run` — one row per run
+## `ingest_run`: one row per run
 
 Inserted when a run starts (`status = 'running'`) and finalized when it ends.
 
@@ -263,7 +263,7 @@ Inserted when a run starts (`status = 'running'`) and finalized when it ends.
 | `work_id` | The check job's work list the run was started for (`<launch_id>:<collection>`): the runs of one launch share its launch id, and the operations app shows them as one job run. `check-<job run>` on the check job's own record of a check (`detail.check` holds what it found): not a group run, so leave these rows out when counting or timing runs. Null for a run started otherwise |
 | `detail` | JSON with run details: change-detection counts per route, timings, peak concurrency, and with `max_queries_per_source` set, each source's share and peak permits (`source_caps`), the rows batched appends committed (`batch_rows`, with `batch_rows_unknown` tables not counted), and table retry totals (`table_retries`), and `cancelled_tables`, how many tables a cancel stopped |
 
-## `ingest_event` — one row per table per run
+## `ingest_event`: one row per table per run
 
 Inserted when a table starts (`status = 'running'`) and updated when it finishes. Tables that fail
 before any work (stage `plan` or `detect`) also get a `failed` event (`cancelled` when their run is being
@@ -322,7 +322,7 @@ failure e-mail read `failed` only, so a cancelled load is recorded as `cancelled
 - **A dead run closes as `cancelled`** when its Databricks run ended `CANCELED` or was asked to stop, and as `failed`
   otherwise (`close_abandoned_runs_sql`). Its open events close with it, as the same status.
 
-## `control_change` — change log
+## `control_change`: change log
 
 Written by the operations app in the same transaction as each change. Columns:
 - `changed_at`, `changed_by` (the signed-in user);
@@ -337,7 +337,7 @@ Written by the operations app in the same transaction as each change. Columns:
 Edits made directly with SQL aren't logged, but the job still reseeds a table whose source, sink or
 key changed (see `checkpoint`).
 
-## `discovery` and `discovered_table` — bulk onboarding
+## `discovery` and `discovered_table`: bulk onboarding
 
 Written by the `lakefed_ingest_discover` job, which reads source catalog metadata only, and reviewed
 in the operations app's Bulk import page.
@@ -356,7 +356,7 @@ in the operations app's Bulk import page.
 
 Nothing here is used by ingestion; control rows are created only when a reviewer registers tables.
 
-## `schedule` and `schedule_member` — scheduling
+## `schedule` and `schedule_member`: scheduling
 
 Written by the operations app (see "Schedules" in `app/README.md`); the ingestion job doesn't read them.
 - **`schedule`:** `name` (unique among active schedules), `cadence_minutes` (5, 10, 15, 20, 30, 60, 120,
@@ -476,7 +476,7 @@ The app's role gets SELECT, INSERT and UPDATE on every table in the schema from 
 cover tables the setup job creates later), and no DELETE, so a record can't be removed through the app. The audit log
 records each write with the value redacted (checked 30 Oct 2026).
 
-## `schema_version` — schema versions applied
+## `schema_version`: schema versions applied
 
 One row per version (`state_store.SCHEMA_VERSION`) applied: `version`, `applied_at`, `applied_by`.
 An ingestion run whose code needs a newer version than the newest row applies the DDL and pending

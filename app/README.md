@@ -1,20 +1,20 @@
-# lakefed_ingest operations app (optional)
+# lakefed_ingest operations app
 
-A Databricks App for operating the default version of lakefed_ingest. It's a separate, optional
-bundle: deploy it only if your workspace allows Databricks Apps. The ingestion bundle at the repo
-root doesn't depend on it, and everything the app does can also be done with SQL and the Jobs UI
-(see [../docs/monitoring.md](../docs/monitoring.md) and [../docs/lakebase_schema.md](../docs/lakebase_schema.md)).
+A Databricks App for operating the default version of lakefed_ingest. It is part of the bundle at the repository
+root, so `databricks bundle deploy` deploys and starts it with the rest (see [Deploy](#deploy)); the workspace must
+allow Databricks Apps. The ingestion jobs don't depend on it, and everything the app does can also be done with SQL
+and the Jobs UI (see [../docs/monitoring.md](../docs/monitoring.md) and
+[../docs/lakebase_schema.md](../docs/lakebase_schema.md)).
 
 | Page | What it does |
 |---|---|
-| **Overview** | Ingestion jobs (a schedule and its ingestion groups) with their tables by state, late databases (a database with a late table; its database page lists the tables), last job run and Status (running, failing, late, paused); groups in no job; job runs going now (progress over all the job's tables, speed, expected end); jobs needing attention, with their failures grouped by cause |
-| **Ingestion jobs** | Every ingestion job, filtered (running, failing, late, paused) and searched; one job's details with its job runs (one per trigger: outcome, took, speed, parallelism, clusters) and its groups; one job run with its group runs, databases and failures |
+| **Overview** | Live ingestion jobs (a schedule and its ingestion groups) with their tables by state, late databases (a database with a late table; its database page lists the tables), last job run and Status (running, failing, late, paused); groups in no job; job runs going now (progress over all the job's tables, speed, expected end); jobs needing attention, with their failures grouped by cause. A deleted job (kept for a Restore, still deleting, or whose delete failed) is left out, with the groups, databases and tables only it holds |
+| **Ingestion jobs** | Every ingestion job, filtered (running, failing, late, paused) and searched; one job's details with its job runs (one per trigger: outcome, took, speed, parallelism, clusters), its groups, and **Run now** and **Cancel run** (see Run now and Cancel run, under [Schedules](#schedules)); one job run with its group runs, databases and failures |
 | **Runs** | Job runs of every ingestion job, running first; group runs of groups in no job. A group run's page shows its outcome, speed, time left, tables in flight, databases and table events |
 | **Sources** | Each source instance: how it is read (UC connection or JDBC host), its ingestion jobs, its tables by state, and tables discovered and not registered yet; UC connections with nothing registered |
 | **Timeline** | Runs per collection over a window (6 hours to 7 days): planned triggers, runs colored by outcome, and triggers Databricks skipped because the previous run was still going |
 | **Schedules** | Run collections at a cadence (see [Schedules](#schedules)): create, edit, pause, resume and delete schedules; each member's next run, wrapper job, last run, p95 run time, skipped triggers, and warnings for overruns and SLAs a schedule can't meet |
-| **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag, SLA). Filter by collection, text, or failing / SLA breached / no SLA / seeding / disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection, or switch to reads through a UC connection), **enable**, **disable** or **force a reseed**. Changing `write_mode` needs a new sink in the same edit (an append sink and a merge sink can't share a table) |
-| **Databricks jobs** | Under Schedules and jobs: the Databricks ingestion job's active and recent runs (with the ingestion job that started each); **cancel** a run |
+| **Tables** | Browse control rows with their checkpoint (phase, status, freshness lag, SLA). Filter by collection, text, or Failing / Past freshness target / No freshness target / Waiting for a first load / Disabled. Select one row to **edit** it (every field, plus its change history), or several to **bulk edit** (e.g. move to another collection, or switch to reads through a UC connection), **enable**, **disable** or **force a reseed**. Changing `write_mode` needs a new sink in the same edit (an append sink and a merge sink can't share a table) |
 | **Manage** | Only for those with Can Manage on the app itself (see [Security model](#security-model)): the app's version (the commit it was deployed from, and its active deployment) and the state database's schema version against the app's (see Schema upgrades, under Deploy); the SQL warehouse the app's queries run on, read only (its name and id, Pro or serverless, its state, and whether it is the bundle's own or `app_warehouse_id`, with a plain line when it is Classic or can't be read; see Discovery through the SQL warehouse); **Export as CSV** of one, several or every ingestion job's enabled tables, in the columns Create from one CSV reads, with an `ingestion_job` column naming each line's job (streamed a page at a time, so a 200,000-table export works; one job's lines import as a new ingestion job, and an import refuses a file of several jobs); and the Databricks jobs the app runs, each linked |
 | **Changes** | The change log: every add, register, edit, enable / disable and reseed made in the app, with who, what and when |
 | **Add table** | A form that adds one control row, checked before insert (the database constraints are the backstop): a JDBC source (host and secret) or a UC connection (`use_remote_query`), `write_mode`, `client_attrs` and `jdbc_options` |
@@ -50,8 +50,8 @@ default collection. Schedules in the app fill that gap; the app shows each sched
 - **Staggering** (on by default) spreads members' start times over the cadence (e.g. :00 and :07 for two
   collections every 15 minutes), so cluster starts and source queries don't all land at once.
 - **Sync and drift.** Every create, edit, pause, resume and delete syncs the wrapper jobs right away and is
-  logged on the Changes page. "Check jobs" reports jobs edited or deleted outside the app; "Sync jobs"
-  recreates missing ones and undoes outside edits. A sync reconciles by tag: it adopts a member's job
+  logged on the Changes page. "Check its Databricks jobs" reports jobs edited or deleted outside the app; "Sync its
+  Databricks jobs" recreates missing ones and undoes outside edits. A sync reconciles by tag: it adopts a member's job
   whose id was never recorded and deletes the schedule's jobs no member owns; a failed delete is retried
   by the next sync. Syncs of one schedule take turns (a Lakebase advisory lock).
 - **Warnings** per member: p95 run time (7 days) close to or over the cadence (triggers will be skipped),
@@ -89,7 +89,7 @@ the ingestion job can't change its cluster, so a job with its own cluster runs i
 - the app then syncs the job's wrappers to start the copy (on `check`, the check job is given the copy as
   `ingest_job_id`);
 - back at the defaults, the job runs the ingestion job again and the copy is deleted;
-- Sync jobs copies the ingestion job again, so a redeploy reaches the copies.
+- "Sync its Databricks jobs" copies the ingestion job again, so a redeploy reaches the copies.
 
 Changing the cluster needs Can Manage on the job's Databricks job, like any change.
 
@@ -137,7 +137,7 @@ wrapper jobs are synced and any cluster copies run has ended; a copies run that 
 
 ## Discovery through the SQL warehouse
 
-Discover on a source runs on a small serverless SQL warehouse the app bundle makes (`lakefed_ingest discovery`), not on
+Discover on a source runs on a small serverless SQL warehouse the bundle makes (`lakefed_ingest discovery`), not on
 the discovery job's cluster, so each step answers in seconds rather than waiting minutes for a cluster. Every statement
 is plain SQL sent to SQL Server through the Unity Catalog connection (`remote_query`); the app can't open the
 connection itself (Unity Catalog lends its login only to Databricks compute), so the warehouse does it, as the app's
@@ -181,8 +181,9 @@ as before (each request reads the statements going, saves the ones that ended an
   is refused. A read started more than 6 hours ago, a discarded draft and one nobody has asked about for two hours are
   left alone.
 
-The step's top line counts the choice: databases chosen of those listed and their tables (counting while some aren't
-checked yet); the same numbers end the step's last line and the job's Chosen summary.
+The step's top line counts the choice: databases chosen of those listed, then their tables once they are counted (the
+count and the access checks go on out of sight, with nothing spinning); the same numbers end the step's last line and
+the job's Chosen summary.
 
 **Keys and identity columns of a new fan-in job.** Each row's `__client_id__` is the server and database joined by an
 underscore (`{server}_{database}`): the UC connection name, or host and port, in lower case, then the database name.
@@ -191,7 +192,8 @@ and Add databases on a job made before keep its `{database}` key and add no colu
 don't allow and names the server and database.
 
 **New job reads the tables as they are chosen (drafts).** Ticking a whole database, or the whole server under its
-filter, starts the read of its tables at once, while the rest of the job is filled in. The read is a draft: its rows
+filter, starts the read of its tables at once, while the rest of the job is filled in. The read goes on out of sight; its
+progress shows once **Add the tables chosen** hands it to New job. The read is a draft: its rows
 are the read's own `discovery` and `discovered_table` rows, marked `draft` in `listing`, and nothing of the job
 (control, checkpoint, schedule, rollups) is written before Create.
 - **Add the tables chosen** doesn't wait: the reads go on in the background reader, and New job's preview counts what
@@ -285,8 +287,8 @@ Logins below, and that goes only into the dedicated login scope.
 - **Logins:** under a connection's secret key the form has a user name and a password field. The fields show only when
   the connection's secret scope is the dedicated login scope, since that is where the login is written, and a key with
   `{database}` in it asks which database the login is for. Save the login writes
-  `{"user": ..., "password": ...}` as one JSON secret into the dedicated login scope (`JDBC_LOGIN_SCOPE`, by default
-  `lakefed_ingest_jdbc_logins`, set by the app bundle's `jdbc_login_scope` variable). The write goes through the Secrets
+  `{"user": ..., "password": ...}` as one JSON secret into the dedicated login scope (`JDBC_LOGIN_SCOPE`, set by the bundle's
+  `jdbc_login_scope` variable, whose default is `lakefed_ingest_jdbc_logins`; blank, the app refuses to save a login). The write goes through the Secrets
   API as the app's service principal, so it shows under the app's identity and never the user's token. The grant job
   (under Deploy) gives that principal `WRITE` on this one scope and nothing else: not `MANAGE`, which would let it change
   who reads the scope, and not `READ`, which a write doesn't need. The scope has `prevent_destroy`, so destroying the
@@ -308,7 +310,7 @@ Logins below, and that goes only into the dedicated login scope.
   - **Never kept:** the password is not stored in Lakebase, not logged, and not returned. The form clears it after a save and
     never prefills it. Error text and the 422 for this route keep the password out.
   - **Who reads it:** the ingestion jobs read the login as the identity they run as, normally the deployer, which must be
-    the person who deployed the app bundle, since that person is the scope's creator. See the grant bullet below.
+    the person who deployed the bundle, since that person is the scope's creator. See the grant bullet below.
   - **Audit log:** checked on 30 Oct 2026 by writing a throwaway secret with a marker value: the audit log's
     `putSecret` record (`system.access.audit`, service `secrets`) shows `string_value` as `REDACTED`, and the marker
     appears nowhere in the record. Its `user_identity` and `identity_metadata` name the identity that wrote it.
@@ -523,7 +525,7 @@ The app runs as its own service principal (created with the app):
   each listed database is then read through the connection, and one the login can't open fails on its own.
 - **JDBC secret scopes:** `READ` on each scope a JDBC connection names, for the identity its jobs run as (normally the
   deployer). The app never holds it and its grant job doesn't give it, so a job reading a scope it can't read fails on
-  its first run. The app bundle creates the dedicated login scope with no permission on it, and the grant job gives the
+  its first run. The bundle creates the dedicated login scope with no permission on it, and the grant job gives the
   app `WRITE` there and nothing else (see Lakebase above). The app makes no other scope and writes no other secret.
   See [JDBC connections](#jdbc-connections-entered-by-hand).
 - **Who can act:** every action on an existing ingestion job follows the signed-in user's own Databricks
@@ -544,7 +546,8 @@ The app runs as its own service principal (created with the app):
   - workspace admins may do all of these.
 
   Who the user is comes from the `X-Forwarded-Email` header the Databricks Apps proxy adds. Without it the app
-  refuses every write and every action (403), so an unknown caller never passes a check. A user's groups are
+  refuses every write and every action (403), so an unknown caller never passes a check. Reads (`GET`) stay open
+  to anyone the proxy admits. A user's groups are
   read from SCIM (their direct groups), and the groups those are in are followed up to 5 levels and 200 groups,
   so a grant to `data-eng` counts for a member of `team-x` inside it. A lookup that fails or passes those caps
   keeps the groups found so far: it can refuse something Databricks would allow, never the reverse.
@@ -565,53 +568,61 @@ everywhere.
 
 ## Deploy
 
-Prerequisites: the ingestion bundle is deployed and its setup job has run (Lakebase schema exists).
+The app is deployed with everything else, from the repository root, by one command (see the
+[deployment guide](../docs/deploy.md)):
 
-1. Add a target to `app/databricks.yml` for your workspace (the committed `dev` / `prod` hosts are
-   placeholders). Set the variables that differ from the defaults:
-   - `lakebase_instance`, `lakebase_database`: the ingestion bundle's values.
-   - `ingest_job_id`, `setup_job_id`, `discover_job_id`, `check_job_id`, `cluster_copies_job_id`, `delete_job_id`:
-     looked up by job name, so deploy the ingestion bundle first. In development mode the ingestion
-     bundle prefixes job names (`[dev your_name] lakefed_ingest`), so set the ids or the prefixed
-     names for dev targets.
-   - `app_name`: 30 characters max.
-   - `app_managers`: who sees Manage besides workspace admins, users or groups, comma separated; by default the user
-     who deploys.
-   - `app_version`: what Manage shows as the version, by default the git commit deployed from. It is blank when the
-     bundle is deployed from a folder that isn't a git checkout: pass `--var app_version=<commit>` there.
-   - `app_warehouse_id`: a Pro or serverless SQL warehouse (version 2025.35 or above) of your own for the app's
-     queries, when serverless can't reach the sources; blank keeps the bundle's own (see A warehouse of your own,
-     under Discovery through the SQL warehouse).
-2. Deploy and start the app, then run the grant job. Run these from `app/`, as the user who manages the Lakebase
-   instance and owns the tables (whoever ran the ingestion setup). On a first deploy the order matters: the grant job
-   needs the app's service principal, which exists only once the app is deployed.
+```bash
+databricks bundle deploy -t <target> -p <profile>
+```
 
-   ```bash
-   cd app
-   databricks bundle deploy -t <target>
-   databricks bundle run lakefed_ingest_app -t <target>          # deploys the code and starts the app
-   databricks bundle run lakefed_ingest_app_grants -t <target>   # Lakebase access, USE CONNECTION on source_connections, WRITE on the login scope, CAN_USE on app_warehouse_id
-   ```
-3. Check the login scope's access list. The grant job sets the app's `WRITE` there (the bundle declares no permission on
+Run it as the user who manages the Lakebase instance and owns the tables, who should also be the user the ingestion
+jobs run as (the login scope below). In order, the deploy applies the Lakebase schema (the `lakefed_ingest_setup`
+run), creates the app and starts it with its code, then runs `lakefed_ingest_app_grants`, which gives the app's
+service principal its access: Lakebase, `USE CONNECTION` on `source_connections`, `WRITE` on the login scope, and
+`CAN_USE` on `app_warehouse_id` when it is set. The grant job needs the app's service principal, which exists only
+once the app does, so it always comes last. It runs on every deploy, so a recreated app (a new service principal) or a
+changed `source_connections` or `app_warehouse_id` is granted by the next deploy.
+
+The app's settings are variables of the bundle (`databricks.yml`), set in your target:
+- `app_name`: lowercase letters, digits and dashes, 30 characters max. Development mode doesn't prefix an app's
+  name, so give each copy in one workspace its own.
+- `app_managers`: who sees Manage besides workspace admins, users or groups, comma separated; by default the user
+  who deploys.
+- `app_version`: what Manage shows as the version, by default the git commit deployed from. It is blank when the
+  bundle is deployed from a folder that isn't a git checkout: pass `--var app_version=<commit>` there.
+- `source_connections`: the Unity Catalog connections discovery reads through, comma separated.
+- `jdbc_login_scope`: the dedicated login scope (default `lakefed_ingest_jdbc_logins`); give each copy in one
+  workspace its own.
+- `app_warehouse_id`: a Pro or serverless SQL warehouse (version 2025.35 or above) of your own for the app's
+  queries, when serverless can't reach the sources; blank keeps the bundle's own (see A warehouse of your own,
+  under Discovery through the SQL warehouse).
+
+The app is told the ingestion jobs' ids and the Lakebase instance and database by the bundle itself, so there is
+nothing to look up.
+
+After the first deploy:
+1. Check the login scope's access list. The grant job sets the app's `WRITE` there (the bundle declares no permission on
    the scope), so the list should show the app's service principal with `WRITE`, the deployer with `MANAGE`, and nothing
    else: `databricks secrets list-acls lakefed_ingest_jdbc_logins -p <profile>`.
-4. Grant `CAN_USE` on the app to your operators, then open the URL printed by `bundle run`.
+2. Grant `CAN_USE` on the app to your operators, then open its URL (`databricks apps get <app_name> -p <profile>`).
 
-Re-run the grant job if the app is recreated (new service principal), or after changing `app_warehouse_id`. It also sets the new principal's `WRITE` on the
-login scope; the old principal's entry stays until you remove it (`databricks secrets delete-acl
-lakefed_ingest_jdbc_logins <old service principal>`). Default privileges cover tables the same owner adds later, so
-schema upgrades don't need it.
+A deploy whose app settings changed, which includes every new commit through `app_version`, deploys the app's code
+again and restarts it once. To deploy the code alone, say from a folder that isn't a git checkout, run
+`databricks bundle run lakefed_ingest_app -t <target> -p <profile>`. When the app is recreated, the old principal's
+`WRITE` on the login scope stays until you remove it (`databricks secrets delete-acl lakefed_ingest_jdbc_logins <old
+service principal>`). Default privileges cover tables the same owner adds later, so schema upgrades need nothing more.
 
-**Schema upgrades.** When the app starts and finds the state database behind the schema version its code expects
-(`schema_upgrade.SCHEMA_VERSION`), it starts the setup job once, under an advisory lock and only if no setup run is
-going, and logs it in the change log (`schema_upgrade`). Manage shows the database's version against the app's, and
-**Upgrading the state database** with the run's link while it runs. The next ingestion or check run also migrates a
-database behind, as before. A first install, with no schema at all, is left to the deploy steps: the grant job and
-the app's own Postgres role need the schema to exist first. `SCHEMA_UPGRADE=0` turns the check off.
+**Schema upgrades.** The deploy applies the schema before it starts the new app. The app also checks for itself: when
+it starts and finds the state database behind the schema version its code expects (`schema_upgrade.SCHEMA_VERSION`),
+it starts the setup job once, under an advisory lock and only if no setup run is going, and logs it in the change log
+(`schema_upgrade`). Manage shows the database's version against the app's, and **Upgrading the state database** with
+the run's link while it runs. The next ingestion or check run also migrates a database behind, as before. A database
+with no schema at all is left to the deploy's setup run: the grant job and the app's own Postgres role need the
+schema to exist first. `SCHEMA_UPGRADE=0` turns the check off.
 
 The grant job defaults to serverless jobs compute (it only calls the workspace APIs and Lakebase). If
 the workspace doesn't have serverless jobs, run it on an existing all-purpose cluster in your target
-(it's a one-time job, so a running cluster beats waiting for a job cluster to start):
+(it's a short job, so a running cluster beats waiting for a job cluster to start):
 
 ```yaml
 targets:
@@ -645,7 +656,7 @@ npm run check                     # type-check + production build
 
 Locally the app connects as you. Tests:
 - `pytest app/tests` covers the SQL and review logic, and runs as part of the repo's `pytest`;
-- the API tests (`tests/api_test.py`) also run when FastAPI and httpx are installed, as in the venv above.
+- the API tests (`app/tests/api_test.py`) also run when FastAPI and httpx are installed, as in the venv above.
 
 ## Not in this version
 
@@ -656,5 +667,5 @@ Locally the app connects as you. Tests:
 
 ## License
 
-See [Help and License](../README.md#help) in the repo README, including the licenses of the
-third-party libraries this app uses.
+See [Help and security](../README.md#help-and-security) and [License](../README.md#license) in the repo README; the
+license section lists the third-party libraries this app uses.

@@ -1,11 +1,11 @@
-"""The app bundle's app_warehouse_id: a variable, blank by default (the bundle's own warehouse), passed to the app as
+"""The bundle's app_warehouse_id: a variable, blank by default (the bundle's own warehouse), passed to the app as
 APP_WAREHOUSE_ID beside the unchanged WAREHOUSE_ID from the discovery-warehouse resource, and to the grants job, which
 gives the app CAN_USE on it. Read as text, like the other bundle tests."""
 from pathlib import Path
 
-APP_BUNDLE = Path(__file__).resolve().parents[1]
-VARIABLES = APP_BUNDLE / "databricks.yml"
-RESOURCES = APP_BUNDLE / "resources" / "lakefed_ingest_app.yml"
+REPO = Path(__file__).resolve().parents[2]
+VARIABLES = REPO / "databricks.yml"
+RESOURCES = REPO / "app" / "resources" / "lakefed_ingest_app.yml"
 
 
 def test_the_variable_exists_and_is_blank_by_default():

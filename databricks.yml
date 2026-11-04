@@ -1,13 +1,19 @@
 # Databricks asset bundle for lakefed_ingest (default version): ingestion that sweeps many tables per
-# job task on cluster compute, with control / checkpoint / telemetry state in Lakebase.
-# The original task-orchestrated (DBSQL warehouse) version is a separate bundle in job_orchestration/.
+# job task on cluster compute, with control / checkpoint / telemetry state in Lakebase, and the operations
+# app (app/). One `databricks bundle deploy -t <target>` creates everything, applies the Lakebase schema
+# (the lakefed_ingest_setup run), starts the app with its code and gives it its access (the
+# lakefed_ingest_app_grants run); see docs/deploy.md.
+# The legacy task-orchestrated (DBSQL warehouse) version is a separate bundle in job_orchestration/.
 # See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
 bundle:
   name: lakefed_ingest_v2
   uuid: bcc77784-ecf3-4a61-9436-2f404328a013
+  # job_runs (the setup and grants runs during deploy) re-fire on every deploy from 1.13.0.
+  databricks_cli_version: ">= 1.13.0"
 
 include:
   - resources/*.yml
+  - app/resources/*.yml
 
 # Variable declarations. Defaults suit most deployments; override per target.
 variables:
@@ -36,7 +42,8 @@ variables:
     description: Postgres database on the Lakebase instance.
     default: lakefed_ingest
   deleted_job_retention_days:
-    description: Days a deleted operations-app job is kept, so it can be restored, before the delete job purges it. The app's DELETED_JOB_RETENTION_DAYS (app/databricks.yml) must have the same value.
+    description: Days a deleted operations-app job is kept, so it can be restored, before the delete job's daily run
+      purges it. The app is told the same value (DELETED_JOB_RETENTION_DAYS).
     default: 7
   lakebase_catalog:
     description: Unity Catalog catalog the Lakebase database is registered as (for DBSQL monitoring).
@@ -70,7 +77,7 @@ variables:
     description: Seconds between freshness writes for unchanged tables already at the current version ("0" = every run).
     default: "0"
   max_queries_per_source:
-    description: Concurrent queries per source server across all runs, shared between them (at least 1 per run; see README "Concurrency"; "0" = no cap).
+    description: Concurrent queries per source server across all runs, shared between them (at least 1 per run; see docs/how-it-works.md, "Concurrency"; "0" = no cap).
     default: "0"
   discover_workers:
     description: Databases the discovery job (lakefed_ingest_discover) reads at once, each taking its three catalog queries in turn. Capped by max_queries_per_source when that is set.
@@ -91,22 +98,69 @@ variables:
     description: Spark session settings for a run, a JSON object of setting to value (a string, number or boolean; blank keeps the cluster's). Code generation off saves compiling every append's plan (+26% tables per second on one cluster in the sweep).
     default: '{"spark.sql.codegen.wholeStage": "false"}'
 
+  # The operations app (app/resources/lakefed_ingest_app.yml). It is told the ingestion jobs' ids and the
+  # Lakebase names above by reference, so a target sets none of them for the app.
+  app_name:
+    description: App name (lowercase letters, digits and dashes; 30 characters max).
+    default: lakefed-ingest-ops
+  app_managers:
+    description: Who manages the app (sees Manage) besides workspace admins, users or groups, comma separated. By
+      default the user who deploys the bundle.
+    default: ${workspace.current_user.userName}
+  app_version:
+    description: The version the app shows under Manage. By default the commit deployed from; it is blank when the
+      bundle is deployed from a folder that isn't a git checkout, so pass --var app_version=<commit> there.
+    default: ${bundle.git.commit}
+  source_connections:
+    description: Unity Catalog connections the app discovers through, comma-separated. The grants job gives the
+      app's service principal USE CONNECTION on each, as whoever runs it (that person needs to own or manage them).
+    default: ""
+  discovery_warehouse_size:
+    description: Size of the serverless SQL warehouse discovery runs on (the connection test, the database list and the
+      tables of the chosen databases). Catalog queries only, so the smallest size; more clusters, not a bigger size, if
+      many statements queue.
+    default: 2X-Small
+  discovery_warehouse_max_clusters:
+    description: The most clusters the discovery warehouse scales out to when its statements queue.
+    default: 2
+  discovery_warehouse_auto_stop_mins:
+    description: Idle minutes before the discovery warehouse stops. It is used only while someone chooses tables.
+    default: 5
+  app_warehouse_id:
+    description: Id of a SQL warehouse of your own for the app's queries (the connection test, the database list, the
+      access checks and the table reads through remote_query), say one that runs in your network and reaches sources
+      serverless can't. Blank (the default) uses the bundle's own discovery warehouse. It must be Pro or serverless, on
+      version 2025.35 or above; remote_query doesn't run on a Classic warehouse. The lakefed_ingest_app_grants job gives
+      the app's service principal CAN_USE on it, as whoever runs that job (who needs CAN_MANAGE on the warehouse).
+    default: ""
+  jdbc_login_scope:
+    description: Secret scope for the JDBC logins users type into the operations app. This bundle creates it, so its
+      deployer holds MANAGE; the lakefed_ingest_app_grants job gives the app's service principal WRITE on it and nothing
+      more. Deploy this bundle as the user who runs the ingestion jobs, since that user is the scope's creator (MANAGE)
+      and the jobs read the logins as their run-as identity.
+    default: lakefed_ingest_jdbc_logins
+  reads_start_cap:
+    description: How many databases of one source server are read through the warehouse at once to begin with (one
+      statement each, counted across every discovery and app instance). The app raises it by 4 while each read keeps
+      its time, and lowers it by 4, never below 4, once reads slow down (the source or the warehouse is saturated).
+    default: 8
+  reads_max_cap:
+    description: The most databases of one source server read through the warehouse at once; reads_start_cap rises no
+      higher.
+    default: 32
+
+# Two targets, and nothing per workspace in them: the profile you deploy with (-p <profile>) names the workspace.
+# Set any variable above for one target under targets.<name>.variables, or pass --var name=value.
 targets:
+  # A development copy: names are prefixed with '[dev <your user name>] ' and job schedules are paused
+  # (https://docs.databricks.com/dev-tools/bundles/deployment-modes.html). The default, so a command without -t
+  # never reaches prod.
   dev:
-    # The default target uses 'mode: development' to create a development copy.
-    # - Deployed resources get prefixed with '[dev my_user_name]'
-    # - Any job schedules and triggers are paused by default.
-    # See also https://docs.databricks.com/dev-tools/bundles/deployment-modes.html.
     mode: development
     default: true
-    workspace:
-      host: https://company-dev.cloud.databricks.com/
-
 
   prod:
     mode: production
     workspace:
-      host: https://company-prd.cloud.databricks.com/
-      # Use fixed location to make sure we only have a single copy.
-      # If this path results in an error, please make sure you have a recent version of the CLI installed.
+      # Production mode needs a fixed folder, so there is only one copy.
       root_path: /Workspace/${bundle.name}
