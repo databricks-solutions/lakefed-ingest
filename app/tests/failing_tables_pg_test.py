@@ -47,7 +47,7 @@ def test_a_table_is_failing_since_its_first_failure_after_its_last_success_and_i
     assert row["message"] == "Login failed again"
     assert (row["error_class"], row["error_kind"]) == ("FAILED_JDBC.CONNECTION", "transient")
     assert (row["runs"], row["failures"]) == (2, 2)
-    assert row["failing_since"] is not None
+    assert isinstance(row["failing_since"], str)
 
 
 def test_a_table_whose_checkpoint_is_not_failed_is_not_listed(pg):
@@ -101,10 +101,12 @@ def _plan(conn, sql, parameter_values):
 
 
 def _rows(conn, sql, parameter_values):
+    import lakebase
     from psycopg.rows import dict_row
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, parameter_values)
-        return cur.fetchall() if cur.description else []
+        rows = cur.fetchall() if cur.description else []
+    return [{column: lakebase._jsonable(value) for column, value in row.items()} for row in rows]
 
 
 def _add(conn, collection, database, table, enabled=True):

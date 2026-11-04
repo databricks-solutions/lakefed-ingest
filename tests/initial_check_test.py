@@ -1,4 +1,5 @@
 """The check: which databases of a group of collections need an ingest, and the work list of each."""
+import contextlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -435,6 +436,7 @@ class _SharedStore(_Store):
     def __init__(self, configs, checkpoints, busy=(), others=()):
         super().__init__(configs, checkpoints)
         self.busy, self.others, self.calls = set(busy), set(others), []
+        self.exclusive_held = False
 
     def try_lock_collection_shared(self, collection):
         self.calls.append(("shared", collection))
@@ -443,8 +445,14 @@ class _SharedStore(_Store):
     def unlock_collection_shared(self, collection):
         self.calls.append(("unshared", collection))
 
+    @contextlib.contextmanager
     def alone_on_collection(self, collection):
-        return collection not in self.others
+        alone = collection not in self.others
+        self.exclusive_held = alone
+        try:
+            yield alone
+        finally:
+            self.exclusive_held = False
 
     def try_lock_databases(self, keys):
         return {k for k in keys if k.rsplit("|", 1)[1] not in self.busy}
@@ -465,6 +473,25 @@ def test_with_shared_locks_the_check_leaves_out_the_databases_a_run_holds_and_le
     assert store.calls[0] == ("shared", "c1") and store.calls[-1] == ("unshared", "c1")
     assert ("unlock", tuple(sorted(ss.database_lock_key("c1", SOURCE, d) for d in ("new", "quiet")))) in store.calls
     assert summary["held"] == [] and store.unlocked == []              # nothing held for the runs: they lock their own
+
+
+class _RunOpensInTheGap(_SharedStore):
+    """Another work-list run tries to start (to take the collection shared) at the moment the check closes the
+    collection's abandoned runs, which Postgres lets it do unless the check holds the collection exclusively."""
+
+    def close_abandoned_runs(self, collection, run_id):
+        self.other_run_opened = not self.exclusive_held
+        return super().close_abandoned_runs(collection, run_id)
+
+
+def test_a_run_that_starts_while_the_check_closes_abandoned_runs_is_refused_the_lock_and_left_alone():
+    configs = [_cfg(1, "quiet", "a")]
+    store = _RunOpensInTheGap(configs, _recorded(configs, {1: _cp(10)}))
+    ic.run_check(store, store, ["c1"], _detector({"quiet": 10}), existing_sinks_of=_sinks, job_run_id="77",
+                 share_locks=True)
+    assert store.closed == [("c1", 1)]
+    assert store.other_run_opened is False, "the check let go of the collection before it closed the dead runs"
+    assert store.exclusive_held is False                                # and lets go once it has
 
 
 def test_a_run_of_a_share_takes_its_collections_in_turn_and_fails_only_for_a_part_that_failed():

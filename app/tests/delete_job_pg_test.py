@@ -97,6 +97,30 @@ def test_a_run_holding_a_groups_lock_refuses_the_delete_and_the_deletion_is_list
     assert pg.execute(q.deleted_jobs_sql(), (10, 0)).fetchall() == []                       # purged: off the list
 
 
+def test_the_daily_purge_records_a_job_with_a_bad_drop_targets_value_and_purges_the_others(pg):
+    import contextlib
+    import delete_job
+    bad = _job(pg, "Bad value", ["g1"], deleted=True)
+    good = _job(pg, "Good value", ["g2"], deleted=True)
+    _row(pg, "g1", "a")
+    _row(pg, "g2", "b")
+    pg.execute("update lakefed_ingest.schedule set options = '{\"delete_drop_targets\": \"maybe\"}' where id = %s", (bad,))
+    pg.execute(q.set_schedule_flag_sql(), (["delete_drop_targets"], True, good))
+
+    @contextlib.contextmanager
+    def transaction():
+        with pg.cursor() as cur, cur.connection.transaction():
+            yield cur
+
+    dropped = []
+    purged = delete_job.purge_expired(transaction, 0, lambda tables: dropped.extend(tables) or {})
+    assert purged["listed"] == 2 and [entry["job"] for entry in purged["purged"]] == ["Good value"]
+    [failed_job] = purged["failed_jobs"]
+    assert failed_job["job"] == "Bad value" and "'maybe'" in failed_job["reason"]
+    assert dropped == ["`m`.`l`.`g2_b`"]
+    assert pg.execute("select task_collection from lakefed_ingest.control").fetchall() == [("g1",)]
+
+
 def _draft_rows(conn, did, marks, started="now()"):
     conn.execute("insert into lakefed_ingest.discovery (discovery_id, src_database, status, listing, started_at) values "
                  f"(%s, 'eng_001', 'ok', %s::jsonb, {started}), (%s, 'eng_002', 'ok', %s::jsonb, {started})",

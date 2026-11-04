@@ -53,8 +53,10 @@ class FakeCursor:
         elif sql == dj.delete_selection_sql():
             self.rowcount = (self.selection or {}).get(params[0], 0)
         elif sql == dj.expired_jobs_sql():
-            self._answer(["id", "name", "drop_targets"], [s for s in self.schedules if _expired(s)])
+            self._answer(["id", "name"], [s for s in self.schedules if _expired(s)])
         elif sql == dj.expired_check_sql():
+            if any(s["id"] == params[0] and s.get("database_error") for s in self.schedules):
+                raise RuntimeError("connection to the state database was lost")
             self._result = [(s["drop_targets"],) for s in self.schedules if s["id"] == params[0] and _expired(s)]
         elif sql == dj.finished_sql():
             for s in self.schedules:
@@ -386,10 +388,12 @@ def test_the_finished_mark_is_the_flag_the_app_reads_and_the_job_is_locked_while
 def test_the_expired_jobs_are_the_deleted_ones_past_retention_and_not_finished():
     sql = dj.expired_jobs_sql()
     assert "deleted_at <= now() - make_interval(days => %s)" in sql
-    assert "not coalesce((options ->> 'delete_finished')::boolean, false)" in sql and "delete_drop_targets" in sql
+    assert "not coalesce((options ->> 'delete_finished')::boolean, false)" in sql
+    assert "delete_drop_targets" not in sql, "one job's bad value must not fail the list of every job"
+    assert "options ->> 'delete_drop_targets'" in dj.expired_check_sql() and "::boolean, false) from" not in dj.expired_check_sql()
     cur = FakeCursor([schedule(7, expired=True, drop_targets=True), schedule(8),
                       schedule(9, expired=True, finished=True)], [], [])
-    assert dj.expired_jobs(cur, 7) == [{"id": 7, "name": "Job 7", "drop_targets": True}]
+    assert dj.expired_jobs(cur, 7) == [{"id": 7, "name": "Job 7"}]
     assert cur.executed[-1] == (sql, (7,))
 
 
@@ -421,7 +425,7 @@ def test_the_daily_purge_with_nothing_expired_purges_nothing():
     cur = FakeCursor([schedule(7)], [member(7, "g1", removed=True)], [row("g1", "a")])
     log = []
     assert dj.purge_expired(lambda: contextlib.nullcontext(cur), 7, _dropper(log)) == {
-        "listed": 0, "purged": [], "waiting": [], "failed": {}}
+        "listed": 0, "purged": [], "waiting": [], "failed": {}, "failed_jobs": []}
     assert log == []
 
 
@@ -463,3 +467,60 @@ def test_a_job_restored_after_the_list_was_read_is_skipped():
 
     purged = dj.purge_expired(transaction, 7, _dropper([]))
     assert purged["listed"] == 1 and purged["purged"] == [] and not cur.schedules[0]["finished"]
+
+
+def _purge(schedules, groups, dropper):
+    cur = FakeCursor(schedules, [member(s["id"], g, removed=True) for s, g in zip(schedules, groups)],
+                     [row(g, f"t{i}") for i, g in enumerate(groups)])
+    return dj.purge_expired(lambda: contextlib.nullcontext(cur), 7, dropper)
+
+
+def test_a_job_that_fails_with_a_database_error_is_recorded_and_the_jobs_after_it_are_still_purged():
+    schedules = [schedule(7, expired=True), schedule(8, expired=True)]
+    schedules[0]["database_error"] = True
+    purged = _purge(schedules, ["g1", "g2"], _dropper([]))
+    assert purged["failed_jobs"] == [{"job": "Job 7", "reason": "connection to the state database was lost"}]
+    assert [entry["job"] for entry in purged["purged"]] == ["Job 8"]
+    assert not schedules[0]["finished"] and schedules[1]["finished"]
+
+
+def test_a_job_with_a_bad_delete_drop_targets_value_is_recorded_and_nothing_of_it_is_deleted():
+    schedules = [schedule(7, expired=True, drop_targets="maybe"), schedule(8, expired=True, drop_targets=True)]
+    log = []
+    purged = _purge(schedules, ["g1", "g2"], _dropper(log))
+    [failed_job] = purged["failed_jobs"]
+    assert failed_job["job"] == "Job 7" and "'maybe'" in failed_job["reason"]
+    assert [entry["job"] for entry in purged["purged"]] == ["Job 8"] and log == ["`main`.`sales`.`t1`"]
+    assert not schedules[0]["finished"] and schedules[1]["finished"]
+
+
+def test_the_drop_failures_of_jobs_purged_before_a_failing_job_stay_in_the_summary():
+    schedules = [schedule(7, expired=True, drop_targets=True), schedule(8, expired=True)]
+    schedules[1]["database_error"] = True
+    purged = _purge(schedules, ["g1", "g2"], _dropper([], failing={"`main`.`sales`.`t0`"}))
+    assert purged["failed"] == {"`main`.`sales`.`t0`": "denied"}
+    assert purged["purged"][0]["drop_failed"] == 1 and [entry["job"] for entry in purged["failed_jobs"]] == ["Job 8"]
+
+
+def test_a_drop_step_that_raises_names_every_table_it_was_given_and_the_other_jobs_still_go():
+    def drop_that_raises(tables):
+        raise RuntimeError("the workspace is unreachable")
+    schedules = [schedule(7, expired=True, drop_targets=True), schedule(8, expired=True)]
+    purged = _purge(schedules, ["g1", "g2"], drop_that_raises)
+    assert purged["failed"] == {"`main`.`sales`.`t0`": "the workspace is unreachable"}
+    assert purged["purged"][0]["drop_failed"] == 1 and [entry["job"] for entry in purged["purged"]] == ["Job 7", "Job 8"]
+
+
+def test_the_delete_drop_targets_option_is_true_false_or_unset_and_anything_else_is_refused():
+    assert [dj.asks_for_targets(v) for v in (None, True, False, "true", "false", "True", "t", "off")] == [
+        False, True, False, True, False, True, True, False]
+    with pytest.raises(ValueError, match="'maybe'"):
+        dj.asks_for_targets("maybe")
+
+
+def test_the_run_fails_with_the_jobs_it_could_not_purge_and_the_tables_it_could_not_drop_named():
+    message = dj.purge_failure_message({"failed_jobs": [{"job": "Job 7", "reason": "bad value"}],
+                                        "failed": {"`main`.`sales`.`t0`": "denied"}})
+    assert "1 job(s) could not be purged" in message and "Job 7: bad value" in message
+    assert "`main`.`sales`.`t0`: denied" in message
+    assert dj.purge_failure_message({"failed_jobs": [], "failed": {}}) == ""

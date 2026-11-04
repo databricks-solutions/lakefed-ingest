@@ -3644,13 +3644,14 @@ def _refuse_connection_edits(rows: List[dict], plans: List[dict], cur=None, user
     """Refuses an edit of a table's source or login (CONNECTION_FIELDS) on a row of a job that reads through a JDBC
     connection: they belong to the connection, and an edited key or host would send its login elsewhere. A row moved
     into such a job's group must read through its connection, as a row written there must. Outside a connection, an
-    edit of those fields that leaves a table read by host and password is an app manager's (_refuse_host_reads)."""
+    edit of those fields, or one that moves the table to another group, that leaves a table read by host and password
+    is an app manager's (_refuse_host_reads)."""
     by_id = {r["id"]: r for r in rows}
     edited = [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans if p["changes"]]
     connections = _group_connections({r["task_collection"] for r in rows} | {r["task_collection"] for r in edited})
     if user is not None:
         resourced = [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans
-                     if set(p["changes"]) & set(CONNECTION_FIELDS)]
+                     if set(p["changes"]) & {*CONNECTION_FIELDS, "task_collection"}]
         _refuse_host_reads(resourced, user, connections)
     if not connections:
         return

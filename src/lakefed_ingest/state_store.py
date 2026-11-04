@@ -1731,14 +1731,18 @@ class StateStore:
             with self._cursor() as cur:
                 cur.execute(unlock_databases_sql(), (keys,))
 
-    def alone_on_collection(self, task_collection: str) -> bool:
-        """For a run holding the collection's lock shared: whether no other session holds it, so the collection's
-        other open runs are dead and may be closed. It tries the lock exclusively (its own shared hold doesn't
-        conflict with itself) and lets go at once if it got it."""
-        if not self.try_lock_collection(task_collection):
-            return False
-        self.unlock_collection(task_collection)
-        return True
+    @contextmanager
+    def alone_on_collection(self, task_collection: str):
+        """For a run holding the collection's lock shared: yields whether no other session holds it, so the
+        collection's other open runs are dead and may be closed. It tries the lock exclusively (its own shared hold
+        doesn't conflict with itself) and keeps it until the block ends, so no other run can take the collection
+        shared, and open a run that would look abandoned, while the caller closes the dead ones."""
+        alone = self.try_lock_collection(task_collection)
+        try:
+            yield alone
+        finally:
+            if alone:
+                self.unlock_collection(task_collection)
 
     def join_sources(self, sources) -> dict:
         """Hold a shared lock per source until this connection closes (see ``SOURCE_LOCK_CLASS``);
