@@ -1,4 +1,4 @@
-"""The browser tab icon: the Inflow logo, a 16 px drawing of its own and a 32 px one, kept in frontend/public so the
+"""The browser tab icon: a workbench (Ingestion Workbench), a 16 px drawing of its own and a 32 px one, kept in frontend/public so the
 build copies them to the top of static/, linked from index.html, and handed out by the app's catch-all route."""
 from pathlib import Path
 
