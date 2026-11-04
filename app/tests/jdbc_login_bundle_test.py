@@ -1,5 +1,5 @@
-"""The app bundle's grant on the dedicated JDBC login scope: the app's service principal gets WRITE on that one scope,
-never MANAGE, and the ingestion bundle grants the app nothing. The bundle declares no permission on the scope (a
+"""The bundle's grant on the dedicated JDBC login scope: the app's service principal gets WRITE on that one scope,
+never MANAGE, and the ingestion resources grant the app nothing. The bundle declares no permission on the scope (a
 permission naming the app's service principal fails at deploy, before the app exists); the grants job sets WRITE
 through the SDK instead. Read as text, like the other bundle tests."""
 import json
@@ -12,7 +12,7 @@ GRANT_NOTEBOOK = APP_BUNDLE / "notebooks" / "grant_app_access.ipynb"
 ROOT_BUNDLE = REPO
 
 
-def test_the_app_bundle_declares_the_login_scope_without_a_permissions_block():
+def test_the_bundle_declares_the_login_scope_without_a_permissions_block():
     block = _secret_scopes_block(RESOURCES.read_text())
     assert block == (
         "  secret_scopes:\n"
@@ -31,8 +31,8 @@ def test_the_login_scope_block_names_no_principal_and_no_level():
     assert "user_name:" not in block and "group_name:" not in block
 
 
-def test_nothing_in_the_app_bundle_grants_manage_on_a_secret_scope():
-    for path in [RESOURCES, APP_BUNDLE / "databricks.yml"]:
+def test_nothing_in_the_app_resources_or_the_bundle_grants_manage_on_a_secret_scope():
+    for path in [RESOURCES, ROOT_BUNDLE / "databricks.yml"]:
         text = path.read_text()
         assert "level: MANAGE" not in text
         assert "permission: MANAGE" not in text
@@ -42,7 +42,7 @@ def test_the_app_has_no_secret_resource_of_its_own():
     assert "          secret:" not in RESOURCES.read_text()
 
 
-def test_the_ingestion_bundle_grants_the_app_nothing_on_a_secret_scope():
+def test_the_ingestion_resources_grant_the_app_nothing_on_a_secret_scope():
     for path in [ROOT_BUNDLE / "databricks.yml", *sorted((ROOT_BUNDLE / "resources").glob("*.yml"))]:
         text = path.read_text()
         assert "service_principal_name" not in text
@@ -50,15 +50,16 @@ def test_the_ingestion_bundle_grants_the_app_nothing_on_a_secret_scope():
 
 
 def test_the_scope_name_is_a_variable_and_the_app_is_told_it():
-    variables = (APP_BUNDLE / "databricks.yml").read_text()
+    variables = (ROOT_BUNDLE / "databricks.yml").read_text()
     assert "  jdbc_login_scope:\n" in variables
     assert "default: lakefed_ingest_jdbc_logins" in variables
     text = RESOURCES.read_text()
     assert "          - name: JDBC_LOGIN_SCOPE\n            value: ${var.jdbc_login_scope}\n" in text
 
 
-def test_the_grants_job_is_passed_the_login_scope_name_from_the_bundle_variable():
-    assert "              jdbc_login_scope: ${var.jdbc_login_scope}\n" in RESOURCES.read_text()
+def test_the_grants_job_is_passed_the_login_scope_name_from_the_scope_itself():
+    # By reference, not the variable: the deploy then creates the scope before the grants job and its run.
+    assert "              jdbc_login_scope: ${resources.secret_scopes.jdbc_logins.name}\n" in RESOURCES.read_text()
 
 
 def test_the_grants_notebook_reads_the_login_scope_and_grants_the_app_write_on_it():

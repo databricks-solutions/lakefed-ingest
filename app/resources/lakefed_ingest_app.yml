@@ -1,4 +1,4 @@
-# The operations app and its one-time grant job.
+# The operations app, its grant job, and the grant job's run on every deploy.
 #
 # The app runs as its own service principal, with the least privilege its checks allow:
 #   - ingestion, check and discovery jobs: CAN_MANAGE through app resources, so the app can read their access
@@ -16,17 +16,25 @@
 #   - with app_warehouse_id set, a SQL warehouse of your own: CAN_USE from the lakefed_ingest_app_grants job below (an
 #     additive update of its access list), and the app runs those queries there instead (APP_WAREHOUSE_ID). An app
 #     resource can't be switched by a variable, so the discovery warehouse stays an app resource either way;
-#   - Lakebase: granted by the lakefed_ingest_app_grants job below (run once after the first deploy,
-#     as the instance manager / tables' owner): CAN_USE on the instance, a Postgres role, and
+#   - Lakebase: granted by the lakefed_ingest_app_grants job below (run by every deploy, as the deployer, the
+#     instance manager and tables' owner): CAN_USE on the instance, a Postgres role, and
 #     SELECT / INSERT / UPDATE on the lakefed_ingest tables. The app has no `database` resource:
 #     some workspaces refuse to attach one even for the instance's manager, and the job works everywhere.
 # Everyone with CAN_USE on the app acts with these privileges, so grant CAN_USE only to operators.
+#
+# Deploy order. The deploy creates the jobs, the Lakebase database and the setup run first. The app waits for the
+# setup run (its SETUP_RUN_RESULT entry refers to it), so it never starts on a database without the schema, and the
+# grants job waits for the app (it refers to the app's name), so its run finds the app's service principal.
 resources:
   apps:
     lakefed_ingest_app:
       name: ${var.app_name}
       description: "lakefed_ingest operations: runs, tables, errors, control rows, jobs."
       source_code_path: ../src
+      # Started: the deploy starts the app and deploys its code, so no `bundle run lakefed_ingest_app` is needed. A
+      # change to the app's settings, including APP_VERSION when the commit changes, deploys the code again.
+      lifecycle:
+        started: true
       config:
         command: ["python", "main.py"]
         env:
@@ -64,36 +72,39 @@ resources:
             value: ${var.app_managers}
           - name: JDBC_LOGIN_SCOPE
             value: ${var.jdbc_login_scope}
+          # Not read by the app: the reference makes the deploy finish the setup run before it starts the app.
+          - name: SETUP_RUN_RESULT
+            value: ${resources.job_runs.lakefed_ingest_setup_run.state.result_state}
       resources:
         - name: ingest-job
           description: The lakefed_ingest ingestion job.
           job:
-            id: ${var.ingest_job_id}
+            id: ${resources.jobs.lakefed_ingest.id}
             permission: CAN_MANAGE
         - name: setup-job
           description: The lakefed_ingest_setup schema job.
           job:
-            id: ${var.setup_job_id}
+            id: ${resources.jobs.lakefed_ingest_setup.id}
             permission: CAN_MANAGE_RUN
         - name: discover-job
           description: The lakefed_ingest_discover table discovery job (bulk import).
           job:
-            id: ${var.discover_job_id}
+            id: ${resources.jobs.lakefed_ingest_discover.id}
             permission: CAN_MANAGE
         - name: check-job
           description: The lakefed_ingest_check job, started by schedules of the check variant.
           job:
-            id: ${var.check_job_id}
+            id: ${resources.jobs.lakefed_ingest_check.id}
             permission: CAN_MANAGE
         - name: cluster-copies-job
           description: The lakefed_ingest_cluster_copies job, started when an app job's own cluster changes.
           job:
-            id: ${var.cluster_copies_job_id}
+            id: ${resources.jobs.lakefed_ingest_cluster_copies.id}
             permission: CAN_MANAGE_RUN
         - name: delete-job
           description: The lakefed_ingest_delete_job job, started when an app job is deleted.
           job:
-            id: ${var.delete_job_id}
+            id: ${resources.jobs.lakefed_ingest_delete_job.id}
             permission: CAN_MANAGE_RUN
         - name: discovery-warehouse
           description: The serverless SQL warehouse discovery runs on.
@@ -143,7 +154,8 @@ resources:
               db_instance: ${var.lakebase_instance}
               db_name: ${var.lakebase_database}
               source_connections: ${var.source_connections}
-              jdbc_login_scope: ${var.jdbc_login_scope}
+              # By reference, so the scope exists before the grant on it.
+              jdbc_login_scope: ${resources.secret_scopes.jdbc_logins.name}
               app_warehouse_id: ${var.app_warehouse_id}
       environments:
         - environment_key: lakebase_client
@@ -154,3 +166,13 @@ resources:
               - "databricks-sdk==0.145.0"
       queue:
         enabled: false
+
+  # The deploy runs the grants job and waits for it; a run that fails fails the deploy, names the failed task, and is
+  # run again by the next deploy. It runs on every deploy, so a recreated app (a new service principal) or a changed
+  # source_connections or app_warehouse_id is granted without a separate step.
+  job_runs:
+    lakefed_ingest_app_grants_run:
+      job_id: ${resources.jobs.lakefed_ingest_app_grants.id}
+      lifecycle:
+        triggers:
+          - on_bundle_deploy: true

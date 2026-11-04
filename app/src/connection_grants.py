@@ -1,7 +1,7 @@
 """USE CONNECTION for the app's service principal on the Unity Catalog connections it discovers through: the app
 lists connections as its own identity, so it sees only those it holds USE CONNECTION on. The connections are not
 the bundle's, so the app's grants job (notebooks/grant_app_access.ipynb) grants it as whoever runs that job, on
-each connection named in the app bundle's source_connections variable."""
+each connection named in the bundle's source_connections variable."""
 from typing import Dict, List, Optional
 
 
