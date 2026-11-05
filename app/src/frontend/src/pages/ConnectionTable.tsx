@@ -11,19 +11,19 @@ export function ConnectionTable({ rows, chosen, disabled, onChoose, empty }: {
   rows: Row[]; chosen: string; disabled: boolean; onChoose: (name: string) => void; empty: ReactNode;
 }) {
   return (
-    <div className="table-wrap"><table className="data connections">
+    <div className="table-wrap"><table className="data one-line connections">
       <colgroup><col className="col-pick" /><col className="col-name" /><col className="col-type" /><col className="col-host" /><col className="col-owner" /></colgroup>
       <thead><tr><th></th><th>Name</th><th>Type</th><th>Host</th><th>Owner</th></tr></thead>
       <tbody>
         {rows.map((c) => (
           <tr key={c.name} className="pick-row" onClick={() => { if (!disabled) onChoose(c.name); }}>
             <td><input type="radio" checked={chosen === c.name} readOnly aria-label={`Use ${c.name}`} /></td>
-            <td className="cell"><b><Cut text={c.name} tipOnlyWhenCut passClick /></b></td>
-            <td className="cell"><Cut text={connectionTypeName(c.connection_type)} tipOnlyWhenCut passClick /></td>
-            <td className="cell mono">{c.host && <span className="cell-line">
+            <td><b><Cut text={c.name} tipOnlyWhenCut passClick /></b></td>
+            <td><Cut text={connectionTypeName(c.connection_type)} tipOnlyWhenCut passClick /></td>
+            <td className="mono">{c.host && <span className="cell-line">
               <Cut text={hostLabel(c.host, c.port)} tipOnlyWhenCut passClick />
               <CopyButton text={hostLabel(c.host, c.port)} label={`Copy host of ${c.name}`} /></span>}</td>
-            <td className="cell"><Cut text={c.owner ?? ""} tipOnlyWhenCut passClick /></td>
+            <td><Cut text={c.owner ?? ""} tipOnlyWhenCut passClick /></td>
           </tr>
         ))}
         {empty && <tr><td colSpan={5} className="muted">{empty}</td></tr>}

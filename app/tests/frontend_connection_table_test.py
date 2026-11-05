@@ -48,14 +48,15 @@ def test_the_host_can_be_copied_without_choosing_the_row():
 
 
 def test_the_table_has_fixed_columns_with_name_and_host_flexible():
-    assert "table-layout: fixed" in rule("table.data.connections")
+    assert "table-layout: fixed" in rule("table.data.one-line")
+    assert 'className="data one-line connections"' in TABLE
     assert re.fullmatch(r"\s*width: \d+px;\s*", rule(".col-type"))
     assert re.fullmatch(r"\s*width: \d+px;\s*", rule(".col-owner"))
     assert "col-host" not in STYLES    # Host takes what the other columns leave
 
 
 def test_a_cell_never_breaks_inside_a_word_and_ends_in_an_ellipsis():
-    cells = rule("table.data.connections td.cell")
+    cells = rule("table.data.one-line th")
     assert "white-space: nowrap" in cells and "overflow: hidden" in cells
     cut = rule(".host, .cut")
     assert "white-space: nowrap" in cut and "text-overflow: ellipsis" in cut and "overflow: hidden" in cut

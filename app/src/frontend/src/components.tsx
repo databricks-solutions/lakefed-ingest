@@ -7,7 +7,7 @@ import { AgGridReact } from "ag-grid-react";
 import { themeQuartz, type ColDef, type GridApi, type GridOptions } from "ag-grid-community";
 import { ApiError, type Row } from "./api";
 import { longWait } from "./pending";
-import { SOURCE_TYPE_NAMES, hostLabel, isCut, tipKeepsClick } from "./cells";
+import { type ColumnWidths, SOURCE_TYPE_NAMES, hostLabel, isCut, tableMinWidth, tipKeepsClick } from "./cells";
 
 // AG Grid in the workspace look: the design system's font, border, header and accent colors (styles.css).
 export const gridTheme = themeQuartz.withParams({
@@ -296,9 +296,10 @@ function TipPop({ id, text, target }: { id: string; text: string; target: DOMRec
 
 /** Text on one line: cut with an ellipsis when it does not fit, the whole text on hover or focus (as the Databricks
  * lists do). Only text that is cut is a tab stop. With `tipOnlyWhenCut` a short text has no tooltip repeating it. With
- * `passClick` a click on the text also reaches the row it sits in, so a row can be chosen by clicking any of its text. */
-export function Cut({ text, className = "cut", tipOnlyWhenCut = false, passClick = false }: {
-  text: string; className?: string; tipOnlyWhenCut?: boolean; passClick?: boolean;
+ * `passClick` a click on the text also reaches the row it sits in, so a row can be chosen by clicking any of its text.
+ * Given `children` (a bold name with a muted note beside it), it shows those and `text` is what the tooltip says. */
+export function Cut({ text, className = "cut", tipOnlyWhenCut = false, passClick = false, children }: {
+  text: string; className?: string; tipOnlyWhenCut?: boolean; passClick?: boolean; children?: ReactNode;
 }) {
   const ref = useRef<HTMLSpanElement>(null);
   const [cut, setCut] = useState(false);
@@ -309,7 +310,24 @@ export function Cut({ text, className = "cut", tipOnlyWhenCut = false, passClick
     return () => window.removeEventListener("resize", measure);
   }, [text]);
   return <Tip text={tipOnlyWhenCut && !cut ? "" : text} focusable={cut} passClick={passClick}>
-    <span ref={ref} className={className}>{text}</span></Tip>;
+    <span ref={ref} className={className}>{children ?? text}</span></Tip>;
+}
+
+/** The columns of a one-line table (`table.data.one-line`): fixed widths in pixels, `null` for the column that takes what
+ * is left. Fixed layout needs them, and they are what keeps a short field narrow and a name wide. */
+export function Cols({ widths }: { widths: ColumnWidths }) {
+  return <colgroup>{widths.map((width, index) => <col key={index} style={width === null ? undefined : { width }} />)}</colgroup>;
+}
+
+/** The props for a one-line table: its class and its narrowest width, from the same widths as its `Cols`. */
+export function oneLine(widths: ColumnWidths, extraClasses = "") {
+  return { className: `data one-line${extraClasses ? ` ${extraClasses}` : ""}`, style: { minWidth: tableMinWidth(widths) } };
+}
+
+/** An identifier on one line with a copy button beside it, shown when the row is hovered or focused (Catalog Explorer
+ * puts a copy icon beside the values you copy: a host, an ID, a full name). */
+export function CutCopy({ text, label, shown }: { text: string; label: string; shown?: string }) {
+  return <span className="cell-line"><Cut text={text} tipOnlyWhenCut>{shown}</Cut><CopyButton text={text} label={label} /></span>;
 }
 
 /** A host name on one line: cut with an ellipsis when it does not fit, its full name (and port) on hover. */

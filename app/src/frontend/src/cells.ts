@@ -29,3 +29,12 @@ export function isCut(scrollWidth: number, clientWidth: number): boolean {
 export function tipKeepsClick(text: string, passClick: boolean): boolean {
   return text !== "" && !passClick;
 }
+
+/** The widths of a one-line table's columns: a number is a fixed width in pixels, `null` takes the room that is left. */
+export type ColumnWidths = readonly (number | null)[];
+
+/** The narrowest a one-line table is drawn before its wrapper scrolls sideways: the fixed columns plus a set room for each
+ * column that takes what is left, so a flexible column is never squeezed to nothing. */
+export function tableMinWidth(widths: ColumnWidths, flexibleMinimum = 160): number {
+  return widths.reduce<number>((sum, width) => sum + (width ?? flexibleMinimum), 0);
+}
