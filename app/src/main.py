@@ -3787,29 +3787,48 @@ class WarehouseReadStore:
     def in_flight(self, kind: str, discovery_id: str) -> List[tuple]:
         return [(r["src_database"], r["statement_id"]) for r in db.query(q.warehouse_in_flight_sql(kind), (discovery_id,))]
 
-    def claim(self, kind: str, discovery_id: str, first: List[str], limit: int, claim_s: int) -> List[str]:
-        if limit <= 0:
+    @staticmethod
+    def _going(cur, server: str, claim_s: int) -> int:
+        return int(db.fetch(cur, q.warehouse_going_sql(), (server, claim_s))[0]["going"] or 0)
+
+    def claim_checks(self, server: str, discovery_id: str, first: List[str], limit: int, cap: int,
+                     claim_s: int) -> List[str]:
+        """Claim the page's databases to check, up to ``limit`` for this discovery and never past the server's cap. It
+        runs in the same transaction, under the server's lock, as the reads do. When the server has no room left for the
+        names asked for, they are marked wanted, so reads leave places for them (warehouse_reads.WANT_S)."""
+        if limit <= 0 or not first:
             return []
         with db.transaction() as cur:
-            return [r["src_database"] for r in db.fetch(cur, q.warehouse_claim_sql(kind), (discovery_id, claim_s, first, limit))]
+            cur.execute(q.warehouse_reads_lock_sql(), (q.warehouse_reads_lock_key(server),))
+            going = self._going(cur, server, claim_s)
+            taken = []
+            room = min(int(limit), int(cap) - going)
+            if room > 0:
+                taken = [r["src_database"] for r in
+                         db.fetch(cur, q.warehouse_claim_sql("check"), (discovery_id, claim_s, list(first), room))]
+            if int(cap) - going - len(taken) <= 0:
+                cur.execute(q.warehouse_want_checks_sql(), (discovery_id, claim_s, list(first)))
+        return taken
 
     def claim_reads(self, server: str, discovery_ids: List[str], cap: int, limit: int,
-                    claim_s: int) -> Tuple[List[tuple], bool]:
+                    claim_s: int) -> List[tuple]:
         """Claim up to ``limit`` databases to read of these discoveries of one server, never more than its cap leaves
-        room for: the reads in flight on the server, of every discovery and app instance, are counted in this same
-        transaction under the server's lock (a transaction lock: the connection goes back to the pool). Returns the
-        (discovery, database) pairs claimed, and whether the server is now at its cap."""
+        room for once the checks in flight and the checks waiting for a place are counted: all of them are counted in
+        this same transaction under the server's lock (a transaction lock: the connection goes back to the pool).
+        Returns the (discovery, database) pairs claimed."""
         if limit <= 0 or not discovery_ids:
-            return [], False
+            return []
         with db.transaction() as cur:
             cur.execute(q.warehouse_reads_lock_sql(), (q.warehouse_reads_lock_key(server),))
-            going = int(db.fetch(cur, q.warehouse_reads_going_sql(), (server, claim_s))[0]["going"] or 0)
-            room = min(int(limit), int(cap) - going)
+            going = self._going(cur, server, claim_s)
+            waiting = int(db.fetch(cur, q.warehouse_waiting_checks_sql(),
+                                   (server, claim_s, warehouse_reads.WANT_S))[0]["waiting"] or 0)
+            room = min(int(limit), int(cap) - going - waiting)
             if room <= 0:
-                return [], True
+                return []
             ids = list(discovery_ids)
             rows = db.fetch(cur, q.warehouse_claim_reads_sql(), (server, ids, claim_s, ids, room))
-        return [(r["discovery_id"], r["src_database"]) for r in rows], going + len(rows) >= int(cap)
+        return [(r["discovery_id"], r["src_database"]) for r in rows]
 
     def collect(self, discovery_id: str, claim_s: int, limit: int) -> List[tuple]:
         if limit <= 0:

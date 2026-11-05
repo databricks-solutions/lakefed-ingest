@@ -18,7 +18,8 @@ def test_each_statement_takes_the_parameters_the_store_passes():
     assert _marks(q.warehouse_read_rows_sql()) == 5 and _marks(q.warehouse_left_out_sql()) == 2
     assert _marks(q.warehouse_named_rows_sql(3)) == 15
     assert _marks(q.insert_discovered_tables_sql(wr.TABLE_COLUMNS, 2)) == 2 * len(wr.TABLE_COLUMNS)
-    assert _marks(q.warehouse_reads_lock_sql()) == 1 and _marks(q.warehouse_reads_going_sql()) == 2
+    assert _marks(q.warehouse_reads_lock_sql()) == 1 and _marks(q.warehouse_going_sql()) == 2
+    assert _marks(q.warehouse_waiting_checks_sql()) == 3 and _marks(q.warehouse_want_checks_sql()) == 3
     assert _marks(q.warehouse_claim_reads_sql()) == 5 and _marks(q.warehouse_collect_sql()) == 3
     assert _marks(q.warehouse_hold_sql()) == 2 and _marks(q.warehouse_read_work_sql()) == 3
     assert _marks(q.discovery_connection_sql()) == 1 and _marks(q.draft_drop_sql()) == 3
@@ -28,10 +29,11 @@ def test_a_servers_reads_are_counted_and_claimed_under_a_transaction_lock_of_its
     assert "pg_advisory_xact_lock" in q.warehouse_reads_lock_sql() and "advisory_lock(" not in q.warehouse_reads_lock_sql()
     assert q.warehouse_reads_lock_key("sql_a") == "lakefed_ingest/warehouse_reads/sql_a"
     assert not q.warehouse_reads_lock_key("sql_a").startswith(q.collection_lock_key(""))
-    going, claim = q.warehouse_reads_going_sql(), q.warehouse_claim_reads_sql()
+    going, claim = q.warehouse_going_sql(), q.warehouse_claim_reads_sql()
     for sql in (going, claim):
         assert "lower(src_connection) = %s" in sql and "listing ->> 'via' = 'warehouse'" in sql
         assert q.WAREHOUSE_WORK["read"] in sql
+    assert q.WAREHOUSE_WORK["check"] in going, "a check in flight is one of the server's places"
     assert "(listing ->> 'claimed_at')::timestamptz >= now()" in going
     assert "for update skip locked" in claim and "order by array_position(%s::text[], discovery_id), src_database" in claim
     assert "for update skip locked" in q.warehouse_collect_sql() and "listing ? 'statement_id'" in q.warehouse_collect_sql()
@@ -164,19 +166,26 @@ def test_the_stores_read_claim_passes_each_parameter_to_its_place(monkeypatch):
 
         def execute(self, sql, params=()):
             sent.append(_filled(sql, params))
-            self.description = [type("Column", (), {"name": n})() for n in
-                                (("going",) if "count(*) as going" in sql else ("discovery_id", "src_database"))]
-            self.rows = [(3,)] if "count(*) as going" in sql else [("d2", "eng_001")]
+            if "count(*) as going" in sql:
+                self.description, self.rows = self._named("going"), [(3,)]
+            elif "count(*) as waiting" in sql:
+                self.description, self.rows = self._named("waiting"), [(0,)]
+            else:
+                self.description, self.rows = self._named("discovery_id", "src_database"), [("d2", "eng_001")]
+
+        def _named(self, *names):
+            return [type("Column", (), {"name": n})() for n in names]
 
         def fetchall(self):
             return self.rows
 
     monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cursor())))
-    claimed, full = main.WarehouseReadStore().claim_reads("sql_a", ["d2", "d1"], 8, 4, 60)
-    assert claimed == [("d2", "eng_001")] and full is False
-    lock, going, claim = sent
+    claimed = main.WarehouseReadStore().claim_reads("sql_a", ["d2", "d1"], 8, 4, 60)
+    assert claimed == [("d2", "eng_001")]
+    lock, going, waiting, claim = sent
     assert lock == "select pg_advisory_xact_lock(hashtextextended('lakefed_ingest/warehouse_reads/sql_a', 0))"
     assert "lower(src_connection) = 'sql_a'" in going and "make_interval(secs => 60)" in going
+    assert "lower(src_connection) = 'sql_a'" in waiting and "make_interval(secs => 10)" in waiting
     assert "lower(src_connection) = 'sql_a' and discovery_id = any(['d2', 'd1']::text[])" in claim
     assert "make_interval(secs => 60)" in claim and "array_position(['d2', 'd1']::text[], discovery_id)" in claim
     assert claim.endswith("limit 4 for update skip locked) c where d.discovery_id = c.discovery_id and "

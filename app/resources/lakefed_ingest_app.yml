@@ -62,10 +62,8 @@ resources:
           # variable source"), so a blank app_warehouse_id arrives as "id:" and warehouse.py reads it as unset.
           - name: APP_WAREHOUSE_ID
             value: id:${var.app_warehouse_id}
-          - name: READS_START_CAP
-            value: ${var.reads_start_cap}
-          - name: READS_MAX_CAP
-            value: ${var.reads_max_cap}
+          - name: READS_CAP
+            value: ${var.reads_cap}
           - name: APP_VERSION
             value: ${var.app_version}
           - name: APP_MANAGERS

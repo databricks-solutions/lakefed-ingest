@@ -14,19 +14,17 @@ database claims it first (FOR UPDATE SKIP LOCKED), so two app instances, a page 
 the same one twice; a claim not renewed after CLAIM_S (the app stopped in between) is free again, and a statement saved
 before then is read again, never sent again.
 
-The reads in flight for one server (its connection) never pass that server's cap, counted across every discovery and
-app instance in the claim's transaction (queries.warehouse_claim_reads_sql). The cap starts at START_CAP and moves with
-the time a read takes (next_cap, ServerCaps).
+The checks and reads in flight for one server (its connection) never pass that server's cap, one fixed number (CAP)
+counted across every discovery and app instance in the claim's transaction (queries.warehouse_going_sql). A check takes
+a free place first; one the server had no room for is wanted for WANT_S, and reads leave that many places free
+meanwhile.
 
 The store passed in holds the Lakebase calls (main.WarehouseReadStore), and the warehouse the Statement Execution
 calls (warehouse.py), so this module is tested with fakes."""
 import os
 import re
-import statistics
-import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 import source_catalog
 
@@ -34,8 +32,10 @@ CLAIM_S = 60
 # The two kinds of work: a check of a listed database (status 'listed'), and a read of a chosen one (status 'running').
 CHECK, READ = "check", "read"
 # Checks kept going at once for one discovery: the page shown, so a page of 100 databases is checked in a few steps.
-# Reads keep instead to their server's cap.
+# A second limit beside the server's cap, which checks and reads share.
 IN_FLIGHT = {CHECK: 16}
+# A check the server had no room for is wanted for this long, and reads leave that many places free meanwhile.
+WANT_S = 10
 # A check waits this long for its answer when it is sent (the Statement Execution API takes 0, or 5 to 50 seconds):
 # most answer within it, so the step that sends them saves them too.
 CHECK_WAIT_S = 5
@@ -54,93 +54,29 @@ def _setting(name: str, default: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
-# The cap on one server's reads in flight. On the lab a 100-eDTU pool's CPU capped 1,000-table reads at about 0.65
-# databases a second, each read slower the more were in flight, and a 2X-Small warehouse began queueing at 16: so it
-# starts at 8 and rises only while reads keep their time. Bundle variables reads_start_cap and reads_max_cap set
-# READS_START_CAP and READS_MAX_CAP.
+# The cap on one server's checks and reads in flight together. On the lab a 100-eDTU pool's CPU capped 1,000-table
+# reads at about 0.65 databases a second, each read slower the more were in flight, and a 2X-Small warehouse began
+# queueing at 16, while throughput stayed flat from 3 to 11 at once: so one fixed number, 8, protects a shared server
+# and gives up little. The bundle variable reads_cap sets READS_CAP; a deploy that still sets READS_START_CAP is read
+# when READS_CAP is not set.
+DEFAULT_CAP = 8
 MIN_CAP = 4
-MAX_CAP = _setting("READS_MAX_CAP", 32, MIN_CAP, 256)
-START_CAP = _setting("READS_START_CAP", 8, MIN_CAP, MAX_CAP)
-CAP_STEP = 4
-CAP_WINDOW = 8          # reads timed at one level before the cap moves
-FLAT = 1.25             # a level's median read within this of the starting level's is flat: there is room for more
-GROWN = 1.5             # past this, the source or the warehouse's queue is slowing each read down: step back
-CAP_FORGET_S = 15 * 60  # a server with no read timed for this long starts again at START_CAP
+MAX_CAP = 256
 
 
-def next_cap(cap: int, times: Sequence[float], baseline: Optional[float], saturated: bool, *, step: int = CAP_STEP,
-             floor: int = MIN_CAP, ceiling: int = MAX_CAP, window: int = CAP_WINDOW, flat: float = FLAT,
-             grown: float = GROWN) -> int:
-    """A server's next cap on reads in flight, from the time its recent reads took at this cap (send to answer, so a
-    warehouse that queues them counts too) against the median at the starting level (baseline). With fewer than
-    ``window`` reads timed, or no baseline yet, it holds. The median of the last ``window`` past ``grown`` times the
-    baseline steps it down by ``step``, never below ``floor``; within ``flat`` times it, and only while the server is
-    held at its cap (``saturated``: there is more to read than places), it steps up by ``step``, never past
-    ``ceiling``. In between it holds."""
-    cap = max(floor, min(ceiling, cap))
-    if len(times) < window or not baseline:
-        return cap
-    median = statistics.median(list(times)[-window:])
-    if median > grown * baseline:
-        return max(floor, cap - step)
-    if median <= flat * baseline and saturated:
-        return min(ceiling, cap + step)
-    return cap
+def cap_from_environment() -> int:
+    """The cap set for this app: READS_CAP, or READS_START_CAP when that is not set, within MIN_CAP and MAX_CAP."""
+    name = "READS_CAP" if os.environ.get("READS_CAP") else "READS_START_CAP"
+    return _setting(name, DEFAULT_CAP, MIN_CAP, MAX_CAP)
+
+
+CAP = cap_from_environment()
 
 
 def server_key(connection: str) -> str:
     """The server a read through the warehouse reads: its connection's name, lower case (job_settings.server_of)."""
     return str(connection or "").lower()
 
-
-class ServerCaps:
-    """Each server's cap on reads in flight, as this app instance sets it, and the read times it is set from.
-
-    The count the cap is held to is shared (Lakebase, in each claim's transaction), but the cap itself is kept here, in
-    memory, per instance: a few numbers per server, with no table and no schema change. Each instance times the reads
-    its own workers send, which is a fair sample of how the server and the warehouse cope, and claims only while the
-    shared count is under its own cap, so all instances together stay within the highest cap any one has set. An
-    instance that restarts starts again at START_CAP, which is the safe side."""
-
-    def __init__(self, start: int = START_CAP, clock: Callable[[], float] = time.monotonic, **rule):
-        self.start, self.clock, self.rule = start, clock, rule
-        self._mu = threading.Lock()
-        self._servers: Dict[str, dict] = {}
-
-    def _state(self, server: str) -> dict:
-        state = self._servers.get(server)
-        if state is None or self.clock() - state["seen"] > CAP_FORGET_S:
-            state = {"cap": self.start, "baseline": None, "times": [], "saturated": False, "seen": self.clock()}
-            self._servers[server] = state
-        return state
-
-    def cap(self, server: str) -> int:
-        with self._mu:
-            return self._state(server)["cap"]
-
-    def saturated(self, server: str, held: bool) -> None:
-        """Whether the server's last claim found it at its cap."""
-        with self._mu:
-            self._state(server)["saturated"] = held
-
-    def timed(self, server: str, seconds: float) -> int:
-        """A read of the server that took ``seconds`` from send to answer. Returns the server's cap after it."""
-        with self._mu:
-            state = self._state(server)
-            state["seen"] = self.clock()
-            state["times"].append(float(seconds))
-            window = self.rule.get("window", CAP_WINDOW)
-            if state["baseline"] is None and state["cap"] == self.start and len(state["times"]) >= window:
-                state["baseline"] = statistics.median(state["times"][-window:])
-            cap = next_cap(state["cap"], state["times"], state["baseline"], state["saturated"], **self.rule)
-            if cap != state["cap"]:
-                state.update(cap=cap, times=[])
-            else:
-                state["times"] = state["times"][-window:]
-            return cap
-
-
-CAPS = ServerCaps()
 
 _NO_ACCESS = re.compile(r"Cannot open database|Login failed|not able to access the database|"
                         r"is not able to access|The server principal .* is not able to|permission was denied", re.I)
@@ -235,12 +171,12 @@ def standing(store, warehouse, kind: str, discovery_id: str) -> dict:
 
 
 def advance(store, warehouse, kind: str, discovery_id: str, connection: str, first: Iterable[str] = (),
-            caps: Optional[ServerCaps] = None) -> dict:
+            cap: int = CAP) -> dict:
     """One step of a discovery's checks or reads: read the statements going, save the ended ones, start more (the
     names in ``first`` before the rest), and say where it stands (store.progress). A statement that can't be read any
-    more (it expired, or the warehouse lost it) is cleared, so its database is started again. Checks are sent with a
-    short wait (CHECK_WAIT_S), so most are saved in this step; reads are sent without one, within the server's cap
-    (caps, CAPS by default), and the next step collects them."""
+    more (it expired, or the warehouse lost it) is cleared, so its database is started again. Checks and reads are both
+    held to the server's cap (``cap``, CAP by default), a check taking a free place first. Checks are sent with a short
+    wait (CHECK_WAIT_S), so most are saved in this step; reads are sent without one, and the next step collects them."""
     going = store.in_flight(kind, discovery_id)
     watched = []
     for database, statement_id in going:
@@ -253,17 +189,15 @@ def advance(store, warehouse, kind: str, discovery_id: str, connection: str, fir
             watched.append(database)
             continue
         finish(store, kind, discovery_id, database, statement_id, answer)
+    if watched:
+        store.hold([(discovery_id, d) for d in watched])
+    server = server_key(connection)
     if kind == CHECK:
         still = len(store.in_flight(kind, discovery_id))
-        claimed = store.claim(kind, discovery_id, list(first), max(0, IN_FLIGHT[kind] - still), CLAIM_S)
+        claimed = store.claim_checks(server, discovery_id, list(first), max(0, IN_FLIGHT[kind] - still), cap, CLAIM_S)
         wait_s = CHECK_WAIT_S
     else:
-        if watched:
-            store.hold([(discovery_id, d) for d in watched])
-        server = server_key(connection)
-        cap = (caps or CAPS).cap(server)
-        taken, _ = store.claim_reads(server, [discovery_id], cap, cap, CLAIM_S)
-        claimed = [database for _, database in taken]
+        claimed = [database for _, database in store.claim_reads(server, [discovery_id], cap, cap, CLAIM_S)]
         wait_s = 0
     error = None
     for database, answer in send(warehouse, kind, connection, claimed, wait_s):

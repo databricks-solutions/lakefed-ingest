@@ -26,7 +26,7 @@ class _Store:
         for n in names:
             self.rows[(discovery_id, n)] = {"status": status, "statement": None, "claimed_at": None, "open": None,
                                             "tables": None, "error": None, "why": None, "found": None,
-                                            "connection": connection, "dropped": False}
+                                            "connection": connection, "dropped": False, "wanted": None}
 
     def row(self, discovery_id, database):
         return self.rows[(discovery_id, database)]
@@ -46,30 +46,51 @@ class _Store:
         with self.lock:
             return [(n, r["statement"]) for n, r in self._mine(discovery_id) if self._work(kind, r) and r["statement"]]
 
-    def claim(self, kind, discovery_id, first, limit, claim_s):
-        with self.lock:
-            free = [n for n, r in self._mine(discovery_id)
-                    if self._work(kind, r) and not r["statement"] and not self._live(r, claim_s)]
-            free.sort(key=lambda n: (n not in first, n))
-            for n in free[:max(0, limit)]:
-                self.row(discovery_id, n)["claimed_at"] = self.now
-            return free[:max(0, limit)]
+    def _free_check(self, row, claim_s=wr.CLAIM_S):
+        return self._work(wr.CHECK, row) and not row["statement"] and not self._live(row, claim_s)
 
     def going(self, server, claim_s=wr.CLAIM_S):
-        return sum(1 for r in self.rows.values() if r["connection"].lower() == server and self._work(wr.READ, r)
-                   and self._live(r, claim_s))
+        return sum(1 for r in self.rows.values() if r["connection"].lower() == server
+                   and (self._work(wr.READ, r) or self._work(wr.CHECK, r)) and self._live(r, claim_s))
+
+    def waiting(self, server, claim_s=wr.CLAIM_S, want_s=wr.WANT_S):
+        return sum(1 for r in self.rows.values() if r["connection"].lower() == server and self._free_check(r, claim_s)
+                   and r["wanted"] is not None and self.now - r["wanted"] <= want_s)
+
+    def claim_checks(self, server, discovery_id, first, limit, cap, claim_s):
+        """As main.WarehouseReadStore.claim_checks: the page's free checks in name order, up to the room the cap leaves,
+        and each free one still not claimed is wanted when the server is full."""
+        with self.lock:
+            if limit <= 0 or not first:
+                return []
+            going = self.going(server, claim_s)
+            taken = []
+            room = min(limit, cap - going)
+            if room > 0:
+                free = [n for n, r in self._mine(discovery_id) if n in first and self._free_check(r, claim_s)]
+                taken = sorted(free)[:room]
+                for n in taken:
+                    self.row(discovery_id, n)["claimed_at"] = self.now
+            if cap - going - len(taken) <= 0:
+                for n, r in self._mine(discovery_id):
+                    if n in first and self._free_check(r, claim_s):
+                        r["wanted"] = self.now
+            return taken
 
     def claim_reads(self, server, discovery_ids, cap, limit, claim_s):
         with self.lock:
             going = self.going(server, claim_s)
-            room = min(limit, cap - going)
+            waiting = self.waiting(server, claim_s)
+            room = min(limit, cap - going - waiting)
+            if room <= 0:
+                return []
             free = [(d, n) for d in discovery_ids for n, r in self._mine(d)
                     if r["connection"].lower() == server and self._work(wr.READ, r) and not r["statement"]
-                    and not self._live(r, claim_s)][:max(0, room)]
+                    and not self._live(r, claim_s)][:room]
             for d, n in free:
                 self.row(d, n)["claimed_at"] = self.now
             self.claims.append((server, cap, going, len(free)))
-            return free, going + len(free) >= cap
+            return free
 
     def collect(self, discovery_id, claim_s, limit):
         with self.lock:
@@ -82,8 +103,9 @@ class _Store:
     def hold(self, reads):
         with self.lock:
             for d, n in reads:
-                if self._work(wr.READ, self.row(d, n)):
-                    self.row(d, n)["claimed_at"] = self.now
+                row = self.row(d, n)
+                if self._work(wr.READ, row) or self._work(wr.CHECK, row):
+                    row["claimed_at"] = self.now
 
     def read_work(self, claim_s, max_age_s, draft_ttl_s):
         with self.lock:
@@ -212,18 +234,19 @@ SUMMARY_ROW = {"sch": "dbo", "tbl": "orders", "row_count": "12", "ct_enabled": "
                "rowversion_col": None, "identity_col": None, "identity_type": None}
 
 
-def test_a_check_opens_each_database_and_counts_its_tables_the_page_shown_first():
-    store = _Store([f"db{i:02d}" for i in range(20)], wr.CHECK)
-    fake = _Warehouse({f"db{i:02d}": [_ok([{"tables": str(i)}])] for i in range(20)})
-    first = wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=["db19", "db18"])
-    assert {"db18", "db19"} <= set(fake.started_for) and len(fake.started_for) == wr.IN_FLIGHT[wr.CHECK]
-    assert "db17" not in fake.started_for, "the page shown is checked first"
+def test_a_check_opens_each_database_the_page_shows_and_counts_its_tables():
+    names = [f"db{i:02d}" for i in range(20)]
+    store = _Store(names, wr.CHECK)
+    fake = _Warehouse({n: [_ok([{"tables": str(i)}])] for i, n in enumerate(names)})
+    roomy = wr.MAX_CAP
+    first = wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=names[:10], cap=roomy)
+    assert sorted(fake.started_for) == names[:10], "only the databases the page lists are checked"
     assert first["state"] == "RUNNING" and first["pending"] == 20 and first["warehouse"] == "RUNNING"
-    _, statement = fake.statements["s-db18"]
+    _, statement = fake.statements["s-db07"]
     assert statement == "SELECT * FROM remote_query(:conn, database => :db, query => :q)"
-    second = wr.advance(store, fake, wr.CHECK, "d1", "sql_a")
-    assert second["open"] == 16 and len(fake.started_for) == 20
-    third = wr.advance(store, fake, wr.CHECK, "d1", "sql_a")
+    second = wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=names, cap=roomy)
+    assert second["open"] == 10 and len(fake.started_for) == 20
+    third = wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=names, cap=roomy)
     assert third["state"] == "SUCCEEDED" and third["open"] == 20 and third["closed"] == 0
     assert third["tables"] == sum(range(20)) and store.row("d1", "db07")["tables"] == 7
 
@@ -232,7 +255,8 @@ def test_checks_are_sent_together_with_a_short_wait_and_saved_by_the_step_that_s
     store = _Store([f"db{i:02d}" for i in range(20)], wr.CHECK)
     fake = _Warehouse({f"db{i:02d}": [_ok([{"tables": "2"}])] for i in range(20)}, in_call=True, hold_s=0.05)
     began = time.monotonic()
-    step = wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=[f"db{i:02d}" for i in range(16)])
+    step = wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=[f"db{i:02d}" for i in range(16)],
+                      cap=wr.MAX_CAP)
     assert time.monotonic() - began < 0.05 * 8, "sent at once, not one after another"
     assert fake.waits == [wr.CHECK_WAIT_S] * 16 and fake.read_ids == []
     assert step["open"] == 16 and step["pending"] == 4 and fake.most["sql_a"] >= 8
@@ -243,8 +267,9 @@ def test_a_database_the_login_cant_open_is_closed_with_why_in_plain_words_and_th
     refused = ('[FAILED_JDBC.CONNECTION] Cannot open database "eng_150" requested by the login. The login failed.\n'
                "at com.microsoft...")
     fake = _Warehouse({"eng_001": [_ok([{"tables": "1000"}])], "eng_150": [_failed(refused)]})
-    wr.advance(store, fake, wr.CHECK, "d1", "sql_a")
-    done = wr.advance(store, fake, wr.CHECK, "d1", "sql_a")
+    page = ["eng_001", "eng_150"]
+    wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=page)
+    done = wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=page)
     assert done == {"databases": 2, "pending": 0, "open": 1, "closed": 1, "tables": 1000, "state": "SUCCEEDED",
                     "warehouse": "RUNNING"}
     why = store.row("d1", "eng_150")["why"]
@@ -255,8 +280,8 @@ def test_a_database_the_login_cant_open_is_closed_with_why_in_plain_words_and_th
 def test_a_check_still_going_is_unknown_and_says_whether_the_warehouse_is_starting():
     store = _Store(["eng_001"], wr.CHECK)
     fake = _Warehouse({"eng_001": [{"state": "PENDING", "rows": None, "error": None}]}, state="STARTING")
-    wr.advance(store, fake, wr.CHECK, "d1", "sql_a")
-    step = wr.advance(store, fake, wr.CHECK, "d1", "sql_a")
+    wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=["eng_001"])
+    step = wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=["eng_001"])
     assert step["state"] == "RUNNING" and step["pending"] == 1 and step["warehouse"] == "STARTING"
     assert store.row("d1", "eng_001")["open"] is None and fake.started_for == ["eng_001"]
 
@@ -264,10 +289,10 @@ def test_a_check_still_going_is_unknown_and_says_whether_the_warehouse_is_starti
 def test_a_statement_that_cant_be_read_any_more_is_started_again():
     store = _Store(["eng_001"], wr.CHECK)
     fake = _Warehouse({"eng_001": [RuntimeError("statement not found"), _ok([{"tables": "3"}])]})
-    wr.advance(store, fake, wr.CHECK, "d1", "sql_a")
-    wr.advance(store, fake, wr.CHECK, "d1", "sql_a")
+    wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=["eng_001"])
+    wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=["eng_001"])
     assert fake.started_for == ["eng_001", "eng_001"]
-    assert wr.advance(store, fake, wr.CHECK, "d1", "sql_a")["open"] == 1
+    assert wr.advance(store, fake, wr.CHECK, "d1", "sql_a", first=["eng_001"])["open"] == 1
 
 
 def test_a_read_saves_each_databases_tables_with_the_discovery_jobs_recommendations():
@@ -287,9 +312,9 @@ def test_a_read_saves_each_databases_tables_with_the_discovery_jobs_recommendati
 def test_a_pages_step_of_a_read_keeps_to_its_servers_cap():
     store = _Store([f"db{i:03d}" for i in range(100)], wr.READ, discovery_id="d9")
     fake = _Warehouse({f"db{i:03d}": [{"state": "RUNNING", "rows": None, "error": None}] for i in range(100)})
-    caps = wr.ServerCaps(start=8)
+    cap = 8
     for _ in range(5):
-        wr.advance(store, fake, wr.READ, "d9", "sql_a", caps=caps)
+        wr.advance(store, fake, wr.READ, "d9", "sql_a", cap=cap)
     assert len(fake.started_for) == 8 and len(store.in_flight(wr.READ, "d9")) == 8
     # Sent together, none waited for: one step starts them all, and the next collects the ones that ended.
     assert fake.waits == [0] * 8
@@ -302,18 +327,51 @@ def test_the_pages_steps_of_two_discoveries_of_one_server_share_its_cap_and_anot
     store.add("d3", [f"c{i:02d}" for i in range(20)], connection="sql_b")
     fake = _Warehouse({n: [{"state": "RUNNING", "rows": None, "error": None}]
                        for p in "abc" for n in (f"{p}{i:02d}" for i in range(20))})
-    caps = wr.ServerCaps(start=8)
+    cap = 8
     for _ in range(4):
         for did, connection in (("d1", "sql_a"), ("d2", "SQL_A"), ("d3", "sql_b")):
-            wr.advance(store, fake, wr.READ, did, connection, caps=caps)
+            wr.advance(store, fake, wr.READ, did, connection, cap=cap)
             assert store.going("sql_a") <= 8 and store.going("sql_b") <= 8
     assert store.going("sql_a") == 8 and store.going("sql_b") == 8
     assert len(store.in_flight(wr.READ, "d1")) + len(store.in_flight(wr.READ, "d2")) == 8
 
 
-def test_checks_keep_16_going_for_the_page_shown_and_reads_start_at_a_cap_of_8():
+def test_checks_keep_16_going_for_the_page_shown_and_each_server_has_a_cap_of_8_by_default():
     assert wr.IN_FLIGHT == {wr.CHECK: 16}
-    assert (wr.START_CAP, wr.MIN_CAP, wr.MAX_CAP, wr.CAP_STEP) == (8, 4, 32, 4)
+    assert (wr.CAP, wr.MIN_CAP, wr.MAX_CAP) == (8, 4, 256)
+    assert wr.WANT_S == 10
+
+
+def test_checks_and_reads_share_the_servers_cap_so_a_read_takes_only_the_places_the_checks_left():
+    reads, checks = [f"a{i:02d}" for i in range(20)], [f"c{i:02d}" for i in range(4)]
+    store = _Store(reads, wr.READ)
+    store.add("d2", checks, wr.CHECK)
+    fake = _Warehouse({n: [{"state": "RUNNING", "rows": None, "error": None}] for n in reads + checks})
+    cap = 8
+    wr.advance(store, fake, wr.CHECK, "d2", "sql_a", first=checks, cap=cap)
+    assert len(store.in_flight(wr.CHECK, "d2")) == 4
+    wr.advance(store, fake, wr.READ, "d1", "sql_a", cap=cap)
+    assert len(store.in_flight(wr.READ, "d1")) == 4, "the cap of 8 less the 4 checks in flight"
+
+
+def test_reads_leave_room_for_checks_wanted_for_a_place_until_their_wait_runs_out():
+    reads, checks = [f"a{i:02d}" for i in range(20)], [f"c{i:02d}" for i in range(4)]
+    store = _Store(reads, wr.READ)
+    store.add("d2", checks, wr.CHECK)
+    fake = _Warehouse({n: [{"state": "RUNNING", "rows": None, "error": None}] for n in reads + checks})
+    cap = 8
+    wr.advance(store, fake, wr.READ, "d1", "sql_a", cap=cap)
+    assert len(store.in_flight(wr.READ, "d1")) == 8
+    wr.advance(store, fake, wr.CHECK, "d2", "sql_a", first=checks, cap=cap)
+    assert store.in_flight(wr.CHECK, "d2") == [] and store.waiting("sql_a") == 4, "the server is full: the checks wait"
+    for name, statement in store.in_flight(wr.READ, "d1")[:4]:
+        store.finish_read("d1", name, [], None, statement)
+    started = len(fake.started_for)
+    wr.advance(store, fake, wr.READ, "d1", "sql_a", cap=cap)
+    assert len(fake.started_for) == started, "the 4 free places are the checks' while they wait"
+    store.now += wr.WANT_S + 1
+    wr.advance(store, fake, wr.READ, "d1", "sql_a", cap=cap)
+    assert len(fake.started_for) == started + 4, "once the wait runs out the reads take them"
 
 
 def test_a_statement_that_fails_to_start_frees_its_database_and_says_why():
@@ -337,53 +395,31 @@ def test_a_dropped_database_is_neither_started_nor_counted():
     assert done["state"] == "SUCCEEDED" and done["databases"] == 1 and done["done"] == 1
 
 
-# ---- the cap rule ----------------------------------------------------------------------------------------------------
+# ---- the cap ---------------------------------------------------------------------------------------------------------
 
-def test_the_cap_holds_until_a_window_of_reads_is_timed_and_there_is_a_baseline():
-    assert wr.next_cap(8, [1.0] * 7, 1.0, True) == 8
-    assert wr.next_cap(8, [1.0] * 8, None, True) == 8
-
-
-def test_the_cap_steps_up_by_4_while_reads_keep_their_time_and_the_server_is_held_at_it():
-    assert wr.next_cap(8, [1.0] * 8, 1.0, True) == 12
-    assert wr.next_cap(12, [1.2] * 8, 1.0, True) == 16
-    assert wr.next_cap(8, [1.0] * 8, 1.0, False) == 8, "a cap the server isn't held at isn't raised"
-
-
-def test_the_cap_holds_while_reads_slow_a_little():
-    assert wr.next_cap(16, [1.4] * 8, 1.0, True) == 16
-    assert wr.next_cap(16, [1.5] * 8, 1.0, True) == 16
+def test_checks_and_reads_never_pass_the_servers_cap_together_whatever_order_their_steps_come_in():
+    reads, checks = [f"a{i:02d}" for i in range(30)], [f"c{i:02d}" for i in range(30)]
+    store = _Store(reads, wr.READ)
+    store.add("d2", checks, wr.CHECK)
+    fake = _Warehouse({n: [{"state": "RUNNING", "rows": None, "error": None}] for n in reads + checks})
+    for step in range(12):
+        for kind, did in ((wr.CHECK, "d2"), (wr.READ, "d1"), (wr.READ, "d1")):
+            wr.advance(store, fake, kind, did, "sql_a", first=checks, cap=8)
+            assert store.going("sql_a") <= 8, f"step {step}: {kind}"
+    assert store.going("sql_a") == 8
 
 
-def test_the_cap_steps_down_by_4_once_the_median_read_is_clearly_slower_than_at_the_start():
-    assert wr.next_cap(16, [1.6] * 8, 1.0, True) == 12
-    assert wr.next_cap(16, [1.0, 1.0, 1.0, 9.0, 9.0, 9.0, 9.0, 9.0], 1.0, False) == 12
-    assert wr.next_cap(16, [9.0, 9.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 1.0, True) == 20, "the median, not the worst"
-
-
-def test_the_cap_never_goes_below_4_or_above_32():
-    assert wr.next_cap(4, [5.0] * 8, 1.0, True) == 4
-    assert wr.next_cap(32, [1.0] * 8, 1.0, True) == 32
-    assert wr.next_cap(64, [1.2] * 8, 1.0, False) == 32 and wr.next_cap(1, [1.2] * 8, 1.0, False) == 4
-
-
-def test_a_servers_cap_starts_at_8_takes_its_baseline_there_and_moves_a_step_per_window():
-    now = [0.0]
-    caps = wr.ServerCaps(start=8, clock=lambda: now[0])
-    assert caps.cap("sql_a") == 8
-    caps.saturated("sql_a", True)
-    for _ in range(7):
-        assert caps.timed("sql_a", 1.0) == 8
-    assert caps.timed("sql_a", 1.0) == 12                 # the starting level's median is 1 s, and 1 s is flat
-    for _ in range(8):
-        caps.timed("sql_a", 1.1)
-    assert caps.cap("sql_a") == 16
-    for _ in range(8):
-        caps.timed("sql_a", 1.8)                          # past 1.5 times the starting level's: back a step
-    assert caps.cap("sql_a") == 12
-    assert caps.cap("sql_b") == 8, "each server has its own"
-    now[0] += wr.CAP_FORGET_S + 1
-    assert caps.cap("sql_a") == 8, "a server not read for a while starts again"
+def test_a_step_keeps_to_the_cap_it_is_given_and_to_the_setting_when_given_none():
+    names = [f"db{i:02d}" for i in range(40)]
+    running = {n: [{"state": "RUNNING", "rows": None, "error": None}] for n in names}
+    store = _Store(names, wr.READ)
+    wr.advance(store, _Warehouse(running), wr.READ, "d1", "sql_a", cap=6)
+    assert store.going("sql_a") == 6
+    wr.advance(store, _Warehouse(running), wr.READ, "d1", "sql_a", cap=10)
+    assert store.going("sql_a") == 10
+    by_default = _Store(names, wr.READ)
+    wr.advance(by_default, _Warehouse(running), wr.READ, "d1", "sql_a")
+    assert by_default.going("sql_a") == wr.CAP == 8
 
 
 @pytest.mark.parametrize("error,plain", [

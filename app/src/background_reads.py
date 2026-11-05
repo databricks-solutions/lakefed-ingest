@@ -12,11 +12,11 @@ next.
 - Each database is claimed before it is sent, with the claim the page's own steps take (FOR UPDATE SKIP LOCKED,
   warehouse_reads.CLAIM_S), so two app instances, a page and re-discovery's loop never start one database twice. The
   claims of the reads this instance's workers hold are renewed every HOLD_S, well inside CLAIM_S.
-- A server's reads in flight never pass its cap, counted in Lakebase in the claim's transaction under that server's
-  lock, across every discovery and instance (store.claim_reads). warehouse_reads.ServerCaps sets the cap from the time
-  this instance's reads took, send to answer.
-- While the warehouse is starting (or stopped), one statement is sent at a time, and it isn't timed: its slow first
-  answer holds one worker, not all of them, and sets no cap. Its answer says the warehouse is up.
+- A server's reads and checks in flight never pass its cap, one fixed number (warehouse_reads.CAP) counted in Lakebase
+  in the claim's transaction under that server's lock, across every discovery and instance (store.claim_reads,
+  store.claim_checks).
+- While the warehouse is starting (or stopped), one statement is sent at a time: its slow first answer holds one
+  worker, not all of them. Its answer says the warehouse is up.
 - After a restart nothing is lost and nothing is sent twice: a claim with no statement is free again after CLAIM_S and
   sent then; a statement saved before the restart is read again from its id once its claim has lapsed (store.collect).
 
@@ -54,11 +54,10 @@ class Reader:
     """One background reader per app process. ``start`` runs its look in a thread and its workers in theirs; ``wake``
     looks at once. ``step`` is one look, which the tests take themselves."""
 
-    def __init__(self, store, warehouse, caps: Optional[wr.ServerCaps] = None, workers: int = WORKERS,
+    def __init__(self, store, warehouse, cap: int = wr.CAP, workers: int = WORKERS,
                  draft_ttl_s: float = 2 * 3600, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep):
-        self.store, self.warehouse = store, warehouse
-        self.caps = caps or wr.CAPS
+        self.store, self.warehouse, self.cap = store, warehouse, cap
         self.workers, self.draft_ttl_s, self.clock, self.sleep = workers, draft_ttl_s, clock, sleep
         self._mu = threading.Lock()
         self._held: Dict[Tuple[str, str], str] = {}     # (discovery_id, database): its server, for each read held here
@@ -127,7 +126,7 @@ class Reader:
                 break
             if int(row.get("orphaned") or 0):
                 for database, statement_id in self.store.collect(row["discovery_id"], wr.CLAIM_S, free):
-                    self._hand(row["discovery_id"], database, row["src_connection"], statement_id, timed=False)
+                    self._hand(row["discovery_id"], database, row["src_connection"], statement_id)
                     free, handed = free - 1, handed + 1
         if now < self._paused_until:
             return handed
@@ -150,29 +149,25 @@ class Reader:
             # The discoveries with least to read first, so a page's few databases don't wait behind a whole server's.
             rows.sort(key=lambda r: int(r["waiting"]))
             connection_of = {r["discovery_id"]: r["src_connection"] for r in rows}
-            claimed, saturated = self.store.claim_reads(server, list(connection_of), self.caps.cap(server), limit,
-                                                        wr.CLAIM_S)
-            self.caps.saturated(server, saturated)
+            claimed = self.store.claim_reads(server, list(connection_of), self.cap, limit, wr.CLAIM_S)
             for discovery_id, database in claimed:
-                self._hand(discovery_id, database, connection_of[discovery_id], None, timed=ready)
+                self._hand(discovery_id, database, connection_of[discovery_id], None)
                 free, handed = free - 1, handed + 1
         return handed
 
-    def _hand(self, discovery_id: str, database: str, connection: str, statement_id: Optional[str], timed: bool) -> None:
+    def _hand(self, discovery_id: str, database: str, connection: str, statement_id: Optional[str]) -> None:
         with self._mu:
             self._held[(discovery_id, database)] = wr.server_key(connection)
-        self._jobs.put((discovery_id, database, connection, statement_id, timed))
+        self._jobs.put((discovery_id, database, connection, statement_id))
 
     def _work(self) -> None:
         while True:
             self.read(*self._jobs.get())
 
-    def read(self, discovery_id: str, database: str, connection: str, statement_id: Optional[str],
-             timed: bool) -> None:
+    def read(self, discovery_id: str, database: str, connection: str, statement_id: Optional[str]) -> None:
         """One worker's read of one database: send its statement with a wait (or, given one saved before, read that
         again), read it again while it is still going, save it, and let it go."""
         try:
-            sent = self.clock()
             answer = None
             if statement_id is None:
                 statement, parameters = wr.statement_for(wr.READ, connection, database)
@@ -201,8 +196,6 @@ class Reader:
                         return
             self._warehouse_seen = ("RUNNING", self.clock())
             wr.finish(self.store, wr.READ, discovery_id, database, statement_id, answer)
-            if timed and answer["state"] == "SUCCEEDED":
-                self.caps.timed(wr.server_key(connection), self.clock() - sent)
         except Exception as e:
             self._failed(e)
             log.exception("a background read of %s failed", database)
