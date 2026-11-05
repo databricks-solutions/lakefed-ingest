@@ -326,7 +326,7 @@ export function oneLine(widths: ColumnWidths, extraClasses = "") {
 
 /** An identifier on one line with a copy button beside it, shown when the row is hovered or focused (Catalog Explorer
  * puts a copy icon beside the values you copy: a host, an ID, a full name). */
-export function CutCopy({ text, label, shown }: { text: string; label: string; shown?: string }) {
+export function CutCopy({ text, label, shown }: { text: string; label: string; shown?: ReactNode }) {
   return <span className="cell-line"><Cut text={text} tipOnlyWhenCut>{shown}</Cut><CopyButton text={text} label={label} /></span>;
 }
 
