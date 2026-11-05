@@ -3796,8 +3796,11 @@ class WarehouseReadStore:
         """Claim the page's databases to check, up to ``limit`` for this discovery and never past the server's cap. It
         runs in the same transaction, under the server's lock, as the reads do. When the server has no room left for the
         names asked for, the first few of them are marked wanted (warehouse_reads.wanted_limit), so reads leave places for
-        them (warehouse_reads.WANT_S)."""
+        them (warehouse_reads.WANT_S). The page asks every 1.5 s, so a quick look comes first, with no lock: when every
+        name is claimed or checked already, there is nothing to claim and the lock is not taken."""
         if limit <= 0 or not first:
+            return []
+        if not db.query(q.warehouse_free_checks_sql(), (discovery_id, claim_s, list(first)))[0]["free"]:
             return []
         with db.transaction() as cur:
             cur.execute(q.warehouse_reads_lock_sql(), (q.warehouse_reads_lock_key(server),))
@@ -3822,10 +3825,8 @@ class WarehouseReadStore:
             return []
         with db.transaction() as cur:
             cur.execute(q.warehouse_reads_lock_sql(), (q.warehouse_reads_lock_key(server),))
-            going = self._going(cur, server, claim_s)
-            waiting = int(db.fetch(cur, q.warehouse_waiting_checks_sql(),
-                                   (server, claim_s, warehouse_reads.WANT_S))[0]["waiting"] or 0)
-            room = min(int(limit), int(cap) - going - waiting)
+            load = db.fetch(cur, q.warehouse_server_load_sql(), (server, claim_s, warehouse_reads.WANT_S))[0]
+            room = min(int(limit), int(cap) - int(load["going"] or 0) - int(load["waiting"] or 0))
             if room <= 0:
                 return []
             ids = list(discovery_ids)

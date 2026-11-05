@@ -1647,14 +1647,28 @@ def warehouse_going_sql() -> str:
             f"and {_LIVE_CLAIM}")
 
 
-def warehouse_waiting_checks_sql() -> str:
-    """How many checks of one server are waiting for a place: marked wanted within the last while
-    (warehouse_want_checks_sql), with no statement and no live claim. Reads leave these places free. Params: server
-    (lower case), claim age in seconds, wanted age in seconds."""
-    return (f"select count(*) as waiting from {SCHEMA}.discovery where lower(src_connection) = %s "
-            f"and {_THROUGH_WAREHOUSE} and {WAREHOUSE_WORK['check']} and not (listing ? 'statement_id') "
-            f"and {_LAPSED_CLAIM} "
-            f"and (listing ->> 'wanted_at')::timestamptz >= now() - make_interval(secs => %s)")
+def warehouse_server_load_sql() -> str:
+    """How many places of one server are taken, in one scan of its discoveries: ``going`` are its checks and reads in
+    flight (warehouse_going_sql's rule), and ``waiting`` are its checks waiting for a place, marked wanted within the
+    last while (warehouse_want_checks_sql) with no statement and no live claim, whose places reads leave free. Params:
+    server (lower case), claim age in seconds, wanted age in seconds."""
+    live = _LIVE_CLAIM.replace("%s", "p.claim_s")
+    lapsed = _LAPSED_CLAIM.replace("%s", "p.claim_s")
+    return (f"with p as (select %s::text as server, %s::float as claim_s, %s::float as want_s) "
+            f"select count(*) filter (where (({WAREHOUSE_WORK['read']}) or ({WAREHOUSE_WORK['check']})) and {live}) "
+            f"as going, "
+            f"count(*) filter (where {WAREHOUSE_WORK['check']} and not (listing ? 'statement_id') and {lapsed} "
+            f"and (listing ->> 'wanted_at')::timestamptz >= now() - make_interval(secs => p.want_s)) as waiting "
+            f"from {SCHEMA}.discovery cross join p "
+            f"where lower(src_connection) = p.server and {_THROUGH_WAREHOUSE}")
+
+
+def warehouse_free_checks_sql() -> str:
+    """Whether any of the names asked for is a check free to claim (what warehouse_claim_sql would take, and what
+    warehouse_want_checks_sql would mark): a quick look before the server's lock is taken. Params: discovery_id, claim
+    age in seconds, the names (text[])."""
+    return (f"select exists (select 1 from {SCHEMA}.discovery where discovery_id = %s and {WAREHOUSE_WORK['check']} "
+            f"and not (listing ? 'statement_id') and {_LAPSED_CLAIM} and src_database = any(%s::text[])) as free")
 
 
 def warehouse_want_checks_sql() -> str:

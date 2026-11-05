@@ -161,6 +161,33 @@ def test_a_page_of_unchecked_databases_holds_places_for_half_the_cap_and_reads_k
     assert len(got) == 4, "reads keep the other half of the server's places while the page waits"
 
 
+def test_the_quick_look_finds_a_page_name_still_free_until_every_one_is_claimed_or_checked(owner):
+    store = main.WarehouseReadStore()
+    page = [f"c{i:02d}" for i in range(3)]
+    did = _listed(owner, page)
+    free = lambda: _rows(owner, q.warehouse_free_checks_sql(), (did, wr.CLAIM_S, page))[0]["free"]
+    assert free() is True
+    claimed = store.claim_checks("sql_a", did, page[:2], 16, 8, wr.CLAIM_S)
+    assert len(claimed) == 2 and free() is True, "the third name is still free"
+    assert len(store.claim_checks("sql_a", did, page, 16, 8, wr.CLAIM_S)) == 1
+    assert free() is False
+    assert store.claim_checks("sql_a", did, page, 16, 8, wr.CLAIM_S) == []
+    store.finish_check(did, page[0], True, 1, None)
+    assert free() is False
+
+
+def test_the_servers_going_and_waiting_places_are_counted_by_one_query(owner):
+    store = main.WarehouseReadStore()
+    page = [f"c{i:02d}" for i in range(6)]
+    checking = _listed(owner, page)
+    reading = _read(owner, [f"a{i:02d}" for i in range(3)], connection="SQL_A")
+    store.claim_reads("sql_a", [reading], 8, 3, wr.CLAIM_S)
+    store.claim_checks("sql_a", checking, page, 16, 5, wr.CLAIM_S)
+    load = _rows(owner, q.warehouse_server_load_sql(), ("sql_a", wr.CLAIM_S, wr.WANT_S))[0]
+    assert (load["going"], load["waiting"]) == (5, 2), "3 reads and 2 checks going, and 2 of the 4 left wanted"
+    assert _rows(owner, q.warehouse_server_load_sql(), ("sql_b", wr.CLAIM_S, wr.WANT_S))[0] == {"going": 0, "waiting": 0}
+
+
 def test_a_claim_waits_for_the_servers_lock_held_elsewhere(owner):
     import psycopg
     store = main.WarehouseReadStore()
