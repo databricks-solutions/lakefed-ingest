@@ -143,9 +143,9 @@ The one-time and ad hoc jobs shouldn't wait several minutes for a job cluster to
   `discovery_warehouse_size`, `discovery_warehouse_max_clusters`, `discovery_warehouse_auto_stop_mins`), through the
   Unity Catalog connection, so the test, the database list and the table reads answer in seconds; the warehouse
   needs the same network path to the sources (serverless network connectivity), or set `app_warehouse_id` to a Pro
-  warehouse of your own that has one (see [The app's SQL warehouse](#the-apps-sql-warehouse)). The app reads at most
-  8 databases of one source server at once to begin with, and raises that by 4, up to 32, only while each read keeps
-  its time (bundle variables `reads_start_cap`, `reads_max_cap`). The discovery job
+  warehouse of your own that has one (see [The app's SQL warehouse](#the-apps-sql-warehouse)). The app checks and
+  reads at most 8 databases of one source server at once, one fixed number (bundle variable `reads_cap`, from 4 to
+  256), shared by the page's checks and the background reads. The discovery job
   stays for listing through Azure and for sources read by host and password. See [app/README.md](../app/README.md),
   Discovery through the SQL warehouse.
 - **Ingestion** runs on job clusters with the source network path (scheduled, recurring work).

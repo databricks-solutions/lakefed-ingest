@@ -141,7 +141,8 @@ variables:
     default: lakefed_ingest_jdbc_logins
   reads_cap:
     description: How many databases of one source server are checked or read through the warehouse at once (one
-      statement each, counted across every discovery and app instance), a fixed number whatever the reads take. Never
+      statement each, checks and reads together, counted across every discovery and app instance), a fixed number
+      whatever the reads take. While a page of unchecked databases waits, reads keep at least half of it. Never
       below 4 and at most 256. An older deploy that still sets READS_START_CAP on the app is read when this is not set.
     default: 8
 
