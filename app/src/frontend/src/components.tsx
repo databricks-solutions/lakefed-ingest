@@ -419,8 +419,9 @@ export type { StateCounts } from "./bars";
 /** The counts under a bar, in the bar's colours (bars.ts says what they are). */
 function BarCountsLine({ summary, stacked }: { summary: BarSummary; stacked?: boolean }) {
   const className = `bar-counts${stacked ? " stacked" : ""}`;
-  if (summary.allDone) return <span className={className}><span className="tone-loaded all-done"><Check /> {summary.allDone}</span></span>;
-  return <span className={className}>{summary.items.map((entry) => <span key={entry.text} className={`tone-${entry.tone}`}>{entry.text}</span>)}</span>;
+  const whole = summary.allDone ?? summary.items.map((entry) => entry.text).join(" · ");
+  if (summary.allDone) return <Cut text={whole} className={className} tipOnlyWhenCut><span className="tone-loaded all-done"><Check /> {summary.allDone}</span></Cut>;
+  return <Cut text={whole} className={className} tipOnlyWhenCut>{summary.items.map((entry) => <span key={entry.text} className={`tone-${entry.tone}`}>{entry.text}</span>)}</Cut>;
 }
 
 function Check() {

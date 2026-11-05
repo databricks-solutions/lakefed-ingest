@@ -55,7 +55,7 @@ test("a click on text with a tooltip stays with the tooltip unless the row is me
 });
 
 test("a one-line table's narrowest width is its fixed columns plus a set room for each flexible one", () => {
-  assert.equal(tableMinWidth([40, null, 100, null, 180]), 40 + 160 + 100 + 160 + 180);
+  assert.equal(tableMinWidth([40, null, 100, null, 180]), 40 + 120 + 100 + 120 + 180);
   assert.equal(tableMinWidth([40, null, 100, null, 180], 100), 40 + 100 + 100 + 100 + 180);
   assert.equal(tableMinWidth([80, 120]), 200);
   assert.equal(tableMinWidth([]), 0);

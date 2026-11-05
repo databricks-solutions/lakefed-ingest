@@ -36,8 +36,8 @@ function LastJobRun({ job }: { job: Row }) {
 
 /** The Jobs list's columns: the name takes the room, the counts and times are narrow and fixed. With the audit columns
  * (Created, Last updated) the counts are narrower still, as the Jobs list keeps its window at 1,280 px. */
-const WIDTHS = [null, 80, 100, 80, 230, 80, 110, 250, 180] as const;
-const AUDIT_WIDTHS = [null, 76, 70, 230, 76, 90, 250, 170, 190, 190] as const;
+const WIDTHS = [null, 64, 84, 64, 170, 64, 112, 150, 130] as const;
+const AUDIT_WIDTHS = [null, 60, 60, 170, 60, 100, 140, 110, 140, 140] as const;
 
 /** Every ingestion job, failing first, with its tables by state and its Status; "Not in any job" last. */
 /** The Ingestion jobs list's sort: a time column and its direction, or none for the list's own order. */
@@ -67,9 +67,8 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
         <tbody>
           {jobs.map((j) => (
             <tr key={j.id ?? "none"}>
-              <td className="name"><Cut text={[j.name, j.id != null ? j.description : null].filter(Boolean).join(": ")} tipOnlyWhenCut>
-                {j.id != null ? <Link to={jobPath(j.id)}><b>{j.name}</b></Link> : <b>{j.name}</b>}
-                <span className="sub">{j.id != null ? j.description : `${fmtInt(j.groups?.length)} ${plural(j.groups?.length, "group")}`}</span></Cut></td>
+              <td className="name"><Cut text={[j.name, j.id != null ? j.description : null].filter(Boolean).join(": ")} tipOnlyWhenCut={!j.description}>
+                {j.id != null ? <Link to={jobPath(j.id)}><b>{j.name}</b></Link> : <b>{j.name}</b>}</Cut></td>
               <td className="num">{fmtInt(j.groups?.length)}</td>{!audit && <td className="num">{fmtInt(j.databases)}</td>}
               <td className="num">{fmtInt(j.enabled_tables)}</td><td><StateBar row={j} saysAllDone={false} /></td>
               <td className="num" style={{ color: Number(j.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(j.state_failing)}</td>
@@ -81,8 +80,8 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
           ))}
           {notInJob && (
             <tr className="total">
-              <td className="name"><Cut text={`Not in any job: ${notInJob.groups.join(", ")}`} tipOnlyWhenCut>
-                <Link to="/ingestion-jobs/not-in-job"><b>Not in any job</b></Link><span className="sub">{notInJob.groups.join(", ")}</span></Cut></td>
+              <td className="name"><Cut text={`Not in any job: ${notInJob.groups.join(", ")}`}>
+                <Link to="/ingestion-jobs/not-in-job"><b>Not in any job</b></Link></Cut></td>
               <td className="num">{fmtInt(notInJob.groups.length)}</td>{!audit && <td className="num">{fmtInt(notInJob.databases)}</td>}
               <td className="num">{fmtInt(notInJob.enabled_tables)}</td><td><StateBar row={notInJob} saysAllDone={false} /></td>
               <td className="num" style={{ color: Number(notInJob.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(notInJob.state_failing)}</td>

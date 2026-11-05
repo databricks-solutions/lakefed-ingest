@@ -35,6 +35,6 @@ export type ColumnWidths = readonly (number | null)[];
 
 /** The narrowest a one-line table is drawn before its wrapper scrolls sideways: the fixed columns plus a set room for each
  * column that takes what is left, so a flexible column is never squeezed to nothing. */
-export function tableMinWidth(widths: ColumnWidths, flexibleMinimum = 160): number {
+export function tableMinWidth(widths: ColumnWidths, flexibleMinimum = 120): number {
   return widths.reduce<number>((sum, width) => sum + (width ?? flexibleMinimum), 0);
 }
