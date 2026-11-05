@@ -1,13 +1,15 @@
 import { Fragment, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, OutLink, Pager, Section, StateBar, StateKey, fmtAgo, fmtInt, plural, Twisty } from "../components";
+import { Cols, Cut, ErrorBox, OutLink, Pager, Section, StateBar, StateKey, fmtAgo, fmtInt, oneLine, plural, Twisty } from "../components";
 
 // A job's target tables: where its data lands, each with its state and the rows the run records say were written over
 // 7 days. Opening one lists the source tables and databases written into it. Names follow Catalog Explorer.
 // Exact row counts would need a SQL warehouse, which the app avoids; Catalog Explorer has them, one click away.
 
 const PAGE = 25;
+/** As Catalog Explorer's tables list keeps its columns: the name takes the spare width, the short fields have their own. */
+const WIDTHS = [null, 170, 230, 150] as const;
 
 function SourceRows({ jobId, target, t }: { jobId: string; target: string; t: Row }) {
   const [offset, setOffset] = useState(0);
@@ -24,8 +26,9 @@ function SourceRows({ jobId, target, t }: { jobId: string; target: string; t: Ro
           jobs {outside === 1 ? "writes" : "write"} here too</span></>}</td></tr>
       {(sources.data?.items ?? []).map((s: Row) => (
         <tr key={s.id} className="l2">
-          <td className="name">{s.server} › {s.database} › {s.schema}.{s.table}
-            {s.client_id && <span className="sub">client_id {s.client_id}</span>}</td>
+          <td className="name"><Cut tipOnlyWhenCut text={`${s.server} › ${s.database} › ${s.schema}.${s.table}${s.client_id ? `  client_id ${s.client_id}` : ""}`}>
+            {s.server} › {s.database} › {s.schema}.{s.table}
+            {s.client_id && <span className="sub">client_id {s.client_id}</span>}</Cut></td>
           <td>{s.enabled ? <StateBar row={s} /> : <span className="muted">disabled</span>}</td>
           <td className="num">{s.rows_written_7d != null ? fmtInt(s.rows_written_7d) : ""}
             {s.last_written && <span className="sub">last {fmtAgo(s.last_written)}</span>}</td>
@@ -54,14 +57,15 @@ export function TargetTables({ jobId }: { jobId: string }) {
       note="Where this job's data lands. Open a target for the source tables and databases written into it. Rows written are from the run records over the last 7 days; Catalog Explorer has each table's exact size.">
       <input className="search tree-search" placeholder="Find a target table" value={search}
         onChange={(e) => { setSearch(e.target.value); setOffset(0); setOpen(null); }} />
-      <div className="table-wrap"><table className="data tree">
+      <div className="table-wrap"><table {...oneLine(WIDTHS, "tree")}>
+        <Cols widths={WIDTHS} />
         <thead><tr><th>Name › its source tables</th><th>State now</th><th className="num">Rows written (7 days)</th><th></th></tr></thead>
         <tbody>
           {(targets.data?.items ?? []).map((t: Row) => (
             <Fragment key={t.target}>
               <tr>
-                <td className="name"><Twisty open={open === t.target} onToggle={() => setOpen(open === t.target ? null : t.target)}><b>{t.table}</b></Twisty>
-                  <span className="sub target-path">{t.catalog}.{t.schema}</span></td>
+                <td className="name"><Twisty open={open === t.target} onToggle={() => setOpen(open === t.target ? null : t.target)}>
+                  <Cut text={`${t.catalog}.${t.schema}.${t.table}`} tipOnlyWhenCut><b>{t.table}</b><span className="sub">{t.catalog}.{t.schema}</span></Cut></Twisty></td>
                 <td><StateBar row={t} /></td>
                 <td className="num">{t.rows_written_7d != null ? fmtInt(t.rows_written_7d) : ""}
                   <span className="sub">{t.last_written ? `last ${fmtAgo(t.last_written)}` : "none in 7 days"}</span></td>

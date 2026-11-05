@@ -100,7 +100,7 @@ export default function JobRun() {
                         : <RunStatus status={null} outcome={g.status} />}</td>
                       <td>{g.started_at ? fmtClock(g.started_at) : ""}</td>
                       <td className="num">{g.duration_s != null ? fmtDuration(g.duration_s) : ""}</td>
-                      <td style={{ minWidth: 160 }}>{g.check ? "" : <ProgressBar p={gp} />}</td>
+                      <td>{g.check ? "" : <ProgressBar p={gp} />}</td>
                       <td className="num">{g.speed_tables_per_min != null ? fmtSpeed(g.speed_tables_per_min) : ""}</td>
                       <td className="num">{g.parallelism ?? ""}</td><td className="mono">{g.cluster_id && <span className="cell-line">
                         <Cut text={g.cluster_id} tipOnlyWhenCut><OutLink href={clusterUrl(config?.workspace_url, g.cluster_id)}>{g.cluster_id}</OutLink></Cut>

@@ -284,8 +284,6 @@ table.data.fit .status-cell { min-width: 0; }
 table.data.fit .bar { min-width: 80px; }
 table.data.fit th, table.data.fit td { padding-left: 6px; padding-right: 6px; }
 /* A wide table's two-word headers take two lines, so its last column stays in view at 1200 px. */
-table.data.wrap-head th { white-space: normal; vertical-align: bottom; }
-table.data.wrap-head td.name { min-width: 110px; }
 table.data td.mono { white-space: nowrap; }
 /* One line to a row, as Catalog Explorer's lists and the Jobs list keep theirs (the Tables rule in CLAUDE.md). Columns
    have set widths (<Cols>), so a short field stays narrow and the name takes what is left; text that does not fit ends
@@ -304,6 +302,9 @@ table.data.one-line .bar-counts { flex-wrap: nowrap; white-space: nowrap; overfl
 table.data.one-line .bar-counts > span { flex: none; }
 /* A row's actions menu opens below the cell, so its cell must not clip it. */
 table.data.one-line td.card-actions { overflow: visible; }
+/* A tree row's name sits in a twisty button: the button gives way so the name can be cut. */
+table.data.one-line .twisty.named { max-width: 100%; min-width: 0; }
+table.data.one-line .twisty.named > .tip-target { flex: 0 1 auto; min-width: 0; }
 table.data.one-line td .sub { display: inline; margin-left: var(--db-space-2); }
 table.data.one-line .cell-line { display: flex; align-items: center; gap: var(--db-space-1, 4px); }
 table.data.one-line .cell-line .tip-target { flex: 0 1 auto; min-width: 0; }
@@ -357,7 +358,6 @@ span.info { display: inline-grid; place-items: center; width: 16px; height: 16px
             font-size: 11px; margin-right: 4px; }
 .mono { font-family: var(--db-font-family-mono, ui-monospace, Menlo, monospace); }
 .tree-search { width: min(420px, 100%); }
-table.tree td .target-path { padding-left: 28px; }
 table.tree tr.l3 td { padding-top: 3px; padding-bottom: 3px; }
 .add-databases { border: 1px solid var(--border); border-radius: 6px; padding: var(--db-space-3); margin-bottom: var(--db-space-3); }
 details.advanced summary { cursor: pointer; display: flex; gap: var(--db-space-2); align-items: baseline; }

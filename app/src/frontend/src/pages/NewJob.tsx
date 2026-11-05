@@ -2,7 +2,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api, type Row } from "../api";
-import { Busy, StatusLine, Crumbs, ErrorBox, Info, Menu, Modal, Notice, PageHead, Section, Twisty, fmtInt, plural, useConfirm, Chevron } from "../components";
+import { Busy, Cols, Cut, StatusLine, Crumbs, ErrorBox, Info, Menu, Modal, Notice, PageHead, Section, Twisty, fmtInt, oneLine, plural, useConfirm, Chevron } from "../components";
 import { CADENCES, IdentityFields, ParameterField, ParameterFields, RunFields, WritesFields } from "./jobForm";
 import { DiscoverDialog, discardDrafts } from "./Discover";
 import { serverRowCells, targetBlock } from "./previewRows";
@@ -207,15 +207,16 @@ export default function NewJob() {
               {Number(reading?.left_out) > 0 && <p className="muted">The whole server leaves out {fmtInt(reading.left_out)}{" "}
                 {plural(reading.left_out, "database")} the connection's login can't open.</p>}
               {discoveringDatabases !== null && <Busy label="Reading tables" />}
-              <div className="table-wrap"><table className="data tree">
+              <div className="table-wrap"><table {...oneLine(CHOSEN_WIDTHS, "tree")}>
+                <Cols widths={CHOSEN_WIDTHS} />
                 <thead><tr><th>Server › database › table</th><th>Read through · load type</th><th className="num">Databases · tables</th></tr></thead>
                 <tbody>
                   {(Array.isArray(summary?.servers) ? summary.servers : []).map((s: Row) => {
                     const cells = serverRowCells(s, LOAD_TYPES);
                     const open = openServer === cells.server;
                     return <Fragment key={cells.server}>
-                      <tr><td className="name"><Twisty open={open} onToggle={() => setOpenServer(open ? null : cells.server)}><b>{cells.server}</b></Twisty></td>
-                        <td>{cells.readThrough} · {cells.loadTypes}</td>
+                      <tr><td className="name"><Twisty open={open} onToggle={() => setOpenServer(open ? null : cells.server)}><Cut text={cells.server} tipOnlyWhenCut><b>{cells.server}</b></Cut></Twisty></td>
+                        <td><Cut text={`${cells.readThrough} · ${cells.loadTypes}`} tipOnlyWhenCut /></td>
                         <td className="num"><span className="row-end">{cells.counts}
                           <button className="ghost icon remove" aria-label="Remove the tables" title="Remove the tables" onClick={removeTables}>×</button></span></td></tr>
                       {open && <ChosenDatabases source={chosen.source} server={cells.server} />}
@@ -261,6 +262,9 @@ export default function NewJob() {
   );
 }
 
+/** The chosen tree's columns as the job page's tree keeps them: the name takes the spare width. */
+const CHOSEN_WIDTHS = [null, 320, 190] as const;
+
 /** A template for the CSV: its header, and one line per table and one per database. */
 function downloadTemplate() {
   const url = URL.createObjectURL(new Blob([CSV_TEMPLATE], { type: "text/csv" }));
@@ -273,13 +277,15 @@ function downloadTemplate() {
 
 /** The first lines of an uploaded file as the file gave them: the header's columns, then each line's values. */
 function FirstLines({ columns, lines }: { columns: string[]; lines: Row[] }) {
+  const widths = [56, ...columns.map(() => 150)];
   return (
-    <div className="table-wrap"><table className="data dense">
+    <div className="table-wrap"><table {...oneLine(widths, "dense")}>
+      <Cols widths={widths} />
       <thead><tr><th className="num">Line</th>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead>
       <tbody>
         {lines.map((line) => (
           <tr key={line.line}><td className="num">{line.line}</td>
-            {columns.map((column) => <td key={column} className="name">{String(line.fields?.[column] ?? "")}</td>)}</tr>
+            {columns.map((column) => <td key={column} className="name"><Cut text={String(line.fields?.[column] ?? "")} tipOnlyWhenCut /></td>)}</tr>
         ))}
       </tbody>
     </table></div>

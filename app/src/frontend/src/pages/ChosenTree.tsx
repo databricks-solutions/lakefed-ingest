@@ -1,7 +1,7 @@
 import { Fragment, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Pager, Twisty, fmtInt } from "../components";
+import { Cut, ErrorBox, Pager, Twisty, fmtInt } from "../components";
 
 // New job's What it ingests, below a server row: the databases chosen on it, a page at a time, and a database's tables
 // read only once it is opened. It uses the reads the app has already (GET /api/sources/{kind}/{id} for the databases of
@@ -35,7 +35,7 @@ function SourceTables({ source, server, database }: { source: Row; server: strin
   return (
     <>
       {(page.data?.tables ?? []).map((t: Row) => (
-        <tr key={`${t.src_schema}.${t.src_table}`} className="l3"><td className="name" colSpan={3}>{t.src_schema}.{t.src_table}</td></tr>
+        <tr key={`${t.src_schema}.${t.src_table}`} className="l3"><td className="name" colSpan={3}><Cut text={`${t.src_schema}.${t.src_table}`} tipOnlyWhenCut /></td></tr>
       ))}
       {(page.data?.total ?? 0) > PAGE && <tr className="l3"><td colSpan={3}>
         <Pager offset={offset} limit={PAGE} total={page.data!.total} noun="table" onPage={setOffset} /></td></tr>}
@@ -51,12 +51,12 @@ function DatabaseRow({ source, server, database, tables, picked }: { source: Row
   return (
     <>
       <tr className="l2">
-        <td className="name"><Twisty open={open} onToggle={() => setOpen(!open)}>{database}</Twisty></td>
+        <td className="name"><Twisty open={open} onToggle={() => setOpen(!open)}><Cut text={database} tipOnlyWhenCut /></Twisty></td>
         <td></td>
         <td className="num">{picked ? fmtInt(picked.length) : tables != null ? fmtInt(tables) : ""}</td>
       </tr>
       {open && (picked
-        ? picked.map((name) => <tr key={name} className="l3"><td className="name" colSpan={3}>{name}</td></tr>)
+        ? picked.map((name) => <tr key={name} className="l3"><td className="name" colSpan={3}><Cut text={name} tipOnlyWhenCut /></td></tr>)
         : <SourceTables source={source} server={server} database={database} />)}
     </>
   );

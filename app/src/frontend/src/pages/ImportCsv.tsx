@@ -2,8 +2,11 @@ import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
-import { ConfirmButton, ErrorBox, PageHead, Section, Tag, ToastOn, fmtInt, plural } from "../components";
+import { Cols, ConfirmButton, Cut, CutCopy, ErrorBox, PageHead, Section, Tag, ToastOn, fmtInt, oneLine, plural } from "../components";
 import { groupsRefusal, usePermissions } from "../permissions";
+
+/** The preview's lines as a job's runs list keeps its columns: the problems take the spare width. */
+const LINE_WIDTHS = [64, 260, 260, 120, null] as const;
 
 /** The group settings the import fills each row with, in the order config_import.SETTINGS gives them. */
 const SETTINGS: { key: string; label: string; options?: string[]; type?: "number" | "checkbox"; help?: string }[] = [
@@ -119,14 +122,15 @@ export default function ImportCsv() {
       {result && (
         <Section title={`Lines: ${fmtInt((result.lines ?? []).length)}`}
           note={Object.entries(counts).map(([s, n]) => `${fmtInt(n)} ${s}`).join(", ")}>
-          <div className="table-wrap"><table className="data dense">
+          <div className="table-wrap"><table {...oneLine(LINE_WIDTHS, "dense")}>
+            <Cols widths={LINE_WIDTHS} />
             <thead><tr><th className="num">Line</th><th>Table</th><th>Sink</th><th>Status</th><th>Problems</th></tr></thead>
             <tbody>
               {(result.lines ?? []).map((line: Row) => (
                 <tr key={line.line}>
-                  <td className="num">{line.line}</td><td className="name">{line.table}</td><td className="name">{line.sink}</td>
+                  <td className="num">{line.line}</td><td className="name"><Cut text={String(line.table ?? "")} tipOnlyWhenCut /></td><td className="name"><Cut text={String(line.sink ?? "")} tipOnlyWhenCut /></td>
                   <td><Tag tone={TONE[line.status] ?? ""}>{line.status}</Tag></td>
-                  <td>{(line.errors ?? []).join("; ")}</td>
+                  <td>{(line.errors ?? []).length ? <CutCopy text={(line.errors as string[]).join("; ")} label={`Copy the problems of line ${line.line}`} /> : null}</td>
                 </tr>
               ))}
             </tbody>
