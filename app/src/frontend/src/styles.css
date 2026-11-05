@@ -295,6 +295,9 @@ table.data.one-line td > a, table.data.one-line td > b, table.data.one-line td >
 table.data.one-line td > .tip-target, table.data.one-line .tip-target > .cut, table.data.one-line .tip-target > .host { display: block; }
 /* A note, an error or a pager that spans the row is a sentence, not a cell: it wraps. */
 table.data.one-line td[colspan]:not(.name) { white-space: normal; overflow: visible; }
+table.data.one-line .status-cell { flex-direction: row; align-items: center; gap: var(--db-space-2); min-width: 0; }
+table.data.one-line .status-cell > * { flex: 0 1 auto; min-width: 0; }
+table.data.one-line .status-cell > .tag, table.data.one-line .status-cell > .tip-target:first-child { flex: none; }
 table.data.one-line td .sub { display: inline; margin-left: var(--db-space-2); }
 table.data.one-line .cell-line { display: flex; align-items: center; gap: var(--db-space-1, 4px); }
 table.data.one-line .cell-line .tip-target { flex: 0 1 auto; min-width: 0; }

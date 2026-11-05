@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
 import { type BarPart, type Tone } from "../bars";
-import { CountBar, ErrorBox, FillBox, Info, JobStatus, Name, Notice, PageHead, Pager, RunStatus, Section, StateBar, StateSummary, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtTime, jobRunPath, plural, usePageStamp } from "../components";
+import { Cols, CountBar, Cut, ErrorBox, FillBox, Info, JobStatus, Notice, PageHead, Pager, RunStatus, Section, StateBar, StateSummary, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtTime, jobRunPath, plural, oneLine, usePageStamp } from "../components";
 
 interface Overview {
   jobs: Row[]; jobs_total: number; offset: number; limit: number; not_in_job: Row | null;
@@ -24,14 +24,20 @@ const jobPath = (id: unknown) => `/ingestion-jobs/${encodeURIComponent(String(id
 function LastJobRun({ job }: { job: Row }) {
   const last = job.last_job_run;
   if (!last) return <span className="muted">Never run</span>;
+  const when = `${fmtSlot(last.slot)}${last.took_s != null ? `, took ${fmtDuration(last.took_s)}` : ""}${
+    Number(last.failed_tables) > 0 ? `, ${fmtInt(last.failed_tables)} failed` : ""}`;
   return (
-    <>
+    <span className="cell-line">
       <Link to={jobRunPath(job.id, last.slot)}><RunStatus status={null} outcome={last.outcome} /></Link>
-      <span className="sub">{fmtSlot(last.slot)}{last.took_s != null && `, took ${fmtDuration(last.took_s)}`}
-        {Number(last.failed_tables) > 0 && `, ${fmtInt(last.failed_tables)} failed`}</span>
-    </>
+      <Cut text={when} className="cut sub" />
+    </span>
   );
 }
+
+/** The Jobs list's columns: the name takes the room, the counts and times are narrow and fixed. With the audit columns
+ * (Created, Last updated) the counts are narrower still, as the Jobs list keeps its window at 1,280 px. */
+const WIDTHS = [null, 80, 100, 80, 230, 80, 110, 250, 180] as const;
+const AUDIT_WIDTHS = [null, 76, 70, 230, 76, 90, 250, 170, 190, 190] as const;
 
 /** Every ingestion job, failing first, with its tables by state and its Status; "Not in any job" last. */
 /** The Ingestion jobs list's sort: a time column and its direction, or none for the list's own order. */
@@ -48,10 +54,12 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
       onClick={() => onSort!({ by, descending: on ? !sort!.descending : true })}>{label}{on ? (sort!.descending ? " ↓" : " ↑") : ""}</button></th>;
   };
   // The user name before the @, the full address on hover, so both columns fit as the Jobs list's Created by does.
-  const who = (by: unknown, at: unknown) => <>{by ? <span title={String(by)}>{String(by).split("@")[0]}</span> : <span className="muted">unknown</span>}
-    {at ? <span className="sub" title={fmtTime(at)}>{fmtShort(at)}</span> : null}</>;
+  const who = (by: unknown, at: unknown) => <span className="cell-line">{by ? <Cut text={String(by)} tipOnlyWhenCut>{String(by).split("@")[0]}</Cut> : <span className="muted">unknown</span>}
+    {at ? <Cut text={fmtTime(at)} className="cut sub">{fmtShort(at)}</Cut> : null}</span>;
+  const widths = audit ? AUDIT_WIDTHS : WIDTHS;
   const table = (
-      <div className="table-wrap"><table className={audit ? "data fit" : "data"}>
+      <div className="table-wrap"><table {...oneLine(widths, audit ? "fit" : "")}>
+        <Cols widths={widths} />
         <thead><tr><th>Ingestion job</th><th className="num">Groups</th>{!audit && <th className="num">Databases</th>}
           <th className="num">Tables</th><th>State now</th><th className="num">Failing</th><th className="num">Late databases</th>
           <th>Last ingestion run</th><th>Status</th>
@@ -59,8 +67,9 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
         <tbody>
           {jobs.map((j) => (
             <tr key={j.id ?? "none"}>
-              <td className={audit ? "name capped" : "name"}>{j.id != null ? <Link to={jobPath(j.id)}><b><Name>{j.name}</Name></b></Link> : <b><Name>{j.name}</Name></b>}
-                <span className="sub">{j.id != null ? j.description : `${fmtInt(j.groups?.length)} ${plural(j.groups?.length, "group")}`}</span></td>
+              <td className="name"><Cut text={[j.name, j.id != null ? j.description : null].filter(Boolean).join(": ")} tipOnlyWhenCut>
+                {j.id != null ? <Link to={jobPath(j.id)}><b>{j.name}</b></Link> : <b>{j.name}</b>}
+                <span className="sub">{j.id != null ? j.description : `${fmtInt(j.groups?.length)} ${plural(j.groups?.length, "group")}`}</span></Cut></td>
               <td className="num">{fmtInt(j.groups?.length)}</td>{!audit && <td className="num">{fmtInt(j.databases)}</td>}
               <td className="num">{fmtInt(j.enabled_tables)}</td><td><StateBar row={j} saysAllDone={false} /></td>
               <td className="num" style={{ color: Number(j.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(j.state_failing)}</td>
@@ -72,12 +81,13 @@ export function JobsTable({ jobs, notInJob, total, offset, limit, onPage, link, 
           ))}
           {notInJob && (
             <tr className="total">
-              <td className="name"><Link to="/ingestion-jobs/not-in-job"><b>Not in any job</b></Link><span className="sub">{notInJob.groups.join(", ")}</span></td>
+              <td className="name"><Cut text={`Not in any job: ${notInJob.groups.join(", ")}`} tipOnlyWhenCut>
+                <Link to="/ingestion-jobs/not-in-job"><b>Not in any job</b></Link><span className="sub">{notInJob.groups.join(", ")}</span></Cut></td>
               <td className="num">{fmtInt(notInJob.groups.length)}</td>{!audit && <td className="num">{fmtInt(notInJob.databases)}</td>}
               <td className="num">{fmtInt(notInJob.enabled_tables)}</td><td><StateBar row={notInJob} saysAllDone={false} /></td>
               <td className="num" style={{ color: Number(notInJob.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(notInJob.state_failing)}</td>
               <td className="num">{fmtInt(notInJob.late_databases)}</td>
-              <td><Link to="/runs?job=none">its group runs</Link></td><td><span className="muted">run by hand or by the Databricks job</span></td>
+              <td><Link to="/runs?job=none">its group runs</Link></td><td><Cut text="Run by hand or by the Databricks job" className="cut muted" tipOnlyWhenCut /></td>
               {audit && <><td></td><td></td></>}
             </tr>
           )}

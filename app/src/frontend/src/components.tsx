@@ -778,8 +778,8 @@ export function JobStatus({ status }: { status?: Row | null }) {
   return (
     <div className="status-cell">
       <Tag tone={tone}>{status.label}</Tag>
-      {detail.length > 0 && <span className="sub">{detail.join(" · ")}</span>}
-      {status.cause && <span className="sub">{status.cause}</span>}
+      {detail.length > 0 && <Cut text={detail.join(" · ")} className="cut sub" />}
+      {status.cause && <Cut text={String(status.cause)} className="cut sub" />}
     </div>
   );
 }
