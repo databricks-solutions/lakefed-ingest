@@ -139,15 +139,12 @@ variables:
       more. Deploy this bundle as the user who runs the ingestion jobs, since that user is the scope's creator (MANAGE)
       and the jobs read the logins as their run-as identity.
     default: lakefed_ingest_jdbc_logins
-  reads_start_cap:
-    description: How many databases of one source server are read through the warehouse at once to begin with (one
-      statement each, counted across every discovery and app instance). The app raises it by 4 while each read keeps
-      its time, and lowers it by 4, never below 4, once reads slow down (the source or the warehouse is saturated).
+  reads_cap:
+    description: How many databases of one source server are checked or read through the warehouse at once (one
+      statement each, checks and reads together, counted across every discovery and app instance), a fixed number
+      whatever the reads take. While a page of unchecked databases waits, reads keep at least half of it. Never
+      below 4 and at most 256. An older deploy that still sets READS_START_CAP on the app is read when this is not set.
     default: 8
-  reads_max_cap:
-    description: The most databases of one source server read through the warehouse at once; reads_start_cap rises no
-      higher.
-    default: 32
 
 # Two targets, and nothing per workspace in them: the profile you deploy with (-p <profile>) names the workspace.
 # Set any variable above for one target under targets.<name>.variables, or pass --var name=value.

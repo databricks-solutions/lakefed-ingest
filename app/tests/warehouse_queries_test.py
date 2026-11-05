@@ -18,20 +18,31 @@ def test_each_statement_takes_the_parameters_the_store_passes():
     assert _marks(q.warehouse_read_rows_sql()) == 5 and _marks(q.warehouse_left_out_sql()) == 2
     assert _marks(q.warehouse_named_rows_sql(3)) == 15
     assert _marks(q.insert_discovered_tables_sql(wr.TABLE_COLUMNS, 2)) == 2 * len(wr.TABLE_COLUMNS)
-    assert _marks(q.warehouse_reads_lock_sql()) == 1 and _marks(q.warehouse_reads_going_sql()) == 2
+    assert _marks(q.warehouse_reads_lock_sql()) == 1 and _marks(q.warehouse_going_sql()) == 2
+    assert _marks(q.warehouse_server_load_sql()) == 3 and _marks(q.warehouse_want_checks_sql()) == 4
+    assert _marks(q.warehouse_free_checks_sql()) == 3
     assert _marks(q.warehouse_claim_reads_sql()) == 5 and _marks(q.warehouse_collect_sql()) == 3
     assert _marks(q.warehouse_hold_sql()) == 2 and _marks(q.warehouse_read_work_sql()) == 3
     assert _marks(q.discovery_connection_sql()) == 1 and _marks(q.draft_drop_sql()) == 3
+
+
+def test_a_servers_places_are_counted_in_one_query_with_two_filtered_counts():
+    load = q.warehouse_server_load_sql()
+    assert load.count(f"from {q.SCHEMA}.discovery") == 1, "one scan of the discovery table, not two"
+    assert load.count("count(*) filter (where") == 2 and "as going" in load and "as waiting" in load
+    assert "lower(src_connection) = p.server" in load and q.WAREHOUSE_WORK["read"] in load
+    assert q.WAREHOUSE_WORK["check"] in load and "wanted_at" in load and "'via' = 'warehouse'" in load
 
 
 def test_a_servers_reads_are_counted_and_claimed_under_a_transaction_lock_of_its_own():
     assert "pg_advisory_xact_lock" in q.warehouse_reads_lock_sql() and "advisory_lock(" not in q.warehouse_reads_lock_sql()
     assert q.warehouse_reads_lock_key("sql_a") == "lakefed_ingest/warehouse_reads/sql_a"
     assert not q.warehouse_reads_lock_key("sql_a").startswith(q.collection_lock_key(""))
-    going, claim = q.warehouse_reads_going_sql(), q.warehouse_claim_reads_sql()
+    going, claim = q.warehouse_going_sql(), q.warehouse_claim_reads_sql()
     for sql in (going, claim):
         assert "lower(src_connection) = %s" in sql and "listing ->> 'via' = 'warehouse'" in sql
         assert q.WAREHOUSE_WORK["read"] in sql
+    assert q.WAREHOUSE_WORK["check"] in going, "a check in flight is one of the server's places"
     assert "(listing ->> 'claimed_at')::timestamptz >= now()" in going
     assert "for update skip locked" in claim and "order by array_position(%s::text[], discovery_id), src_database" in claim
     assert "for update skip locked" in q.warehouse_collect_sql() and "listing ? 'statement_id'" in q.warehouse_collect_sql()
@@ -164,19 +175,23 @@ def test_the_stores_read_claim_passes_each_parameter_to_its_place(monkeypatch):
 
         def execute(self, sql, params=()):
             sent.append(_filled(sql, params))
-            self.description = [type("Column", (), {"name": n})() for n in
-                                (("going",) if "count(*) as going" in sql else ("discovery_id", "src_database"))]
-            self.rows = [(3,)] if "count(*) as going" in sql else [("d2", "eng_001")]
+            if "as going" in sql:
+                self.description, self.rows = self._named("going", "waiting"), [(3, 0)]
+            else:
+                self.description, self.rows = self._named("discovery_id", "src_database"), [("d2", "eng_001")]
+
+        def _named(self, *names):
+            return [type("Column", (), {"name": n})() for n in names]
 
         def fetchall(self):
             return self.rows
 
     monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cursor())))
-    claimed, full = main.WarehouseReadStore().claim_reads("sql_a", ["d2", "d1"], 8, 4, 60)
-    assert claimed == [("d2", "eng_001")] and full is False
-    lock, going, claim = sent
+    claimed = main.WarehouseReadStore().claim_reads("sql_a", ["d2", "d1"], 8, 4, 60)
+    assert claimed == [("d2", "eng_001")]
+    lock, load, claim = sent
     assert lock == "select pg_advisory_xact_lock(hashtextextended('lakefed_ingest/warehouse_reads/sql_a', 0))"
-    assert "lower(src_connection) = 'sql_a'" in going and "make_interval(secs => 60)" in going
+    assert "'sql_a'::text as server" in load and "60::float as claim_s" in load and "10::float as want_s" in load
     assert "lower(src_connection) = 'sql_a' and discovery_id = any(['d2', 'd1']::text[])" in claim
     assert "make_interval(secs => 60)" in claim and "array_position(['d2', 'd1']::text[], discovery_id)" in claim
     assert claim.endswith("limit 4 for update skip locked) c where d.discovery_id = c.discovery_id and "
@@ -203,3 +218,64 @@ def test_the_stores_other_read_calls_pass_each_parameter_to_its_place(monkeypatc
     assert "jsonb_build_object('statement_id', 's-1'::text" in started and "src_database = 'eng_001'" in started
     assert "set status = 'failed', tables = None, error = 'Login failed'" in failed
     assert "coalesce(listing ->> 'statement_id', 's-2'::text) = 's-2'::text and ('failed'::text = 'ok'" in failed
+
+
+def test_a_check_claim_that_finds_the_server_full_wants_at_most_half_the_cap_in_the_order_it_claims(monkeypatch):
+    import contextlib
+    import pytest
+    pytest.importorskip("fastapi")
+    import main
+    sent = []
+
+    class Cursor:
+        description = None
+
+        def execute(self, sql, params=()):
+            sent.append(_filled(sql, params))
+            self.description = [type("Column", (), {"name": n})() for n in
+                                (("going",) if "count(*) as going" in sql else ("src_database",))]
+            self.rows = [(8,)] if "count(*) as going" in sql else []
+
+        def fetchall(self):
+            return self.rows
+
+    monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cursor())))
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): [{"free": True}])
+    names = [f"c{i:03d}" for i in range(100)]
+    assert main.WarehouseReadStore().claim_checks("sql_a", "d2", names, 16, 8, 60) == []
+    lock, going, wanted = sent
+    assert lock.startswith("select pg_advisory_xact_lock(")
+    assert "discovery_id = 'd2'" in wanted and "make_interval(secs => 60)" in wanted
+    assert "wanted_at" in wanted and wanted.endswith("order by src_database limit 4)")
+    sent.clear()
+    main.WarehouseReadStore().claim_checks("sql_a", "d2", names, 2, 8, 60)
+    assert sent[-1].endswith("order by src_database limit 2)"), "only 2 of the discovery's check slots are free"
+
+
+def test_a_check_poll_with_nothing_free_to_claim_takes_no_lock_and_one_with_something_takes_it(monkeypatch):
+    import contextlib
+    import pytest
+    pytest.importorskip("fastapi")
+    import main
+    looked, locked = [], []
+
+    class Cursor:
+        def execute(self, sql, params=()):
+            locked.append(sql)
+            counted = "count(*) as going" in sql
+            self.description = [type("Column", (), {"name": "going" if counted else "src_database"})()]
+            self.rows = [(0,)] if counted else []
+
+        def fetchall(self):
+            return self.rows
+
+    free = [False]
+    monkeypatch.setattr(main.db, "query", lambda sql, params=(): looked.append(_filled(sql, params)) or [{"free": free[0]}])
+    monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cursor())))
+    store = main.WarehouseReadStore()
+    assert store.claim_checks("sql_a", "d2", ["c001", "c002"], 16, 8, 60) == []
+    assert locked == [] and len(looked) == 1, "every name is claimed or checked: one quick look, no lock"
+    assert "discovery_id = 'd2'" in looked[0] and "any(['c001', 'c002']::text[])" in looked[0]
+    free[0] = True
+    store.claim_checks("sql_a", "d2", ["c001", "c002"], 16, 8, 60)
+    assert locked and locked[0].startswith("select pg_advisory_xact_lock("), "a free name is claimed under the lock"

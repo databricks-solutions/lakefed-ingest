@@ -67,6 +67,16 @@ def _draft(conn, names):
                                      "touched_at": datetime.now(timezone.utc).isoformat()})
 
 
+def _listed(conn, names):
+    """A listing of these databases through the warehouse, as the connection test saves it: its discovery id."""
+    did = uuid.uuid4().hex[:12]
+    listing = json.dumps({"via": "warehouse"})
+    conn.execute(q.insert_discovery_rows_sql(len(names)),
+                 tuple(v for n in names
+                       for v in (did, "sqlserver", "sql_a", n, "listed", None, None, "op@example.com", listing)))
+    return did
+
+
 def _rows(conn, sql, params=()):
     cur = conn.execute(sql, params)
     columns = [d.name for d in cur.description]
@@ -79,7 +89,7 @@ def _row(conn, did, database):
 
 
 def _going(conn, server="sql_a"):
-    return _rows(conn, q.warehouse_reads_going_sql(), (server, wr.CLAIM_S))[0]["going"]
+    return _rows(conn, q.warehouse_going_sql(), (server, wr.CLAIM_S))[0]["going"]
 
 
 def _lapse(conn, did, database):
@@ -98,7 +108,7 @@ def test_concurrent_claimers_of_two_discoveries_of_one_server_never_pass_its_cap
     def claimer(ids):
         try:
             for _ in range(10):
-                got, _ = store.claim_reads("sql_a", ids, 8, 3, wr.CLAIM_S)
+                got = store.claim_reads("sql_a", ids, 8, 3, wr.CLAIM_S)
                 claimed.extend(got)
         except Exception as e:
             failures.append(e)
@@ -110,12 +120,72 @@ def test_concurrent_claimers_of_two_discoveries_of_one_server_never_pass_its_cap
         thread.join()
     assert failures == []
     assert len(claimed) == 8 and len(set(claimed)) == 8 and _going(owner) == 8
-    assert store.claim_reads("sql_a", [first, second], 8, 8, wr.CLAIM_S) == ([], True)
-    got, full = store.claim_reads("sql_b", [other], 8, 8, wr.CLAIM_S)
-    assert len(got) == 8 and full, "another server has its own cap"
+    assert store.claim_reads("sql_a", [first, second], 8, 8, wr.CLAIM_S) == []
+    got = store.claim_reads("sql_b", [other], 8, 8, wr.CLAIM_S)
+    assert len(got) == 8, "another server has its own cap"
     held = owner.execute("select count(*) from pg_locks where locktype = 'advisory' and database = "
                          "(select oid from pg_database where datname = current_database())").fetchone()[0]
     assert held == 0, "a transaction lock, gone with its transaction"
+
+
+def test_checks_and_reads_of_two_discoveries_of_one_server_share_one_cap(owner):
+    store = main.WarehouseReadStore()
+    checks = [f"c{i:02d}" for i in range(12)]
+    checking = _listed(owner, checks)
+    reading = _read(owner, [f"a{i:02d}" for i in range(10)], connection="SQL_A")
+    claimed = store.claim_checks("sql_a", checking, checks, 16, 8, wr.CLAIM_S)
+    assert len(claimed) == 8 and _going(owner) == 8
+    assert store.claim_reads("sql_a", [reading], 8, 8, wr.CLAIM_S) == [], "the 4 checks left wait for a place"
+    for database in claimed[:5]:
+        store.finish_check(checking, database, True, 1, None)
+    assert _going(owner) == 3
+    got = store.claim_reads("sql_a", [reading], 8, 8, wr.CLAIM_S)
+    assert len(got) == 1 and _going(owner) == 4, "one read in the room the 4 waiting checks leave"
+
+
+def test_a_page_of_unchecked_databases_holds_places_for_half_the_cap_and_reads_keep_the_rest(owner):
+    store = main.WarehouseReadStore()
+    page = [f"c{i:03d}" for i in range(100)]
+    checking = _listed(owner, page)
+    reading = _read(owner, [f"a{i:02d}" for i in range(20)], connection="SQL_A")
+    started = store.claim_reads("sql_a", [reading], 8, 8, wr.CLAIM_S)
+    assert len(started) == 8 and _going(owner) == 8
+    assert store.claim_checks("sql_a", checking, page, 16, 8, wr.CLAIM_S) == [], "the server is full"
+    wanted = _rows(owner, "select count(*) as n from lakefed_ingest.discovery where discovery_id = %s "
+                          "and listing ? 'wanted_at'", (checking,))[0]["n"]
+    assert wanted == 4, "half the cap, not the 100 names of the page"
+    for _, database in started:
+        store.started(wr.READ, reading, database, f"s-{database}")
+        store.finish_read(reading, database, [], None, f"s-{database}")
+    got = store.claim_reads("sql_a", [reading], 8, 8, wr.CLAIM_S)
+    assert len(got) == 4, "reads keep the other half of the server's places while the page waits"
+
+
+def test_the_quick_look_finds_a_page_name_still_free_until_every_one_is_claimed_or_checked(owner):
+    store = main.WarehouseReadStore()
+    page = [f"c{i:02d}" for i in range(3)]
+    did = _listed(owner, page)
+    free = lambda: _rows(owner, q.warehouse_free_checks_sql(), (did, wr.CLAIM_S, page))[0]["free"]
+    assert free() is True
+    claimed = store.claim_checks("sql_a", did, page[:2], 16, 8, wr.CLAIM_S)
+    assert len(claimed) == 2 and free() is True, "the third name is still free"
+    assert len(store.claim_checks("sql_a", did, page, 16, 8, wr.CLAIM_S)) == 1
+    assert free() is False
+    assert store.claim_checks("sql_a", did, page, 16, 8, wr.CLAIM_S) == []
+    store.finish_check(did, page[0], True, 1, None)
+    assert free() is False
+
+
+def test_the_servers_going_and_waiting_places_are_counted_by_one_query(owner):
+    store = main.WarehouseReadStore()
+    page = [f"c{i:02d}" for i in range(6)]
+    checking = _listed(owner, page)
+    reading = _read(owner, [f"a{i:02d}" for i in range(3)], connection="SQL_A")
+    store.claim_reads("sql_a", [reading], 8, 3, wr.CLAIM_S)
+    store.claim_checks("sql_a", checking, page, 16, 5, wr.CLAIM_S)
+    load = _rows(owner, q.warehouse_server_load_sql(), ("sql_a", wr.CLAIM_S, wr.WANT_S))[0]
+    assert (load["going"], load["waiting"]) == (5, 2), "3 reads and 2 checks going, and 2 of the 4 left wanted"
+    assert _rows(owner, q.warehouse_server_load_sql(), ("sql_b", wr.CLAIM_S, wr.WANT_S))[0] == {"going": 0, "waiting": 0}
 
 
 def test_a_claim_waits_for_the_servers_lock_held_elsewhere(owner):
@@ -132,7 +202,7 @@ def test_a_claim_waits_for_the_servers_lock_held_elsewhere(owner):
         assert thread.is_alive() and got == [], "the claim waits for the lock"
         other.commit()
         thread.join(5)
-        assert len(got[0][0]) == 2
+        assert len(got[0]) == 2
     finally:
         other.close()
 
@@ -142,14 +212,13 @@ def test_the_background_reader_and_a_pages_step_at_once_never_start_one_database
     names = [f"eng_{i:03d}" for i in range(40)]
     did = _read(owner, names)
     fake = _Warehouse({n: [RUNNING, RUNNING, _ok([SUMMARY_ROW])] for n in names})
-    caps = wr.ServerCaps(start=8, window=10 ** 6)
-    reader = br.Reader(store, fake, caps=caps, sleep=lambda s: time.sleep(0.01))
+    reader = br.Reader(store, fake, cap=8, sleep=lambda s: time.sleep(0.01))
     reader.start_workers()
     deadline = time.monotonic() + 60
     while store.progress(wr.READ, did)["pending"]:
         assert time.monotonic() < deadline, "the reads didn't end"
         reader.step()
-        wr.advance(store, fake, wr.READ, did, "sql_a", caps=caps)
+        wr.advance(store, fake, wr.READ, did, "sql_a", cap=8)
         assert _going(owner) <= 8
         time.sleep(0.01)
     assert sorted(fake.started_for) == names, "each database sent once"
@@ -168,7 +237,7 @@ def test_a_dropped_database_is_left_out_of_the_claim_the_progress_and_creates_wa
         [("eng_002", "s-2"), ("eng_003", None), ("eng_004", None)]
     assert "statement_id" not in _row(owner, did, "eng_002")["listing"]
     assert _rows(owner, q.draft_drop_sql(), (did, ["eng_002"], did)) == [], "dropped once"
-    got, _ = store.claim_reads("sql_a", [did], 8, 8, wr.CLAIM_S)
+    got = store.claim_reads("sql_a", [did], 8, 8, wr.CLAIM_S)
     assert got == [(did, "eng_001")]
     assert _rows(owner, q.warehouse_progress_sql(wr.READ), (did,)) == \
         [{"databases": 1, "pending": 1, "done": 0, "failed": 0, "tables": 0}]
@@ -183,7 +252,7 @@ def test_a_dropped_database_is_left_out_of_the_claim_the_progress_and_creates_wa
     # Ticked again: the draft grows by them again, and only the one never read is read.
     owner.execute(q.warehouse_named_rows_sql(2), (did, "sql_a", "eng_002", "op", "{}", did, "sql_a", "eng_003", "op", "{}"))
     assert "dropped" not in _row(owner, did, "eng_002")["listing"] and _row(owner, did, "eng_003")["status"] == "ok"
-    got, _ = store.claim_reads("sql_a", [did], 8, 8, wr.CLAIM_S)
+    got = store.claim_reads("sql_a", [did], 8, 8, wr.CLAIM_S)
     assert got == [(did, "eng_002")]
 
 
@@ -218,7 +287,7 @@ def test_after_a_restart_the_reader_reads_a_saved_statement_again_and_sends_a_la
     work = _rows(owner, q.warehouse_read_work_sql(), (wr.CLAIM_S, br.MAX_AGE_S, 7200))
     assert [(w["discovery_id"], w["waiting"], w["orphaned"]) for w in work] == [(did, 2, 1)]
     fake = _Warehouse({n: [_ok([SUMMARY_ROW])] for n in ("eng_001", "eng_002", "eng_003")}, in_call=True)
-    reader = br.Reader(store, fake, caps=wr.ServerCaps(start=8), sleep=lambda s: time.sleep(0.01))
+    reader = br.Reader(store, fake, cap=8, sleep=lambda s: time.sleep(0.01))
     reader.start_workers()
     deadline = time.monotonic() + 30
     while store.progress(wr.READ, did)["pending"] or reader.held():
@@ -265,7 +334,7 @@ def test_a_failed_read_through_the_store_is_saved_with_why(owner):
     store = main.WarehouseReadStore()
     did = _read(owner, ["eng_001"])
     fake = _Warehouse({"eng_001": [_failed("Login failed for user 'x'.")]}, in_call=True)
-    reader = br.Reader(store, fake, caps=wr.ServerCaps(start=8))
+    reader = br.Reader(store, fake, cap=8)
     reader.start_workers()
     reader.step()
     deadline = time.monotonic() + 10

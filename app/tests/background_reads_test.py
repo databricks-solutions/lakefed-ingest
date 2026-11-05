@@ -15,14 +15,8 @@ RUNNING = {"state": "RUNNING", "rows": None, "error": None}
 CANCELED = {"state": "CANCELED", "rows": None, "error": "the statement was cancelled"}
 
 
-def _fixed_caps(start=8):
-    """A cap that never moves, so a test sees the cap it set."""
-    return wr.ServerCaps(start=start, window=10 ** 6)
-
-
-def _reader(store, fake, caps=None, workers=32, clock=time.monotonic):
-    reader = br.Reader(store, fake, caps=caps or _fixed_caps(), workers=workers, clock=clock,
-                       sleep=lambda s: time.sleep(0.001))
+def _reader(store, fake, cap=8, workers=32, clock=time.monotonic):
+    reader = br.Reader(store, fake, cap=cap, workers=workers, clock=clock, sleep=lambda s: time.sleep(0.001))
     reader.start_workers()
     return reader
 
@@ -89,14 +83,8 @@ def test_a_statement_still_going_after_its_wait_is_read_again_until_it_ends():
     assert store.row("d1", "eng_001")["status"] == "ok"
 
 
-def test_a_warehouse_starting_takes_one_statement_at_a_time_and_its_slow_first_answer_sets_no_cap():
+def test_a_warehouse_starting_takes_one_statement_at_a_time_and_its_slow_first_answer_holds_only_one_worker():
     store = _Store(_names("db", 12))
-    timed = []
-
-    class Caps(wr.ServerCaps):
-        def timed(self, server, seconds):
-            timed.append(server)
-            return super().timed(server, seconds)
 
     class Starting(_Warehouse):
         def read(self, statement_id):
@@ -108,12 +96,12 @@ def test_a_warehouse_starting_takes_one_statement_at_a_time_and_its_slow_first_a
     answers = {n: [_ok([SUMMARY_ROW])] for n in _names("db", 12)}
     answers["db00"] = [PENDING, RUNNING, RUNNING, _ok([SUMMARY_ROW])]
     fake = Starting(answers, state="STARTING", in_call=True)
-    reader = _reader(store, fake, caps=Caps(start=8, window=10 ** 6))
+    reader = _reader(store, fake)
     for _ in range(20):
         reader.step()
     _drain(store, reader)
     assert fake.started_for[0] == "db00" and fake.sent_before_the_first_answer == 1
-    assert sorted(fake.started_for) == _names("db", 12) and len(timed) == 11, "the first answer isn't timed"
+    assert sorted(fake.started_for) == _names("db", 12)
 
 
 def test_after_a_restart_a_saved_statement_is_read_again_not_sent_again_and_a_claim_with_none_is_sent_once_it_lapses():
@@ -171,14 +159,13 @@ def test_a_database_dropped_while_its_statement_is_being_sent_has_it_cancelled_n
 def test_the_pages_steps_beside_the_reader_never_pass_the_cap_or_start_a_database_twice():
     store = _Store(_names("db", 30))
     fake = _Warehouse({n: [RUNNING, RUNNING, _ok([SUMMARY_ROW])] for n in _names("db", 30)})
-    caps = _fixed_caps()
-    reader = _reader(store, fake, caps=caps)
+    reader = _reader(store, fake)
     deadline = time.monotonic() + 10
     while store.progress(wr.READ, "d1")["pending"]:
         assert time.monotonic() < deadline
         reader.step()
         assert store.going("sql_a") <= 8
-        wr.advance(store, fake, wr.READ, "d1", "sql_a", caps=caps)
+        wr.advance(store, fake, wr.READ, "d1", "sql_a", cap=8)
         assert store.going("sql_a") <= 8
         time.sleep(0.002)
     _until(lambda: not reader.held())
@@ -225,12 +212,14 @@ def test_the_claims_of_the_reads_held_are_renewed_well_inside_their_time():
     _until(lambda: store.row("d1", "eng_001")["status"] == "ok")
 
 
-def test_the_reads_the_reader_times_move_its_servers_cap():
+def test_the_reader_claims_under_one_cap_for_a_server_whatever_its_reads_take():
     store = _Store(_names("db", 40))
     fake = _Warehouse({n: [_ok([SUMMARY_ROW])] for n in _names("db", 40)}, in_call=True, hold_s=0.01)
-    caps = wr.ServerCaps(start=8, window=4, flat=100.0)
-    _drain(store, _reader(store, fake, caps=caps))
-    assert caps.cap("sql_a") > 8
+    reader = br.Reader(store, fake, workers=32, sleep=lambda s: time.sleep(0.001))
+    reader.start_workers()
+    _drain(store, reader)
+    assert {cap for _, cap, _, _ in store.claims} == {wr.CAP}, "the setting, and it never moves"
+    assert all(going + claimed <= wr.CAP for _, _, going, claimed in store.claims)
 
 
 def test_the_app_starts_the_reader_with_a_warehouse_and_not_when_turned_off(monkeypatch):

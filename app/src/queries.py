@@ -1614,12 +1614,12 @@ def warehouse_claim_sql(kind: str) -> str:
             f"where d.discovery_id = c.discovery_id and d.src_database = c.src_database returning d.src_database")
 
 
-# The reads through the warehouse are capped per server: the reads in flight on one connection, across every discovery
-# and app instance, are counted in the claim's own transaction, under a transaction lock of that server's
-# (warehouse_reads.CAPS sets each server's cap). A read is in flight while its claim is live: whoever watches its
-# statement (a worker of the background reader, or the page's step) renews the claim (warehouse_hold_sql), so one
-# nobody watches any more, after a restart say, stops counting once CLAIM_S has gone and is read again from its saved
-# statement (warehouse_collect_sql), never sent again.
+# The checks and reads through the warehouse are capped per server: those in flight on one connection, across every
+# discovery and app instance, are counted in the claim's own transaction, under a transaction lock of that server's
+# (warehouse_reads.CAP is its cap). One is in flight while its claim is live: whoever watches its statement (a
+# worker of the background reader, or the page's step) renews the claim (warehouse_hold_sql), so one nobody watches
+# any more, after a restart say, stops counting once CLAIM_S has gone and is read again from its saved statement
+# (warehouse_collect_sql), never sent again. Checks waiting for a place: warehouse_waiting_checks_sql.
 _LIVE_CLAIM = "(listing ->> 'claimed_at')::timestamptz >= now() - make_interval(secs => %s)"
 _LAPSED_CLAIM = ("(listing ->> 'claimed_at' is null "
                  "or (listing ->> 'claimed_at')::timestamptz < now() - make_interval(secs => %s))")
@@ -1639,11 +1639,47 @@ def warehouse_reads_lock_key(server: str) -> str:
     return f"{SCHEMA}/warehouse_reads/{server}"
 
 
-def warehouse_reads_going_sql() -> str:
-    """How many reads of one server are in flight: its databases still to read, through the warehouse, with a live
-    claim (a statement going and watched, or one about to be sent). Params: server (lower case), claim age in seconds."""
+def warehouse_going_sql() -> str:
+    """How many checks and reads of one server are in flight through the warehouse: a database with a live claim (a
+    statement going and watched, or one about to be sent). Params: server (lower case), claim age in seconds."""
     return (f"select count(*) as going from {SCHEMA}.discovery where lower(src_connection) = %s "
-            f"and {_THROUGH_WAREHOUSE} and {WAREHOUSE_WORK['read']} and {_LIVE_CLAIM}")
+            f"and {_THROUGH_WAREHOUSE} and (({WAREHOUSE_WORK['read']}) or ({WAREHOUSE_WORK['check']})) "
+            f"and {_LIVE_CLAIM}")
+
+
+def warehouse_server_load_sql() -> str:
+    """How many places of one server are taken, in one scan of its discoveries: ``going`` are its checks and reads in
+    flight (warehouse_going_sql's rule), and ``waiting`` are its checks waiting for a place, marked wanted within the
+    last while (warehouse_want_checks_sql) with no statement and no live claim, whose places reads leave free. Params:
+    server (lower case), claim age in seconds, wanted age in seconds."""
+    live = _LIVE_CLAIM.replace("%s", "p.claim_s")
+    lapsed = _LAPSED_CLAIM.replace("%s", "p.claim_s")
+    return (f"with p as (select %s::text as server, %s::float as claim_s, %s::float as want_s) "
+            f"select count(*) filter (where (({WAREHOUSE_WORK['read']}) or ({WAREHOUSE_WORK['check']})) and {live}) "
+            f"as going, "
+            f"count(*) filter (where {WAREHOUSE_WORK['check']} and not (listing ? 'statement_id') and {lapsed} "
+            f"and (listing ->> 'wanted_at')::timestamptz >= now() - make_interval(secs => p.want_s)) as waiting "
+            f"from {SCHEMA}.discovery cross join p "
+            f"where lower(src_connection) = p.server and {_THROUGH_WAREHOUSE}")
+
+
+def warehouse_free_checks_sql() -> str:
+    """Whether any of the names asked for is a check free to claim (what warehouse_claim_sql would take, and what
+    warehouse_want_checks_sql would mark): a quick look before the server's lock is taken. Params: discovery_id, claim
+    age in seconds, the names (text[])."""
+    return (f"select exists (select 1 from {SCHEMA}.discovery where discovery_id = %s and {WAREHOUSE_WORK['check']} "
+            f"and not (listing ? 'statement_id') and {_LAPSED_CLAIM} and src_database = any(%s::text[])) as free")
+
+
+def warehouse_want_checks_sql() -> str:
+    """Mark the checks a page asked for that got no place: wanted now, the first few by name (the order a check claims
+    in) that have no statement and no live claim. Params: discovery_id, claim age in seconds, the names (text[]), the
+    most to mark (warehouse_reads.wanted_limit)."""
+    return (f"update {SCHEMA}.discovery set listing = coalesce(listing, '{{}}'::jsonb) "
+            f"|| jsonb_build_object('wanted_at', now()::text) "
+            f"where (discovery_id, src_database) in (select discovery_id, src_database from {SCHEMA}.discovery "
+            f"where discovery_id = %s and {WAREHOUSE_WORK['check']} and not (listing ? 'statement_id') "
+            f"and {_LAPSED_CLAIM} and src_database = any(%s::text[]) order by src_database limit %s)")
 
 
 def warehouse_claim_reads_sql() -> str:
@@ -1673,11 +1709,11 @@ def warehouse_collect_sql() -> str:
 
 
 def warehouse_hold_sql() -> str:
-    """Renew the claims of reads still being watched, so no one else takes them and they keep counting under the cap.
-    Params: discovery ids (text[]) and databases (text[]), pair by pair."""
+    """Renew the claims of checks and reads still being watched, so no one else takes them and they keep counting under
+    the cap. Params: discovery ids (text[]) and databases (text[]), pair by pair."""
     return (f"update {SCHEMA}.discovery set listing = listing || jsonb_build_object('claimed_at', now()::text) "
             f"where (discovery_id, src_database) in (select * from unnest(%s::text[], %s::text[])) "
-            f"and {WAREHOUSE_WORK['read']}")
+            f"and (({WAREHOUSE_WORK['read']}) or ({WAREHOUSE_WORK['check']}))")
 
 
 def warehouse_read_work_sql() -> str:

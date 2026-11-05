@@ -157,17 +157,19 @@ while it is still going, saves it, and takes the next. The page, Create's wait a
 reads stand. `BACKGROUND_READS=0` turns the reader off on an instance; the page's requests then take the reads' steps
 as before (each request reads the statements going, saves the ones that ended and starts more, without a wait).
 
-- **Each source server has a cap** on its reads in flight, counted across every discovery and app instance: in
-  Lakebase, in the claim's own transaction, under a transaction lock of that server's (its connection's name), so two
-  claimers never both take its last places. It starts at 8 (`reads_start_cap`) and moves by 4 between 4 and 32
-  (`reads_max_cap`), from the time each read takes from send to answer, the warehouse's queue included
-  (`warehouse_reads.next_cap`): while the median of the last 8 reads stays within 1.25 times the median at the
-  starting level and the server is held at its cap, it steps up; once that median passes 1.5 times, it steps down.
-  On the lab, a 100-eDTU pool's CPU capped a 1,000-table server's reads at about 0.65 databases a second, each read
-  slower the more were in flight, and a 2X-Small warehouse began queueing at 16. Each instance keeps its own cap in
-  memory and holds the shared count to it, so a restarted instance starts again at 8.
-- **A warehouse that is starting** takes one statement at a time until one answers, and that slow first answer isn't
-  timed.
+- **Each source server has one fixed cap** on its checks and reads in flight together, counted across every
+  discovery and app instance: in Lakebase, in the claim's own transaction, under a transaction lock of that server's
+  (its connection's name), so two claimers never both take its last places. It is 8 by default (the bundle variable
+  `reads_cap`, never below 4 and at most 256) and does not move with how long the reads take. On the lab, a 100-eDTU
+  pool's CPU capped a 1,000-table server's reads at about 0.65 databases a second, each read slower the more were in
+  flight, and a 2X-Small warehouse began queueing at 16, while throughput stayed flat from 3 to 11 at once: one fixed
+  number protects a shared server and gives up little.
+- **A page of unchecked databases does not pause the reads.** A check takes a free place first. A check the server
+  had no room for is wanted for 10 seconds, and reads leave places for the checks wanted. At most half the cap (and no
+  more than the discovery's free check slots) are wanted at once, so the reads always keep the other half while a
+  page waits, and the page still gets its half a round. A check poll whose page names are all claimed or checked
+  returns without taking the server's lock, and the places going and waiting are counted in one query.
+- **A warehouse that is starting** takes one statement at a time until one answers.
 - **Nothing is read twice, nothing stays claimed.** Where each database stands is kept on its `discovery` row
   (`listing`: its statement, its claim, and a check's answer). Whoever starts a database claims it first (`FOR UPDATE
   SKIP LOCKED`), so two app instances, a page and the reader never start the same one twice. A claim lasts 60 seconds
@@ -231,9 +233,9 @@ setting chose it, and says so plainly when it is Classic or can't be read; the a
 [docs/deploy.md](../docs/deploy.md#the-apps-sql-warehouse).
 
 **At a whole server's size** (estimates): a check takes about a second, and only the page shown (100 databases) is
-checked, about 7 seconds at 16 at once whatever the server's size. A read of 1,000 tables is about 2 to 5 seconds per
-database, about 1 to 2 hours for 22,000 at 16 at once; in New job it starts at the choice, so Create waits only for
-what is left when it is pressed. Without a warehouse set (`WAREHOUSE_ID` empty), Discover runs the discovery job as before.
+checked, about 13 seconds at 8 at once (the server's cap) whatever the server's size. A read of 1,000 tables is
+about 2 to 5 seconds per database, about 2 to 4 hours for 22,000 at 8 at once; in New job it starts at the choice, so
+Create waits only for what is left when it is pressed. Without a warehouse set (`WAREHOUSE_ID` empty), Discover runs the discovery job as before.
 
 **What stays on the discovery job:** listing an Azure SQL server's databases through Azure (it takes a service
 credential only Databricks compute holds; the tables are then read through the warehouse), and sources read by host
