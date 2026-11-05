@@ -2,8 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-The repo holds **two versions** of a metadata-driven framework that ingests external databases into
-Databricks Delta tables. Each is its own Databricks Asset Bundle. Job orchestration is the legacy version; all new
+The repo is **Ingestion Workbench** (formerly lakefed-ingest and the EDW Ingestion Accelerator). It holds **two
+versions** of a metadata-driven framework that ingests external databases into Databricks Delta tables. Each is its own Databricks Asset Bundle. Job orchestration is the legacy version; all new
 development goes into the default version:
 
 | Version | Location | Bundle | Orchestration / compute / state |

@@ -29,7 +29,7 @@ resources:
   apps:
     lakefed_ingest_app:
       name: ${var.app_name}
-      description: "lakefed_ingest operations: runs, tables, errors, control rows, jobs."
+      description: "Ingestion Workbench operations: runs, tables, errors, control rows, jobs."
       source_code_path: ../src
       # Started: the deploy starts the app and deploys its code, so no `bundle run lakefed_ingest_app` is needed. A
       # change to the app's settings, including APP_VERSION when the commit changes, deploys the code again.
@@ -124,7 +124,7 @@ resources:
       tags:
         custom_tags:
           - key: project
-            value: lakefed_ingest
+            value: ${var.project_tag}
 
   # The dedicated scope for JDBC logins that users type into the app (app/src/jdbc_logins.py). This bundle creates it,
   # so the deployer is its creator and holds MANAGE, and the ingestion jobs, which run as the deployer, read the logins
@@ -142,6 +142,8 @@ resources:
       name: "lakefed_ingest_app_grants"
       description: "Grant the operations app's service principal access to the lakefed_ingest Lakebase tables, USE CONNECTION on the source_connections, WRITE on the JDBC login scope, and CAN_USE on app_warehouse_id when it is set. Run as the deployer, who owns the tables and created the scope; idempotent."
       # Serverless: the task only talks to the Lakebase instance and the workspace APIs.
+      tags:
+        project: ${var.project_tag}
       tasks:
         - task_key: grant_app_access
           environment_key: lakebase_client

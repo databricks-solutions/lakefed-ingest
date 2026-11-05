@@ -1,6 +1,8 @@
-# lakefed-ingest
+# Ingestion Workbench
 
-`lakefed-ingest` copies tables from external databases (SQL Server, Oracle, PostgreSQL, MySQL) into Delta tables on
+*Formerly lakefed-ingest, and the EDW Ingestion Accelerator.*
+
+Ingestion Workbench copies tables from external databases (SQL Server, Oracle, PostgreSQL, MySQL) into Delta tables on
 Databricks, and keeps them up to date. You describe the tables to copy as rows of metadata; it reads each source,
 writes its Delta tables and records where each one is, so the next run reads only what changed. It is built for
 estates of many databases: thousands of source databases and hundreds of thousands of tables. The
@@ -86,6 +88,12 @@ Every page, the permissions it checks and the app's limits are described in [the
 
 ## Without the app
 
+The app is the recommended way to use the tool: discovery, onboarding and schedules live there. The jobs don't need
+it, though. To deploy without it (say, in a workspace that doesn't allow Databricks Apps), comment out
+`- app/resources/*.yml` under `include:` in `databricks.yml` before the first deploy. Once the app is deployed,
+removing that line makes the next deploy delete the app and its warehouse, and the deploy is refused because the JDBC
+login scope has `prevent_destroy`.
+
 Insert control rows yourself, as `notebooks/load_control_example.ipynb` shows (the
 [Control rows](docs/how-it-works.md#control-rows) reference lists the columns), load one secret per source
 database if the rows read through Spark JDBC, then run a group, or let the check job run several:
@@ -134,6 +142,16 @@ changes to it, and reconciles the Delta tables with the source; see [tests/synth
 The `cdc` load strategy (a placeholder with a documented contract in `load_strategies.py`), watermark and `cdc` loads
 for sources other than SQL Server (placeholders), and built-in alerts beyond the jobs' failure emails
 ([Monitoring](docs/monitoring.md) has the queries an alert can run).
+
+## Usage attribution
+
+So Databricks can see how widely the tool is used, the tool labels its own activity in three ways. It adds only the fixed values below and sends nothing else of its own.
+
+- API calls. The Databricks SDK clients the engine and the operations app create put `ingestion-workbench/<version>` at the start of their user agent, next to the details the SDK always sends (SDK, Python and OS versions and the authentication type).
+- Resource tags. The jobs, job clusters, the discovery cluster and the app's SQL warehouse that the bundle deploys carry the tag `project: ingestion-workbench`. Change the value per target with the bundle variable `project_tag`.
+- Query tags. The operations app's SQL statements carry the query tags `application: ingestion-workbench` and `component: discovery`.
+
+As for any Databricks API call or SQL statement, your workspace records these alongside the workspace, the caller and, for SQL, the statement text, in its audit logs, query history and billing data.
 
 ## Help and security
 

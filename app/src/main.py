@@ -1,4 +1,4 @@
-"""lakefed_ingest operations app (optional): FastAPI backend + React frontend (built into ./static).
+"""Ingestion Workbench operations app (optional): FastAPI backend + React frontend (built into ./static).
 
 JSON API under /api, used by the React app; everything else serves the single-page app. Data access
 runs as the app's service principal: Lakebase through lakebase.py, Jobs API through jobs.py. All SQL

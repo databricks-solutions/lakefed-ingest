@@ -17,6 +17,10 @@ include:
 
 # Variable declarations. Defaults suit most deployments; override per target.
 variables:
+  project_tag:
+    description: The value of the project tag on every job, cluster and warehouse this bundle makes, which attributes their
+      usage to Ingestion Workbench (see README "Usage attribution").
+    default: ingestion-workbench
   # Compute (warehouse-free; jobs run on job clusters). The sweep is DRIVER-bound — per-table MERGE
   # planning + Delta commits run on the driver — so size the driver up and keep workers modest.
   # Defaults are Azure node types; override per target. Note: the defaults need ~32 cores (16-core

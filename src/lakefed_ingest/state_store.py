@@ -1237,11 +1237,11 @@ class StateStore:
         """
         import uuid
         import psycopg
-        from databricks.sdk import WorkspaceClient
+        import product
 
         # Requires databricks-sdk with the Database (Lakebase) API — the cluster tasks pin a
         # recent version (databricks-sdk==0.145.0) since the DBR-bundled sdk may predate it.
-        w = WorkspaceClient()
+        w = product.workspace_client()
         if host is None:
             host = w.database.get_database_instance(name=instance_name).read_write_dns
         if user is None:

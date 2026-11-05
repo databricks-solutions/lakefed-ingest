@@ -28,6 +28,8 @@ from typing import List, Optional
 import psycopg
 from databricks.sdk import WorkspaceClient
 
+import app_product
+
 INSTANCE = os.environ.get("LAKEBASE_INSTANCE", "lakefed-ingest")
 DATABASE = os.environ.get("LAKEBASE_DATABASE", "lakefed_ingest")
 _TOKEN_TTL_S = 40 * 60          # Lakebase credentials last about an hour; refresh well before
@@ -43,10 +45,15 @@ _pool_mu = threading.Lock()
 _idle: list = []                # (connection, opened_at, returned_at), monotonic seconds, newest last
 
 
+def _new_client() -> WorkspaceClient:
+    """The app's SDK client, identifying itself as the product (app_product) in every API call's user agent."""
+    return WorkspaceClient(product=app_product.PRODUCT_NAME, product_version=app_product.PRODUCT_VERSION)
+
+
 def workspace() -> WorkspaceClient:
     global _w
     if _w is None:
-        _w = WorkspaceClient()
+        _w = _new_client()
     return _w
 
 

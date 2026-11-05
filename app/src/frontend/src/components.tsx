@@ -556,7 +556,7 @@ export function usePageStamp(at?: string, every?: number, error?: unknown) {
 
 /** The browser tab's title, as the workspace's "<page or object> - Databricks": the page or object first. */
 export function useTabTitle(title?: string) {
-  useEffect(() => { document.title = title ? `${title} · Lakefed Ingest` : "Lakefed Ingest"; }, [title]);
+  useEffect(() => { document.title = title ? `${title} · Ingestion Workbench` : "Ingestion Workbench"; }, [title]);
 }
 
 /** The steps above a page, as the workspace shows them: "Ingestion jobs › East hourly › Ingestion run". */

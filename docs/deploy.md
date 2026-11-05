@@ -1,4 +1,4 @@
-# Deploying lakefed_ingest
+# Deploying Ingestion Workbench
 
 Everything the default version needs is a resource in one bundle (`lakefed_ingest_v2`, at the repo root): the
 Lakebase instance and its UC-registered database, the secret scope, the jobs (`resources/lakefed_ingest*.yml`), and
@@ -232,7 +232,7 @@ targets:
                 driver_node_type_id: ${var.driver_node_type_id}
                 num_workers: ${var.num_workers}
                 custom_tags:
-                  project: lakefed_ingest
+                  project: ${var.project_tag}
           tasks:
             - task_key: check
               environment_key: ""               # clears the serverless environment

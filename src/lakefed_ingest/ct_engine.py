@@ -253,8 +253,8 @@ def _uc_host(conn_name: str):
         if conn_name not in _uc_host_cache:
             host = port = None
             try:
-                from databricks.sdk import WorkspaceClient
-                opts = (WorkspaceClient().connections.get(conn_name).options or {})
+                import product
+                opts = (product.workspace_client().connections.get(conn_name).options or {})
                 host, port = opts.get("host"), opts.get("port")
             except Exception:
                 pass

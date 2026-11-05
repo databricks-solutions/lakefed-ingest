@@ -24,7 +24,7 @@ resources:
         spark.master: "local[*]"
       custom_tags:
         ResourceClass: SingleNode
-        project: lakefed_ingest
+        project: ${var.project_tag}
 
   jobs:
     lakefed_ingest_discover:
@@ -52,7 +52,7 @@ resources:
                 package: "databricks-sdk==0.145.0"
       tags:
         business_unit: ""
-        project: lakefed_ingest
+        project: ${var.project_tag}
       queue:
         enabled: true
       parameters:
