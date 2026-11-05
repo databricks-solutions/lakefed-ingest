@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="410" viewBox="0 0 880 410" font-family="'DM Sans', Helvetica, Arial, sans-serif">
-<title>How the parts of lakefed-ingest fit</title>
+<title>How the parts of Ingestion Workbench fit</title>
 <desc>The check job, a Lakeflow job, asks the source databases what changed and starts ingest runs, also Lakeflow jobs, on job clusters for the databases with work. The ingest runs read the changes through a Unity Catalog connection or JDBC and write Delta tables in Unity Catalog. Both record their state in Lakebase. The optional operations app, a Databricks App, writes the control rows to Lakebase, makes the scheduled Databricks jobs that start the check (they run whether or not the app is up), and reads table lists from the sources through its SQL warehouse.</desc>
 <defs><marker id="hif-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#1B3139"/></marker></defs>
 <rect x="0" y="0" width="880" height="410" fill="#FFFFFF"/>
