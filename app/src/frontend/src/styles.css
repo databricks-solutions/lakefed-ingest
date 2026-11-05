@@ -301,7 +301,7 @@ table.data.one-line .state-bar { min-width: 0; }
 table.data.one-line .bar-counts { flex-wrap: nowrap; white-space: nowrap; overflow: hidden; }
 table.data.one-line .bar-counts > span { flex: none; }
 /* A row's actions menu opens below the cell, so its cell must not clip it. */
-table.data.one-line td.card-actions { overflow: visible; }
+table.data.one-line td.card-actions { overflow: visible; flex-wrap: nowrap; }
 /* A tree row's name sits in a twisty button: the button gives way so the name can be cut. */
 table.data.one-line .twisty.named { max-width: 100%; min-width: 0; }
 table.data.one-line .twisty.named > .tip-target { flex: 0 1 auto; min-width: 0; }

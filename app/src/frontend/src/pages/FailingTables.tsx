@@ -3,7 +3,7 @@ import { api, type Row } from "../api";
 import { Cols, Cut, CutCopy, ErrorBox, Notice, Section, fmtInt, fmtTime, oneLine, plural, useConfirm, type ConfirmRequest } from "../components";
 
 /** The failing tables as a job's runs list keeps its columns: the table and the source message share the spare width. */
-const WIDTHS = [null, 150, 110, null, 170, 90, 280] as const;
+const WIDTHS = [null, 140, 84, null, 160, 64, 255] as const;
 
 // What each kind of failure means for the table, as its title reads on the page.
 const KIND_NOTE: Record<string, string> = {

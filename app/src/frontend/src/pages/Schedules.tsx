@@ -1,14 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
-import { Badge, Cols, Cut, ErrorBox, Menu, Notice, PageHead, Section, fmtTime, oneLine, readAt, statusName, usePageStamp } from "../components";
+import { Badge, Cols, Cut, ErrorBox, Menu, Notice, PageHead, Section, fmtShort, fmtTime, oneLine, readAt, statusName, usePageStamp } from "../components";
 import { usePermissions } from "../permissions";
 
 // Schedules: when each ingestion job runs, as set in its Edit view (When it runs), one row per job and no groups, as
 // the Databricks Jobs list shows them. Run history is on Runs. A schedule is changed in the job's Edit view.
 
 /** The schedules list as the Jobs list keeps its columns: the job takes the spare width, the schedule and times have their own. */
-const WIDTHS = [null, 200, 90, 170, 200, 170, 170] as const;
+const WIDTHS = [null, 150, 84, 150, 165, 125, 150] as const;
 
 function next(job: Row): string {
   if (job.paused) return "paused";
@@ -37,7 +37,7 @@ function JobRow({ job }: { job: Row }) {
       <td><Cut text={job.description} tipOnlyWhenCut /></td>
       <td>{job.paused ? <Badge value="paused" /> : <Badge value="ok" />}</td>
       <td>{next(job)}</td>
-      <td>{recent ? <Cut text={`${statusName(recent.last_status)} ${fmtTime(recent.last_started)}`} tipOnlyWhenCut>{statusName(recent.last_status)}<span className="sub">{fmtTime(recent.last_started)}</span></Cut> : <span className="muted">never run</span>}</td>
+      <td>{recent ? <Cut text={`${statusName(recent.last_status)} ${fmtTime(recent.last_started)}`} tipOnlyWhenCut>{statusName(recent.last_status)}<span className="sub">{fmtShort(recent.last_started)}</span></Cut> : <span className="muted">never run</span>}</td>
       <td>{unsynced ? <span className="tag warn">{unsynced} not synced</span> : check.data
         ? (drifted ? <span className="tag warn">changed in the Jobs UI</span> : <span className="muted">in sync</span>) : <span className="muted">synced</span>}
         <ErrorBox error={act.error || check.error} /></td>

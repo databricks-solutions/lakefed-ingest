@@ -16,7 +16,7 @@ import { Busy, Cols, Cut, CutCopy, Info, Spinner, OutLink, Crumbs, Badge, ErrorB
 const PAGE = 25;
 /** An ingestion run list's columns, as a job's runs list keeps its own: the run's time, then fixed narrow fields; the job
  * (when several jobs are listed) or the outcome takes what is left. */
-const runWidths = (showJob: boolean) => [190, ...(showJob ? [null, 170] : [null]), 92, 84, 104, 84, 100, 96, 72, 64] as const;
+const runWidths = (showJob: boolean) => [150, ...(showJob ? [null, 150] : [null]), 84, 74, 96, 78, 114, 88, 66, 56] as const;
 const GROUP_OF_RUN_WIDTHS = [null, 160, 90, 80, 160, 70] as const;
 const CHECK_WIDTHS = [150, 90, null, 120] as const;
 const RUNNING_GROUP_WIDTHS = [null, 190, 90, 240, 120] as const;
