@@ -4,6 +4,7 @@ import { api, qs, type Row } from "../api";
 import { Busy, ErrorBox, Info, Modal, Notice, Pager, Tag, Tip, fmtInt, plural, Twisty, useNow } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
+import { ConnectionTable } from "./ConnectionTable";
 import { CreateConnectionChoices } from "./CreateConnectionChoices";
 import { accessOf, countsText, likeContaining, readable, selectionCounts, serverRowPick, underFilter, type Pick, type ServerCount } from "./pickState";
 import { connectionFailure, connectionNextBlock, connectionNextLabel, MASTER_ACCESS, readsDone, waitLine, type ErrorCodes } from "../pending";
@@ -194,22 +195,10 @@ function Step1({ chosen, setChosen, tested, setTested, testing, error, setError 
             <span className="muted">A connection made in Catalog Explorer shows here after Refresh, once this app has USE CONNECTION on it.</span></div>
           <ErrorBox error={list.error} />
           {list.data?.error && <Notice tone="warn">The app can't list connections: {list.data.error}</Notice>}
-          <div className="table-wrap"><table className="data connections">
-            <colgroup><col className="pick" /><col className="name" /><col className="type" /><col /><col className="owner" /></colgroup>
-            <thead><tr><th></th><th>Name</th><th>Type</th><th>Host</th><th>Owner</th></tr></thead>
-            <tbody>
-              {found.map((c) => (
-                <tr key={c.name} className="pick-row" onClick={() => { if (!testing) setChosen(c.name); }}>
-                  <td><input type="radio" checked={chosen === c.name} readOnly aria-label={`Use ${c.name}`} /></td>
-                  <td className="name" title={c.name}><b>{c.name}</b></td><td title={c.connection_type}>{c.connection_type}</td>
-                  <td className="mono" title={c.host}>{c.host}</td><td title={c.owner}>{c.owner}</td>
-                </tr>
-              ))}
-              {list.data && !found.length && <tr><td colSpan={5} className="muted">No SQL Server connection {search ? "matches" : "the app can see"}.
-                {!search && <> The app sees only connections its service principal{config?.app_principal ? <> (<span className="mono">{config.app_principal}</span>)</> : ""} has
-                  USE CONNECTION on: the connection's owner grants it in Catalog Explorer, Connections, the connection, Permissions. Then Refresh.</>}</td></tr>}
-            </tbody>
-          </table></div>
+          <ConnectionTable rows={found} chosen={chosen} disabled={testing} onChoose={setChosen}
+            empty={list.data && !found.length ? <>No SQL Server connection {search ? "matches" : "the app can see"}.
+              {!search && <> The app sees only connections its service principal{config?.app_principal ? <> (<span className="mono">{config.app_principal}</span>)</> : ""} has
+                USE CONNECTION on: the connection's owner grants it in Catalog Explorer, Connections, the connection, Permissions. Then Refresh.</>}</> : null} />
           {tested && <div className="toolbar"><span><Tag tone="ok">{tested.typed ? "Typed" : "Connected"}</Tag> <span className="muted">
             {tested.typed ? "uses" : "reads"} {fmtInt(tested.databases.length)} {plural(tested.databases.length, "database")} through {chosen}
           </span></span></div>}
