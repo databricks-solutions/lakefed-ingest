@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
+import { SOURCE_TYPE_NAMES } from "../cells";
 import { PageHead, ErrorBox, Section, ToastOn } from "../components";
 import { groupsRefusal, usePermissions } from "../permissions";
 
 // The values in words, as the Edit view names them.
-const OPTION_LABELS: Record<string, string> = { sqlserver: "SQL Server", oracle: "Oracle", postgresql: "PostgreSQL", mysql: "MySQL",
+const OPTION_LABELS: Record<string, string> = { ...SOURCE_TYPE_NAMES,
   ct: "Change tracking", cursor: "Cursor column", full: "Full reload", merge: "Merge: current state", append: "Append: change log" };
 
 type Field = { key: string; label: string; required?: boolean; help?: string; type?: "text" | "number" | "checkbox"; options?: string[]; initial?: any };

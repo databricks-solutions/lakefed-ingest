@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
+import { SOURCE_TYPE_NAMES, connectionTypeName } from "../cells";
 import { ErrorBox, Notice, Spinner } from "../components";
 import { LoginFields } from "./JdbcLoginFields";
 
@@ -8,9 +9,7 @@ import { LoginFields } from "./JdbcLoginFields";
  *  it saves through the app and reads its own list, so the props are accepted and left unused. */
 type ChoiceProps = { workspaceUrl?: string | null; refreshing?: boolean; onRefresh?: () => void };
 
-const SOURCE_TYPES: [string, string][] = [
-  ["sqlserver", "SQL Server"], ["oracle", "Oracle"], ["postgresql", "PostgreSQL"], ["mysql", "MySQL"],
-];
+const SOURCE_TYPES = Object.entries(SOURCE_TYPE_NAMES);
 const KEY_PLACEHOLDER = "orders-login, or creds-{database} for one login per database";
 
 type Connection = { name: string; src_type: string; src_host: string; src_port: number; secret_scope: string;
@@ -130,7 +129,7 @@ export function JdbcConnectionForm(_props: ChoiceProps) {
             {list.map((c) => (
               <tr key={c.name}>
                 <td>{c.name}</td>
-                <td>{SOURCE_TYPES.find(([value]) => value === c.src_type)?.[1] ?? c.src_type}</td>
+                <td>{connectionTypeName(c.src_type)}</td>
                 <td>{c.src_host}:{c.src_port}</td>
                 <td>{c.secret_scope}</td>
                 <td>{c.secret_key}</td>
@@ -166,7 +165,7 @@ export function JdbcConnectionForm(_props: ChoiceProps) {
  *  only; the secret itself is in the scope and is never shown here. */
 export function JdbcSourceNotice({ jdbc }: { jdbc: Row }) {
   if (jdbc.missing) return <Notice tone="warn">It reads through the JDBC connection {jdbc.name}, which is no longer kept.</Notice>;
-  const type = SOURCE_TYPES.find(([value]) => value === jdbc.src_type)?.[1] ?? jdbc.src_type;
+  const type = connectionTypeName(jdbc.src_type);
   return (
     <Notice tone="info">
       It reads through the JDBC connection <b>{jdbc.name}</b>: {type} at {jdbc.src_host}:{jdbc.src_port}, secret scope{" "}
