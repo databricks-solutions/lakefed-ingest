@@ -19,7 +19,7 @@ def test_each_statement_takes_the_parameters_the_store_passes():
     assert _marks(q.warehouse_named_rows_sql(3)) == 15
     assert _marks(q.insert_discovered_tables_sql(wr.TABLE_COLUMNS, 2)) == 2 * len(wr.TABLE_COLUMNS)
     assert _marks(q.warehouse_reads_lock_sql()) == 1 and _marks(q.warehouse_going_sql()) == 2
-    assert _marks(q.warehouse_waiting_checks_sql()) == 3 and _marks(q.warehouse_want_checks_sql()) == 3
+    assert _marks(q.warehouse_waiting_checks_sql()) == 3 and _marks(q.warehouse_want_checks_sql()) == 4
     assert _marks(q.warehouse_claim_reads_sql()) == 5 and _marks(q.warehouse_collect_sql()) == 3
     assert _marks(q.warehouse_hold_sql()) == 2 and _marks(q.warehouse_read_work_sql()) == 3
     assert _marks(q.discovery_connection_sql()) == 1 and _marks(q.draft_drop_sql()) == 3
@@ -212,3 +212,34 @@ def test_the_stores_other_read_calls_pass_each_parameter_to_its_place(monkeypatc
     assert "jsonb_build_object('statement_id', 's-1'::text" in started and "src_database = 'eng_001'" in started
     assert "set status = 'failed', tables = None, error = 'Login failed'" in failed
     assert "coalesce(listing ->> 'statement_id', 's-2'::text) = 's-2'::text and ('failed'::text = 'ok'" in failed
+
+
+def test_a_check_claim_that_finds_the_server_full_wants_at_most_half_the_cap_in_the_order_it_claims(monkeypatch):
+    import contextlib
+    import pytest
+    pytest.importorskip("fastapi")
+    import main
+    sent = []
+
+    class Cursor:
+        description = None
+
+        def execute(self, sql, params=()):
+            sent.append(_filled(sql, params))
+            self.description = [type("Column", (), {"name": n})() for n in
+                                (("going",) if "count(*) as going" in sql else ("src_database",))]
+            self.rows = [(8,)] if "count(*) as going" in sql else []
+
+        def fetchall(self):
+            return self.rows
+
+    monkeypatch.setattr(main.db, "transaction", contextlib.contextmanager(lambda: (yield Cursor())))
+    names = [f"c{i:03d}" for i in range(100)]
+    assert main.WarehouseReadStore().claim_checks("sql_a", "d2", names, 16, 8, 60) == []
+    lock, going, wanted = sent
+    assert lock.startswith("select pg_advisory_xact_lock(")
+    assert "discovery_id = 'd2'" in wanted and "make_interval(secs => 60)" in wanted
+    assert "wanted_at" in wanted and wanted.endswith("order by src_database limit 4)")
+    sent.clear()
+    main.WarehouseReadStore().claim_checks("sql_a", "d2", names, 2, 8, 60)
+    assert sent[-1].endswith("order by src_database limit 2)"), "only 2 of the discovery's check slots are free"

@@ -59,7 +59,7 @@ class _Store:
 
     def claim_checks(self, server, discovery_id, first, limit, cap, claim_s):
         """As main.WarehouseReadStore.claim_checks: the page's free checks in name order, up to the room the cap leaves,
-        and each free one still not claimed is wanted when the server is full."""
+        and when the server is full the first of the rest are wanted, no more than wr.wanted_limit."""
         with self.lock:
             if limit <= 0 or not first:
                 return []
@@ -72,9 +72,9 @@ class _Store:
                 for n in taken:
                     self.row(discovery_id, n)["claimed_at"] = self.now
             if cap - going - len(taken) <= 0:
-                for n, r in self._mine(discovery_id):
-                    if n in first and self._free_check(r, claim_s):
-                        r["wanted"] = self.now
+                unclaimed = [r for n, r in self._mine(discovery_id) if n in first and self._free_check(r, claim_s)]
+                for r in unclaimed[:wr.wanted_limit(limit - len(taken), cap)]:
+                    r["wanted"] = self.now
             return taken
 
     def claim_reads(self, server, discovery_ids, cap, limit, claim_s):
@@ -372,6 +372,28 @@ def test_reads_leave_room_for_checks_wanted_for_a_place_until_their_wait_runs_ou
     store.now += wr.WANT_S + 1
     wr.advance(store, fake, wr.READ, "d1", "sql_a", cap=cap)
     assert len(fake.started_for) == started + 4, "once the wait runs out the reads take them"
+
+
+def test_a_page_of_unchecked_databases_wants_no_more_places_than_half_the_cap_so_reads_keep_going():
+    reads, page = [f"a{i:02d}" for i in range(20)], [f"c{i:03d}" for i in range(100)]
+    store = _Store(reads, wr.READ)
+    store.add("d2", page, wr.CHECK)
+    fake = _Warehouse({n: [{"state": "RUNNING", "rows": None, "error": None}] for n in reads + page})
+    wr.advance(store, fake, wr.READ, "d1", "sql_a", cap=8)
+    wr.advance(store, fake, wr.CHECK, "d2", "sql_a", first=page, cap=8)
+    assert store.in_flight(wr.CHECK, "d2") == [] and store.waiting("sql_a") == 4, "100 names, 4 places held for them"
+    for name, statement in store.in_flight(wr.READ, "d1"):
+        store.finish_read("d1", name, [], None, statement)
+    wr.advance(store, fake, wr.READ, "d1", "sql_a", cap=8)
+    assert len(store.in_flight(wr.READ, "d1")) == 4, "reads keep half the server's places while the page waits"
+
+
+def test_the_places_wanted_are_no_more_than_the_discoverys_free_check_slots_nor_half_the_cap():
+    assert wr.wanted_limit(16, 8) == 4
+    assert wr.wanted_limit(2, 8) == 2, "only 2 of the discovery's 16 check slots are free"
+    assert wr.wanted_limit(0, 8) == 0
+    assert wr.wanted_limit(16, 5) == 2 and wr.wanted_limit(16, 4) == 2
+    assert wr.wanted_limit(16, 256) == 16
 
 
 def test_a_statement_that_fails_to_start_frees_its_database_and_says_why():

@@ -3795,7 +3795,8 @@ class WarehouseReadStore:
                      claim_s: int) -> List[str]:
         """Claim the page's databases to check, up to ``limit`` for this discovery and never past the server's cap. It
         runs in the same transaction, under the server's lock, as the reads do. When the server has no room left for the
-        names asked for, they are marked wanted, so reads leave places for them (warehouse_reads.WANT_S)."""
+        names asked for, the first few of them are marked wanted (warehouse_reads.wanted_limit), so reads leave places for
+        them (warehouse_reads.WANT_S)."""
         if limit <= 0 or not first:
             return []
         with db.transaction() as cur:
@@ -3807,7 +3808,8 @@ class WarehouseReadStore:
                 taken = [r["src_database"] for r in
                          db.fetch(cur, q.warehouse_claim_sql("check"), (discovery_id, claim_s, list(first), room))]
             if int(cap) - going - len(taken) <= 0:
-                cur.execute(q.warehouse_want_checks_sql(), (discovery_id, claim_s, list(first)))
+                cur.execute(q.warehouse_want_checks_sql(),
+                            (discovery_id, claim_s, list(first), warehouse_reads.wanted_limit(limit - len(taken), cap)))
         return taken
 
     def claim_reads(self, server: str, discovery_ids: List[str], cap: int, limit: int,

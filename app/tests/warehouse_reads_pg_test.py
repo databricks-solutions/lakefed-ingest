@@ -143,6 +143,24 @@ def test_checks_and_reads_of_two_discoveries_of_one_server_share_one_cap(owner):
     assert len(got) == 1 and _going(owner) == 4, "one read in the room the 4 waiting checks leave"
 
 
+def test_a_page_of_unchecked_databases_holds_places_for_half_the_cap_and_reads_keep_the_rest(owner):
+    store = main.WarehouseReadStore()
+    page = [f"c{i:03d}" for i in range(100)]
+    checking = _listed(owner, page)
+    reading = _read(owner, [f"a{i:02d}" for i in range(20)], connection="SQL_A")
+    started = store.claim_reads("sql_a", [reading], 8, 8, wr.CLAIM_S)
+    assert len(started) == 8 and _going(owner) == 8
+    assert store.claim_checks("sql_a", checking, page, 16, 8, wr.CLAIM_S) == [], "the server is full"
+    wanted = _rows(owner, "select count(*) as n from lakefed_ingest.discovery where discovery_id = %s "
+                          "and listing ? 'wanted_at'", (checking,))[0]["n"]
+    assert wanted == 4, "half the cap, not the 100 names of the page"
+    for _, database in started:
+        store.started(wr.READ, reading, database, f"s-{database}")
+        store.finish_read(reading, database, [], None, f"s-{database}")
+    got = store.claim_reads("sql_a", [reading], 8, 8, wr.CLAIM_S)
+    assert len(got) == 4, "reads keep the other half of the server's places while the page waits"
+
+
 def test_a_claim_waits_for_the_servers_lock_held_elsewhere(owner):
     import psycopg
     store = main.WarehouseReadStore()

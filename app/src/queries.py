@@ -1658,12 +1658,14 @@ def warehouse_waiting_checks_sql() -> str:
 
 
 def warehouse_want_checks_sql() -> str:
-    """Mark the checks a page asked for that got no place: wanted now, when they have no statement and no live claim.
-    Params: discovery_id, claim age in seconds, the names (text[])."""
+    """Mark the checks a page asked for that got no place: wanted now, the first few by name (the order a check claims
+    in) that have no statement and no live claim. Params: discovery_id, claim age in seconds, the names (text[]), the
+    most to mark (warehouse_reads.wanted_limit)."""
     return (f"update {SCHEMA}.discovery set listing = coalesce(listing, '{{}}'::jsonb) "
             f"|| jsonb_build_object('wanted_at', now()::text) "
+            f"where (discovery_id, src_database) in (select discovery_id, src_database from {SCHEMA}.discovery "
             f"where discovery_id = %s and {WAREHOUSE_WORK['check']} and not (listing ? 'statement_id') "
-            f"and {_LAPSED_CLAIM} and src_database = any(%s::text[])")
+            f"and {_LAPSED_CLAIM} and src_database = any(%s::text[]) order by src_database limit %s)")
 
 
 def warehouse_claim_reads_sql() -> str:

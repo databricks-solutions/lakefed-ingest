@@ -73,6 +73,14 @@ def cap_from_environment() -> int:
 CAP = cap_from_environment()
 
 
+def wanted_limit(free_check_slots: int, cap: int) -> int:
+    """How many of a page's checks that found the server full are marked wanted: the checks that could run now (the
+    discovery's free check slots), and never more than half the cap. A page of 100 unchecked names would otherwise
+    hold every place for itself and pause the reads until nearly all of it was checked; with half the cap, reads
+    always keep the other half while the page waits, and the page still gets its half a round."""
+    return max(0, min(int(free_check_slots), int(cap) // 2))
+
+
 def server_key(connection: str) -> str:
     """The server a read through the warehouse reads: its connection's name, lower case (job_settings.server_of)."""
     return str(connection or "").lower()
