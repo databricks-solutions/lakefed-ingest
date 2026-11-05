@@ -145,15 +145,13 @@ for sources other than SQL Server (placeholders), and built-in alerts beyond the
 
 ## Usage attribution
 
-So Databricks can see how widely the tool is used, it identifies itself in three ways. Nothing else is collected: no
-names, hosts, queries or data.
+So Databricks can see how widely the tool is used, the tool labels its own activity in three ways. It adds only the fixed values below and sends nothing else of its own.
 
-- **API calls.** Every Databricks SDK client the jobs and the operations app make identifies itself as
-  `ingestion-workbench/<version>` in its user agent (`src/lakefed_ingest/product.py`, `app/src/app_product.py`).
-- **Resource tags.** Every job, job cluster, the discovery cluster and the app's SQL warehouse carry the tag
-  `project: ingestion-workbench` (bundle variable `project_tag`).
-- **Query tags.** The operations app's SQL warehouse statements carry the query tags `application:
-  ingestion-workbench` and `component: discovery`.
+- API calls. The Databricks SDK clients the engine and the operations app create put `ingestion-workbench/<version>` at the start of their user agent, next to the details the SDK always sends (SDK, Python and OS versions and the authentication type).
+- Resource tags. The jobs, job clusters, the discovery cluster and the app's SQL warehouse that the bundle deploys carry the tag `project: ingestion-workbench`. Change the value per target with the bundle variable `project_tag`.
+- Query tags. The operations app's SQL statements carry the query tags `application: ingestion-workbench` and `component: discovery`.
+
+As for any Databricks API call or SQL statement, your workspace records these alongside the workspace, the caller and, for SQL, the statement text, in its audit logs, query history and billing data.
 
 ## Help and security
 
