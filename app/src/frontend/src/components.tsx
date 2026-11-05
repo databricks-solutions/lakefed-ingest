@@ -82,6 +82,12 @@ export function heading(key: string): string {
   return HEADINGS[key] ?? (key.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase()) || " ");
 }
 
+/** The widest an autosized grid column grows: a longer value is cut with an ellipsis and shown whole on hover. */
+const GRID_MAX_COLUMN_WIDTH = 420;
+
+/** A time cell: the short form in the cell, the full date and time on hover, as the plain tables show their times. */
+export const timeCellRenderer = (p: { value?: unknown }) => <span title={fmtTime(p.value)}>{fmtShort(p.value)}</span>;
+
 /** Column defs from the first row's keys (with per-column overrides), so pages stay short. */
 export function autoColumns(rows: Row[], overrides: Record<string, Partial<ColDef>> = {}, hide: string[] = []): ColDef[] {
   const keys = rows.length ? Object.keys(rows[0]) : Object.keys(overrides);
@@ -89,8 +95,9 @@ export function autoColumns(rows: Row[], overrides: Record<string, Partial<ColDe
     field: k,
     headerName: heading(k),
     ...(/(_at|started|finished|ended)$/.test(k)
-      ? { valueFormatter: (p: any) => fmtShort(p.value), tooltipValueGetter: (p: any) => fmtTime(p.value) }
+      ? { valueFormatter: (p: any) => fmtShort(p.value), cellRenderer: timeCellRenderer }
       : VALUE_WORDS[k] ? { valueFormatter: (p: any) => valueName(k, p.value) } : {}),
+    ...(overrides[k]?.flex ? {} : { maxWidth: GRID_MAX_COLUMN_WIDTH }),
     ...overrides[k],
   }));
 }
@@ -169,7 +176,9 @@ export function Grid(props: {
         theme={theme}
         rowData={props.rows ?? []}
         columnDefs={cols}
-        defaultColDef={{ sortable: true, filter: props.filters ?? true, resizable: true, minWidth: 90 }}
+        defaultColDef={{ sortable: true, filter: props.filters ?? true, resizable: true, minWidth: 90,
+          tooltipValueGetter: (p) => String(p.valueFormatted ?? p.value ?? "") }}
+        tooltipShowMode="whenTruncated" enableCellTextSelection
         rowHeight={ROW_HEIGHT} headerHeight={HEADER_HEIGHT}
         autoSizeStrategy={{ type: "fitCellContents" }}
         rowSelection={props.selection
