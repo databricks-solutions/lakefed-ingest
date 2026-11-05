@@ -4,10 +4,14 @@ import { Link, useParams } from "react-router-dom";
 import { useSettings } from "../App";
 import { api, type Row } from "../api";
 import { OutLink, clusterUrl, databricksRunUrl,
-  Crumbs, fmtSlot,
+  Cols, Crumbs, Cut, fmtSlot, oneLine,
   Badge, BigCount, ErrorBox, FillBox, Grid, Notice, PageHead, ProgressBar, ProgressKey, RunStatus, Section, Stamp, autoColumns,
   databasePath, fmtDuration, fmtInt, fmtLeft, fmtSpeed, jobRunPath, plural, progressOf, progressText, type Progress
 } from "../components";
+
+/** Columns as a job run's list keeps them: names take the spare width, the counts and times have their own. */
+const IN_FLIGHT_WIDTHS = [220, null, 100, 150, 110, 80] as const;
+const databaseRunWidths = (live: boolean) => [null, ...(live ? [170, 110] : []), 90, 90, 90, 140] as const;
 
 /** A finished run's totals in the same shape as a live run's progress, so both read the same way. The run's "ok"
  * counts its unchanged tables and its reseeds queued too, so loaded is ok less both (queries.loaded_tables), and
@@ -60,13 +64,14 @@ function InFlight({ id }: { id: string }) {
       actions={tables.length > 8 ? <button onClick={() => setAll(!all)}>{all ? "Show fewer" : "Show all"}</button> : undefined}>
       <ErrorBox error={found.error} />
       <FillBox min={120}>
-        <table className="data">
+        <table {...oneLine(IN_FLIGHT_WIDTHS)}>
+          <Cols widths={IN_FLIGHT_WIDTHS} />
           <thead><tr><th>Database</th><th>Table</th><th>Load</th><th>Step</th><th className="num">Running for</th>
             <th className="num">Retries</th></tr></thead>
           <tbody>
             {shown.map((t) => (
-              <tr key={`${t.src_database}\u001f${t.src_schema}\u001f${t.src_table}`}><td>{t.src_database}</td>
-                <td><b>{t.src_schema}.{t.src_table}</b></td><td>{t.action}</td><td>{t.stage || ""}</td>
+              <tr key={`${t.src_database}\u001f${t.src_schema}\u001f${t.src_table}`}><td><Cut text={t.src_database} tipOnlyWhenCut /></td>
+                <td><Cut text={`${t.src_schema}.${t.src_table}`} tipOnlyWhenCut><b>{t.src_schema}.{t.src_table}</b></Cut></td><td>{t.action}</td><td>{t.stage || ""}</td>
                 <td className="num">{fmtDuration(t.running_s)}</td><td className="num">{fmtInt(t.retry_count)}</td></tr>
             ))}
             {found.data && !tables.length && <tr><td colSpan={6} className="muted">No table is being loaded right now.</td></tr>}
@@ -195,7 +200,8 @@ export default function RunDetail() {
           <Section title="By database" note="Each database of the run, in progress first: tables loaded, in flight and failed, and the rows its loads wrote. Checked counts its tables stamped since the run started.">
             <ErrorBox error={databases.error} />
             <FillBox min={160}>
-              <table className="data">
+              <table {...oneLine(databaseRunWidths(live))}>
+                <Cols widths={databaseRunWidths(live)} />
                 <thead><tr><th>Database</th>{live && <th>Progress</th>}{live && <th className="num">Checked</th>}<th className="num">Loaded</th>
                   <th className="num">In flight</th><th className="num">Failed</th><th className="num">Rows written</th></tr></thead>
                 <tbody>
@@ -206,9 +212,10 @@ export default function RunDetail() {
                                            inFlight: Number(d.in_flight || 0), failed: Number(d.failed || 0) };
                     return (
                     <tr key={`${d.server}\u001f${d.src_database}`}><td className="name">
+                      <Cut tipOnlyWhenCut text={`${d.src_database || "(none)"}${manyServers ? `  ${d.server || "(no server)"}` : ""}`}>
                       <Link to={databasePath(r!.task_collection, d.server, d.src_database)}><b>{d.src_database || "(none)"}</b></Link>
-                      {manyServers && <span className="sub">{d.server || "(no server)"}</span>}</td>
-                      {live && <td style={{ minWidth: 140 }}>{g ? <ProgressBar p={dp} /> : null}</td>}
+                      {manyServers && <span className="sub">{d.server || "(no server)"}</span>}</Cut></td>
+                      {live && <td>{g ? <ProgressBar p={dp} /> : null}</td>}
                       {live && <td className="num">{g ? `${fmtInt(checked)} of ${fmtInt(tables)}` : ""}</td>}
                       <td className="num">{fmtInt(d.loaded)}</td>
                       <td className="num">{fmtInt(d.in_flight)}</td>

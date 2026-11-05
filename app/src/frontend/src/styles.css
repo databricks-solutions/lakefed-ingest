@@ -302,6 +302,8 @@ table.data.one-line .status-cell > .tag, table.data.one-line .status-cell > .tip
 table.data.one-line .state-bar { min-width: 0; }
 table.data.one-line .bar-counts { flex-wrap: nowrap; white-space: nowrap; overflow: hidden; }
 table.data.one-line .bar-counts > span { flex: none; }
+/* A row's actions menu opens below the cell, so its cell must not clip it. */
+table.data.one-line td.card-actions { overflow: visible; }
 table.data.one-line td .sub { display: inline; margin-left: var(--db-space-2); }
 table.data.one-line .cell-line { display: flex; align-items: center; gap: var(--db-space-1, 4px); }
 table.data.one-line .cell-line .tip-target { flex: 0 1 auto; min-width: 0; }

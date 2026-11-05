@@ -1,11 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
-import { Badge, ErrorBox, Menu, Notice, PageHead, Section, fmtTime, readAt, statusName, usePageStamp } from "../components";
+import { Badge, Cols, Cut, ErrorBox, Menu, Notice, PageHead, Section, fmtTime, oneLine, readAt, statusName, usePageStamp } from "../components";
 import { usePermissions } from "../permissions";
 
 // Schedules: when each ingestion job runs, as set in its Edit view (When it runs), one row per job and no groups, as
 // the Databricks Jobs list shows them. Run history is on Runs. A schedule is changed in the job's Edit view.
+
+/** The schedules list as the Jobs list keeps its columns: the job takes the spare width, the schedule and times have their own. */
+const WIDTHS = [null, 200, 90, 170, 200, 170, 170] as const;
 
 function next(job: Row): string {
   if (job.paused) return "paused";
@@ -30,11 +33,11 @@ function JobRow({ job }: { job: Row }) {
   const drifted = check.data ? Object.values(check.data).filter((c: any) => c?.status && c.status !== "in_sync").length : 0;
   return (
     <tr>
-      <td className="name"><Link to={`/ingestion-jobs/${job.id}`}><b>{job.name}</b></Link></td>
-      <td>{job.description}</td>
+      <td className="name"><Link to={`/ingestion-jobs/${job.id}`}><Cut text={job.name} tipOnlyWhenCut><b>{job.name}</b></Cut></Link></td>
+      <td><Cut text={job.description} tipOnlyWhenCut /></td>
       <td>{job.paused ? <Badge value="paused" /> : <Badge value="ok" />}</td>
       <td>{next(job)}</td>
-      <td>{recent ? <>{statusName(recent.last_status)}<span className="sub">{fmtTime(recent.last_started)}</span></> : <span className="muted">never run</span>}</td>
+      <td>{recent ? <Cut text={`${statusName(recent.last_status)} ${fmtTime(recent.last_started)}`} tipOnlyWhenCut>{statusName(recent.last_status)}<span className="sub">{fmtTime(recent.last_started)}</span></Cut> : <span className="muted">never run</span>}</td>
       <td>{unsynced ? <span className="tag warn">{unsynced} not synced</span> : check.data
         ? (drifted ? <span className="tag warn">changed in the Jobs UI</span> : <span className="muted">in sync</span>) : <span className="muted">synced</span>}
         <ErrorBox error={act.error || check.error} /></td>
@@ -58,7 +61,8 @@ export default function Schedules() {
       <ErrorBox error={list.error} />
       <Section title="Ingestion jobs" note="Each one's schedule, as set in its Edit view (When it runs).">
         {list.data && list.data.length === 0 ? <Notice>No ingestion jobs yet: New ingestion job, on Ingestion jobs, makes one.</Notice> : (
-          <div className="table-wrap"><table className="data">
+          <div className="table-wrap"><table {...oneLine(WIDTHS)}>
+            <Cols widths={WIDTHS} />
             <thead><tr><th>Ingestion job</th><th>Schedule</th><th>Status</th><th>Next run</th><th>Last run</th><th>Its Databricks jobs</th><th></th></tr></thead>
             <tbody>{(list.data ?? []).map((job) => <JobRow key={job.id} job={job} />)}</tbody>
           </table></div>

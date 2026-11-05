@@ -2,9 +2,13 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api, type Row } from "../api";
 import { valueName,
-  Crumbs, ErrorBox, FillBox, PageHead, ProgressBar, ProgressKey, Section, Stamp, StateBar, StateKey, Tag, databasePath,
-  fmtAgo, fmtClock, fmtDuration, fmtInt, progressOf, progressText, type Progress, plural
+  Cols, Crumbs, Cut, ErrorBox, FillBox, PageHead, ProgressBar, ProgressKey, Section, Stamp, StateBar, StateKey, Tag, databasePath,
+  fmtAgo, fmtClock, fmtDuration, fmtInt, oneLine, progressOf, progressText, type Progress, plural
 } from "../components";
+
+/** The databases list as a job's runs list keeps its columns: the database takes the spare width, the counts have their own. */
+const databaseWidths = (run: boolean) => [null, ...(run ? [170, 110, 80] : []), 170, 80, 90, 120, 150, 170] as const;
+const SETTING_WIDTHS = [260, null] as const;
 
 interface CollectionData { collection: string; databases: Row[]; running: Row | null; batches: Row[]; jobs: Row[]; read_at: string; cache_s: number }
 
@@ -62,7 +66,8 @@ export default function CollectionPage() {
         note={<>Rows in first loads are what each table's first load wrote, which is the source's row count at that moment, so the
           total can be checked against a count taken at the source. Rows in changes are written since, in the last 24 hours.</>}>
         <FillBox>
-          <table className="data">
+          <table {...oneLine(databaseWidths(!!run))}>
+            <Cols widths={databaseWidths(!!run)} />
             <thead><tr><th>Database</th>{run && <th>This run</th>}{run && <th className="num">Checked</th>}{run && <th className="num">In flight</th>}
               <th>State now</th><th className="num">Failing</th><th className="num">First load</th><th className="num">Oldest success</th>
               <th className="num">Rows in first loads</th><th className="num">Rows in changes, 24 h</th></tr></thead>
@@ -75,8 +80,9 @@ export default function CollectionPage() {
                                        inFlight: Number(d.in_flight || 0), failed: Number(d.failed_this_run || 0) };
                 return (
                   <tr key={`${d.server}\u001f${d.src_database}`}>
-                    <td className="name"><Link to={databasePath(name, d.server, d.src_database)}><b>{d.src_database || "(none)"}</b></Link>
-                      {servers.length > 1 && <span className="sub">{d.server || "(no server)"}</span>}</td>
+                    <td className="name"><Cut tipOnlyWhenCut text={`${d.src_database || "(none)"}${servers.length > 1 ? `  ${d.server || "(no server)"}` : ""}`}>
+                      <Link to={databasePath(name, d.server, d.src_database)}><b>{d.src_database || "(none)"}</b></Link>
+                      {servers.length > 1 && <span className="sub">{d.server || "(no server)"}</span>}</Cut></td>
                     {run && <td><ProgressBar p={dp} /></td>}
                     {run && <td className="num">{fmtInt(checked)} of {fmtInt(tablesHere)}</td>}
                     {run && <td className="num">{fmtInt(d.in_flight || 0)}</td>}
@@ -130,15 +136,17 @@ function GroupSettings({ name }: { name: string }) {
       actions={<span className="pager-buttons"><Link to={`/import?group=${encodeURIComponent(name)}`}>Import CSV</Link>
         <a href={`/api/collections/${encodeURIComponent(name)}/export.csv`}>Export CSV</a></span>}>
       <ErrorBox error={settings.error} />
-      <div className="table-wrap" style={{ maxWidth: 760 }}><table className="data dense">
+      <div className="table-wrap" style={{ maxWidth: 760 }}><table {...oneLine(SETTING_WIDTHS, "dense")}>
+        <Cols widths={SETTING_WIDTHS} />
         <thead><tr><th>Setting</th><th>Value</th></tr></thead>
         <tbody>
           {(settings.data?.settings ?? []).map((s) => (
             <tr key={s.setting}>
               <td>{SETTING_LABELS[s.setting] ?? s.setting}</td>
-              <td>{s.mixed ? <>mixed: {Object.entries(s.mixed as Record<string, number>).map(([v, n]) =>
-                `${valueName(s.setting, v) || "blank"} (${fmtInt(n)} ${plural(n, "table")})`).join(", ")}</>
-                : show(typeof s.value === "string" ? valueName(s.setting, s.value) : s.value)}</td>
+              <td>{s.mixed ? <Cut tipOnlyWhenCut text={`mixed: ${Object.entries(s.mixed as Record<string, number>).map(([v, n]) =>
+                `${valueName(s.setting, v) || "blank"} (${fmtInt(n)} ${plural(n, "table")})`).join(", ")}`} />
+                : typeof s.value === "string" && s.value !== "" ? <Cut tipOnlyWhenCut text={valueName(s.setting, s.value)} />
+                : show(s.value)}</td>
             </tr>
           ))}
         </tbody>

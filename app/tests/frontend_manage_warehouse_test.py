@@ -22,7 +22,7 @@ def test_manage_shows_the_warehouse_after_the_version():
 def test_the_warehouse_row_shows_name_and_id_type_state_setting_and_problem():
     section = _warehouse_section()
     assert '<Section title="SQL warehouse">' in section
-    assert "<th>SQL warehouse</th><th>Type</th><th>State</th><th>Set by</th>" in section
+    assert "<th>SQL warehouse</th><th>Warehouse ID</th><th>Type</th><th>State</th><th>Set by</th>" in section
     assert section.count("<tr>") == 2                                           # the header and one row
     for shown in ("warehouse.name", "warehouse.id", "warehouseKind(warehouse)", "warehouse.state",
                   "warehouseChosenBy(warehouse)", '<Notice tone="warn">{warehouse.problem}</Notice>'):

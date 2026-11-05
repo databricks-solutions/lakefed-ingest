@@ -1,7 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { api, type Row } from "../api";
-import { Crumbs, ErrorBox, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, plural } from "../components";
+import { Cols, Crumbs, Cut, ErrorBox, PageHead, RunStatus, Section, StateBar, StateKey, fmtClock, fmtDuration, fmtInt, oneLine, plural } from "../components";
+
+/** The groups list as the Jobs list keeps its columns: the group takes the spare width, the counts and states have their own. */
+const WIDTHS = [null, 100, 80, 170, 80, 300, 110] as const;
 
 // The groups in no ingestion job, as a page of their own, so a deployment with no jobs (a read-only share) still
 // opens its groups and, from each group, its tables.
@@ -19,17 +22,18 @@ export default function NotInJob() {
       <ErrorBox error={page.error} />
       {d && (
         <Section title={`Ingestion groups: ${fmtInt(d.groups_detail.length)}`} actions={<StateKey />}>
-          <div className="table-wrap"><table className="data">
+          <div className="table-wrap"><table {...oneLine(WIDTHS)}>
+            <Cols widths={WIDTHS} />
             <thead><tr><th>Ingestion group</th><th className="num">Databases</th><th className="num">Tables</th><th>State now</th>
               <th className="num">Failing</th><th>Last group run</th><th className="num">p95 run time</th></tr></thead>
             <tbody>
               {d.groups_detail.map((g: Row) => (
                 <tr key={g.task_collection}>
-                  <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><b>{g.task_collection}</b></Link></td>
+                  <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><Cut text={g.task_collection} tipOnlyWhenCut><b>{g.task_collection}</b></Cut></Link></td>
                   <td className="num">{fmtInt(g.databases)}</td><td className="num">{fmtInt(g.enabled_tables)}</td><td><StateBar row={g} /></td>
                   <td className="num" style={{ color: Number(g.state_failing) ? "var(--bad)" : undefined }}>{fmtInt(g.state_failing)}</td>
-                  <td>{g.last_run ? <><Link to={`/runs/${g.last_run.run_id}`}><RunStatus status={g.last_run.status} outcome={g.last_run.outcome} /></Link>
-                    <span className="sub">group run {fmtInt(g.last_run.run_id)} at {fmtClock(g.last_run.started_at)}</span></> : <span className="muted">never run</span>}</td>
+                  <td>{g.last_run ? <span className="cell-line"><Link to={`/runs/${g.last_run.run_id}`}><RunStatus status={g.last_run.status} outcome={g.last_run.outcome} /></Link>
+                    <Cut text={`group run ${fmtInt(g.last_run.run_id)} at ${fmtClock(g.last_run.started_at)}`} className="cut sub" tipOnlyWhenCut /></span> : <span className="muted">never run</span>}</td>
                   <td className="num">{g.p95_s != null ? fmtDuration(g.p95_s) : ""}</td>
                 </tr>
               ))}

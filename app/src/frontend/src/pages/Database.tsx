@@ -3,8 +3,11 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import {
-  Crumbs, ErrorBox, FillBox, Info, PageHead, Pager, Section, Stamp, StateKey, StateSummary, Tag, fmtAgo, fmtDuration, fmtInt, plural, type Tone
+  Cols, Crumbs, Cut, ErrorBox, FillBox, Info, PageHead, Pager, Section, Stamp, StateKey, StateSummary, Tag, fmtAgo, fmtDuration, fmtInt, oneLine, plural, type Tone
 } from "../components";
+
+/** The tables list as a table list keeps its columns: the name takes the spare width, the short fields have their own. */
+const tableWidths = (running: boolean) => [null, ...(running ? [250] : []), 170, 120, 130, 110] as const;
 
 const STATE_TONE: Record<string, Tone> = { failing: "bad", "first load": "first", late: "warn", current: "ok", disabled: "" };
 
@@ -31,6 +34,7 @@ export default function Database() {
   });
   const d = found.data;
   const running = !!d?.running;
+  const widths = tableWidths(running);
   return (
     <>
       <PageHead crumb={<Crumbs steps={[["Ingestion jobs", "/ingestion-jobs"],
@@ -54,13 +58,14 @@ export default function Database() {
           onChange={(e) => { setOffset(0); setSearch(e.target.value); }} /></>}>
         {d && <Pager offset={offset} limit={d.limit} total={d.total} noun="table" onPage={setOffset} />}
         <FillBox min={240}>
-          <table className="data">
+          <table {...oneLine(widths)}>
+            <Cols widths={widths} />
             <thead><tr><th>Table</th>{running && <th>In this group run</th>}<th>State now</th><th>Last success</th>
               <th className="num">Freshness target</th><th>Load</th></tr></thead>
             <tbody>
               {(d?.tables ?? []).map((t: Row) => (
                 <tr key={t.id}>
-                  <td className="name"><b>{t.src_schema}.{t.src_table}</b></td>
+                  <td className="name"><Cut text={`${t.src_schema}.${t.src_table}`} tipOnlyWhenCut><b>{t.src_schema}.{t.src_table}</b></Cut></td>
                   {running && <td><RunPart t={t} running={running} /></td>}
                   <td><Tag tone={STATE_TONE[t.state] ?? ""}>{t.state}</Tag></td>
                   <td>{t.last_success_at ? fmtAgo(t.last_success_at) : <span className="muted">never</span>}</td>
