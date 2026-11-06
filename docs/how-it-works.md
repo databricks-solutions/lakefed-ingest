@@ -138,6 +138,18 @@ column in a `UNION`, or comparing the two, needs an explicit collation on one si
 `CAST(id AS STRING COLLATE UTF8_BINARY)`. Sources other than SQL Server
 keep exact keys for now. Kana and width sensitivity (`_KS`, `_WS`) are not mapped.
 
+The source's collation is read once per table, so three cases need care:
+
+- **A collation changed at the source later** (an `ALTER ... COLLATE` on the source column) is not applied to the
+  sink, not even by a reseed. Case-insensitive to case-sensitive would treat keys that now differ only by case as one
+  key; the reverse brings the duplicate rows back. After such a change, drop the sink table: the next run finds it
+  missing and reseeds it under the new collation (for a shared sink, every database that writes it reseeds).
+- **A shared sink** takes the key collation of the first database that writes it. Keep databases whose key
+  collations differ (for example, a case-sensitive one among case-insensitive ones) in separate sinks: under the
+  first one's collation, keys that differ only by case would be matched as one.
+- **The first sweep after upgrading** to this version is a one-time heavier pass: one source query per existing
+  table, plus the column change and a statistics recompute for each sink not yet collated.
+
 Comparing under a collation costs more CPU per row than an exact comparison. A MERGE into a shared sink
 reads only its database's files (the `__client_id__` filter is exact), so this barely shows there; a MERGE
 into a large dedicated sink that scans the whole table took about twice as long in a test (160 million
