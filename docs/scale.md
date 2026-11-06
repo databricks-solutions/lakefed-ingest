@@ -232,7 +232,6 @@ Each of these areas changes what the simulation counts. After a change to one, r
 - Lakebase statement and round-trip time, for the discovery writes (100,608 at 417 databases; 5,345,277 at 22,000), the
   create's writes, the upload's lines and each monitoring page.
 - The real per-call latency of the SQL Server catalog queries, and whether the source's concurrency limit holds at 32.
-- The Azure Resource Manager listing time at 22,000 databases (pages of 100).
 - Peak memory of the create and the selection read at 5,280,000 tables, on the app's real compute.
 - Monitoring pages' latency with 22,000 databases and 5,280,000 control rows in Lakebase (the state scan's cost).
 - The upload route's real 413 behaviour through the Apps proxy, and the real request size with JSON encoding.

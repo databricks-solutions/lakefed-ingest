@@ -2,7 +2,7 @@
 // strips the types in pending.ts as it loads it). frontend_pending_test.py runs this file from pytest.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { changeInProgress, connectionFailure, connectionNextBlock, connectionNextLabel, daysLeftText, deleteNotice, longWait, readsDone, waitLine, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, syncFailureLines }
+import { changeInProgress, connectionFailure, MASTER_ACCESS, connectionNextBlock, connectionNextLabel, daysLeftText, deleteNotice, longWait, readsDone, waitLine, isUnconfirmed, requestWriteNotice, runButton, runTimeoutNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, saveNotice, syncFailureLines }
   from "../../src/frontend/src/pending.ts";
 
 const IDLE = { phase: "idle", timed_out: false, run_url: null, blocked: null, refused: null };
@@ -354,6 +354,17 @@ test("a failed connection test shows its codes, the source's message and what to
   assert.match(connectionFailure("x", { error_class: "FAILED_JDBC.CONNECTION" }).hint, /host, port, user and password/);
   assert.match(connectionFailure("x", { sqlstate: "28000" }).hint, /refused the connection's login/);
   assert.match(connectionFailure("x", { sqlstate: "08S01" }).hint, /network path/);
+});
+
+test("a login that can't open master is told the access Lakeflow Connect asks for, and may type the databases instead", () => {
+  const hint = connectionFailure("[FAILED_JDBC.CONNECTION] Cannot open database \"master\" requested by the login",
+                                 { error_class: "FAILED_JDBC.CONNECTION", sql_server_error: 4060 }).hint;
+  assert.ok(hint.startsWith("The login can't open master, where the server lists its databases."));
+  assert.ok(hint.includes(MASTER_ACCESS));
+  assert.match(hint, /Then test again, or type the databases below\.$/);
+  for (const name of ["VIEW ANY DATABASE", "sys.databases", "##MS_DatabaseConnector##", "Lakeflow Connect"]) {
+    assert.ok(MASTER_ACCESS.includes(name), name);
+  }
 });
 
 test("a failed test with no code, such as the app refusing the request, says so plainly and still says what to do", () => {

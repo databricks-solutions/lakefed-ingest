@@ -113,7 +113,9 @@ def test_the_backend_names_the_databricks_job():
 
 def test_discover_says_when_the_login_cant_open_master_and_takes_typed_databases():
     discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
-    assert "If the login can't open master" in discover and "VIEW ANY" in discover
+    pending = (FRONTEND / "pending.ts").read_text()
+    assert "The login may not be able to open master" in discover and "{MASTER_ACCESS}" in discover
+    assert "VIEW ANY DATABASE" in pending and "##MS_DatabaseConnector##" in pending and "sys.databases" in pending
     assert "function TypedDatabases" in discover and "Databases typed by hand are read by name" in discover
 
 
@@ -131,10 +133,11 @@ def test_next_on_the_connection_step_tests_it_with_no_button_of_its_own():
     assert "<TestFailed" in discover and "actionNote=" in discover
 
 
-def test_discover_can_list_an_azure_sql_server_through_azure_and_reads_the_whole_server_the_same_way():
+def test_discover_has_no_path_of_its_own_for_azure_sql():
     discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
-    assert "Service credential" in discover and "Server resource id" in discover and "Reader on the server" in discover
-    assert "azure_credential" in discover and "azure_resource_id" in discover and "...(tested?.azure ?? {})" in discover
+    for gone in ("Service credential", "Server resource id", "azure_credential", "azure_resource_id", "azureOf"):
+        assert gone not in discover, gone
+    assert "Azure SQL below" not in discover
 
 
 def test_the_target_fields_are_marked_required_with_no_help_under_them():

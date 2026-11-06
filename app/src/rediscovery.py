@@ -23,7 +23,7 @@ RECORD = "rediscovery"
 BEAT_S = 15
 STALE_S = 120
 RESTARTED = "the app restarted; run it again"
-LISTING_KEYS = ("pattern", "azure_credential", "azure_resource_id")
+LISTING_KEYS = ("pattern",)
 REPORT_LIMIT = 20
 # The phases a running re-discovery records: reading a server again (its discovery run goes), then writing the tables.
 DISCOVERING, ADDING = "discovering", "adding"

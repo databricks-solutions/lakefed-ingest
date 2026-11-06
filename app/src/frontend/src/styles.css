@@ -184,7 +184,7 @@ table.data td a b { font-weight: var(--db-font-weight-normal); }
 table.data td .sub { display: block; font-size: var(--db-font-size-sm); color: var(--muted); font-weight: var(--db-font-weight-normal); }
 /* A host name never breaks across lines: an ellipsis when it does not fit, the full name in its tooltip (Tip). */
 .tip-target { display: inline-block; max-width: 100%; vertical-align: bottom; }
-.host { display: inline-block; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+.host, .cut { display: inline-block; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         vertical-align: bottom; }
 .tip-pop { position: fixed; z-index: 1000; max-width: min(560px, calc(100vw - 8px)); padding: 4px 8px;
            background: var(--db-surface-base, #fff); color: var(--text); border: 1px solid var(--border, #d1d9e1);
@@ -286,6 +286,21 @@ table.data.fit th, table.data.fit td { padding-left: 6px; padding-right: 6px; }
 table.data.wrap-head th { white-space: normal; vertical-align: bottom; }
 table.data.wrap-head td.name { min-width: 110px; }
 table.data td.mono { white-space: nowrap; }
+/* The connection picker (Add tables, step 1): one line to a row, as Catalog Explorer's connections list and the Jobs list
+   keep theirs. Name and Host are the flexible columns, Type is fixed and narrow, Owner is cut with an ellipsis. */
+table.data.connections { table-layout: fixed; min-width: 600px; }
+table.data.connections .col-pick { width: 40px; }
+table.data.connections .col-name { width: 24%; }
+table.data.connections .col-type { width: 100px; }
+table.data.connections .col-owner { width: 180px; }
+table.data.connections td.cell { white-space: nowrap; overflow: hidden; }
+table.data.connections td.cell b { display: block; overflow: hidden; }
+table.data.connections .cut { display: block; }
+table.data.connections .tip-target { display: block; }
+table.data.connections .cell-line { display: flex; align-items: center; gap: var(--db-space-1, 4px); }
+table.data.connections .cell-line .tip-target { flex: 0 1 auto; min-width: 0; }
+.copy-button { flex: none; padding: 0 4px; min-height: 0; line-height: 1; opacity: 0; }
+tr:hover .copy-button, .copy-button:focus-visible, .copy-button:focus { opacity: 1; }
 .pager { display: flex; align-items: center; justify-content: space-between; gap: var(--db-space-3); flex-wrap: wrap; margin: var(--db-space-2) 0; }
 .pager-buttons { display: inline-flex; gap: var(--db-space-2); }
 .chips { display: inline-flex; flex-wrap: wrap; gap: var(--db-space-2); }

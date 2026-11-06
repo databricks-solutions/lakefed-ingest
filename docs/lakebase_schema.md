@@ -346,7 +346,7 @@ in the operations app's Bulk import page.
   `secret_key`); `status` (`running` | `ok` | `failed`, or `listed` for a discovery that only lists the server's
   databases, as Test connection does), `error`, and the number of tables found. A connection that fails is recorded
   on the server's `master` row. `listing` (JSON, schema version 11): how it listed its databases, for a later
-  re-discovery: `pattern`, `azure_credential`, `azure_resource_id` and `secret_key_template`. Never a secret. Null
+  re-discovery: `pattern`, `secret_key_template` and `jdbc_connection`. Never a secret. Null
   for discoveries made before version 11.
 - **`discovered_table`:** one row per table, with size and row counts, whether Change Tracking is
   enabled, and the recommended settings: `select_list` (unsupported column types listed in

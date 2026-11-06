@@ -3,8 +3,8 @@
 One server holds ``databases`` user databases of ``tables_per_database`` tables each: 22,000 x 240 is the large-estate
 case, about 5.3 million tables. Nothing is stored. A database's catalog is derived from the seed and the database's
 index when it is asked for, so the whole server costs no memory until a database is read. The rows match what the
-catalog queries of discovery.py return (its TABLES_SQL, COLUMNS_SQL and PK_SQL), the database listing through master,
-and the Azure Resource Manager list of an Azure SQL server's databases.
+catalog queries of discovery.py return (its TABLES_SQL, COLUMNS_SQL and PK_SQL), and the database listing through
+master.
 
 Shape:
   * Names: lfc_eng_NNNNN (60%), lfc_test_NNNNN (20%), lfc_heavy_NNNNN (10%) and ops_NNNNN (10%), so a name filter such as
@@ -34,8 +34,6 @@ CURSOR_SHARE = 0.06
 GEOGRAPHY_SHARE = 0.02
 MAX_ROW_COUNT = 5_000_000
 EMPTY_SHARE = 0.10
-ARM_PAGE_SIZE = 100
-ARM_BASE = "https://management.azure.com"
 
 # The name prefix of database i is FAMILY_BY_DIGIT[i % 10], so the shares are exact (6, 2, 1 and 1 in ten).
 FAMILY_BY_DIGIT = ("lfc_eng_",) * 6 + ("lfc_test_",) * 2 + ("lfc_heavy_",) + ("ops_",)
@@ -155,19 +153,3 @@ class ServerCatalog:
         if not 0 <= index < self.databases:
             raise KeyError(f"no database {index}")
         return _catalog_of(self.seed, index, self.tables_per_database)
-
-    def arm_page(self, page_index: int, base_url: str, page_size: int = ARM_PAGE_SIZE) -> Dict[str, object]:
-        """One page of the Azure Resource Manager list of the server's databases (the value and nextLink shape). A
-        paused database lists as Paused, which the listing keeps; the others list as Online."""
-        start = page_index * page_size
-        value = []
-        for index in range(start, min(start + page_size, self.databases)):
-            status = "Paused" if self.is_paused(index) else "Online"
-            value.append({"name": database_name(index), "properties": {"status": status}})
-        page: Dict[str, object] = {"value": value}
-        if start + page_size < self.databases:
-            page["nextLink"] = f"{base_url}?page={page_index + 1}"
-        return page
-
-    def arm_page_count(self, page_size: int = ARM_PAGE_SIZE) -> int:
-        return max(1, math.ceil(self.databases / page_size))

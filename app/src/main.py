@@ -3712,12 +3712,6 @@ class SourceDiscoverRequest(BaseModel):
     whole_server: bool = False
     # A database name filter for listing the server, as SQL Server's LIKE reads it (discovery.pattern_errors).
     pattern: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9_%\-\[\]\.$#@]*$")
-    # For an Azure SQL server whose login can't open master: a Unity Catalog service credential with Reader on the
-    # server, and the server's resource id. The discovery job then lists the databases through Azure
-    # (discovery.azure_databases); the app never calls Azure. Both or neither.
-    azure_credential: str = Field(default="", max_length=255, pattern=r"^[A-Za-z0-9_\-]*$")
-    azure_resource_id: str = Field(default="", max_length=512, pattern=r"^(/subscriptions/[0-9A-Za-z-]+/resourceGroups/"
-                                   r"[-\w.()]+/providers/Microsoft\.Sql/(servers|managedInstances)/[a-z0-9][a-z0-9-]*)?$")
     # Reading a whole server through the SQL warehouse: the discovery its connection test listed, and the filter the
     # whole-server tick was made under (in the database's name).
     listing_id: str = Field(default="", max_length=64, pattern=r"^[0-9a-f]*$")
@@ -4066,25 +4060,21 @@ def start_source_discovery(body: SourceDiscoverRequest, request: Request):
     names = list(dict.fromkeys(d.strip() for d in body.databases if d.strip()))
     if body.kind == "tables" and not body.whole_server and not names:
         raise HTTPException(422, "choose the whole server or at least one database")
-    if bool(body.azure_credential) != bool(body.azure_resource_id):
-        raise HTTPException(422, "listing through Azure takes both a service credential and the server's resource id")
     _require_connection(body.src_connection)
-    if body.kind == "list" and warehouse.configured() and not body.azure_credential:
+    if body.kind == "list" and warehouse.configured():
         # The connection test is the listing: one statement on the warehouse, every database (the filter comes after).
         did = uuid.uuid4().hex[:12]
         statement, parameters = warehouse.remote_query_statement(body.src_connection, SERVER_DATABASE,
                                                                  source_catalog.databases_sql(""))
         return _listing_answer(did, body.src_connection, _user(request), warehouse.start(statement, parameters))
-    if body.kind == "tables" and warehouse.configured() and not body.azure_credential:
+    if body.kind == "tables" and warehouse.configured():
         return _start_warehouse_read(body, names, _user(request))
     job_id = _require(jobs.DISCOVER_JOB_ID, "discovery")
     _refuse_run_of(job_id, request)
     did = uuid.uuid4().hex[:12]
     spec = {"src_type": "sqlserver", "src_connection": body.src_connection, "kind": body.kind,
             "databases": "*" if body.kind == "tables" and body.whole_server else names, "requested_by": _user(request),
-            **({"pattern": body.pattern} if body.pattern else {}),
-            **({"azure_credential": body.azure_credential, "azure_resource_id": body.azure_resource_id}
-               if body.azure_credential else {})}
+            **({"pattern": body.pattern} if body.pattern else {})}
     if body.kind == "list":
         spec.pop("databases")
     rid = jobs.run_now(job_id, {"discovery_id": did, "spec": json.dumps(spec)})
@@ -7168,10 +7158,9 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
 
 
 def _through_warehouse(spec: dict) -> bool:
-    """A discovery the SQL warehouse can run: through a Unity Catalog connection, not listed through Azure (which takes
-    a service credential only Databricks compute holds). A source read by host and password stays on the discovery
-    job."""
-    return warehouse.configured() and bool(spec.get("src_connection")) and not spec.get("azure_credential")
+    """A discovery the SQL warehouse can run: through a Unity Catalog connection. A source read by host and password
+    stays on the discovery job."""
+    return warehouse.configured() and bool(spec.get("src_connection"))
 
 
 def _discover_through_warehouse(spec: dict, discovery_id: str) -> Optional[str]:

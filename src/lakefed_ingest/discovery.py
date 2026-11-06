@@ -18,14 +18,12 @@ Recommendations (the reviewer can change any of them):
 
 Catalog views only (sys.tables / columns / indexes / partitions / allocation_units /
 change_tracking_tables): no data is read and no permission beyond metadata visibility is needed.
-A server's databases are listed through master, or for Azure SQL by Azure Resource Manager with a Unity Catalog
-service credential (``azure_databases``). Pure Python except ``discover_database`` and the Azure call (unit-tested
-in tests/discovery_test.py, with fakes for the credential and the HTTP call).
+A server's databases are listed through master. Pure Python except ``discover_database`` (unit-tested in
+tests/discovery_test.py).
 """
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Dict, List
 
@@ -87,121 +85,6 @@ def databases_sql(pattern: str = "") -> str:
         raise ValueError(pattern_errors(pattern)[0])
     return DATABASES_SQL.format(name=f" AND name LIKE N'{pattern}'" if pattern else "")
 
-
-# An Azure SQL server's (or Managed Instance's) databases can be listed by Azure Resource Manager instead of through
-# master, for a login that can't open master: the discovery job calls it with a token from a Unity Catalog service
-# credential whose managed identity has Reader on the server. Each database is then read by name through the
-# connection, as a typed one is. The app never calls Azure.
-ARM = "https://management.azure.com"
-ARM_API_VERSION = "2023-08-01"
-ARM_SCOPE = ARM + "/.default"
-ARM_RETRIES = 3
-AZURE_RESOURCE = re.compile(r"^/subscriptions/[0-9A-Za-z-]+/resourceGroups/[-\w.()]+/providers/Microsoft\.Sql/"
-                            r"(servers|managedInstances)/[a-z0-9][a-z0-9-]{0,127}$", re.IGNORECASE)
-CREDENTIAL = re.compile(r"^[A-Za-z0-9_\-]{1,255}$")
-SYSTEM_DATABASES = {"master", "model", "msdb", "tempdb"}
-# Azure's statuses for a database a login can open (a paused serverless one resumes on connecting); a database with
-# no status is kept. Creating, restoring, offline, stopped and the like are left out, as master leaves out a
-# database that isn't ONLINE.
-READABLE_STATUSES = {"online", "paused", "pausing", "resuming", "scaling", "autoclosed",
-                     "onlinechangingdwperformancetiers", "updating"}
-
-
-def azure_errors(spec: dict) -> List[str]:
-    """Why a spec's listing through Azure can't be used, or nothing: it takes both a service credential and the
-    server's resource id, or neither."""
-    credential, resource = spec.get("azure_credential"), spec.get("azure_resource_id")
-    if not credential and not resource:
-        return []
-    if not (credential and resource):
-        return ["listing through Azure needs both azure_credential (a Unity Catalog service credential) and "
-                "azure_resource_id (the server's resource id)"]
-    errors = []
-    if not CREDENTIAL.match(credential):
-        errors.append(f"azure_credential {credential!r}: use letters, digits, _ and - only")
-    if not AZURE_RESOURCE.match(resource):
-        errors.append(f"azure_resource_id {resource!r}: expected /subscriptions/<id>/resourceGroups/<group>/providers/"
-                      "Microsoft.Sql/servers/<server> (or managedInstances/<instance>)")
-    return errors
-
-
-def lists_through_azure(spec: dict) -> bool:
-    """Whether the spec's server is listed by Azure Resource Manager rather than through master."""
-    return bool(spec.get("azure_credential") and spec.get("azure_resource_id"))
-
-
-def like(pattern: str) -> "re.Pattern[str]":
-    """A database name filter as SQL Server's LIKE reads it, for the names Azure lists: % any run of characters, _ any
-    one, [ ] a set or a range. Case-insensitive, as a server's default collation is."""
-    out, i = [], 0
-    while i < len(pattern):
-        c = pattern[i]
-        end = pattern.find("]", i + 2) if c == "[" else -1
-        if c == "%":
-            out.append(".*")
-        elif c == "_":
-            out.append(".")
-        elif end > 0:
-            out.append("[" + pattern[i + 1:end].replace("[", r"\[") + "]")
-            i = end
-        else:
-            out.append(re.escape(c))
-        i += 1
-    try:
-        return re.compile("^" + "".join(out) + "$", re.IGNORECASE | re.DOTALL)
-    except re.error as e:
-        raise ValueError(f"database filter {pattern!r}: {e}") from e
-
-
-def _arm_get(url: str, token: str) -> dict:
-    """One page of an Azure Resource Manager list."""
-    import urllib.request
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return json.loads(response.read())
-
-
-def _arm_refusal(error, resource: str) -> str:
-    """What Azure's refusal means: its status and error code, with the fix for the usual ones."""
-    try:
-        detail = json.loads(error.read() or b"{}").get("error") or {}
-    except Exception:
-        detail = {}
-    said = f"HTTP {error.code}" + (f" {detail['code']}" if detail.get("code") else "")
-    fix = {401: "Azure refused the service credential's token",
-           403: "give the service credential's managed identity (its access connector's) Reader on the server",
-           404: "check the server's resource id"}.get(error.code, str(detail.get("message") or "").split("\n")[0][:200])
-    return f"Azure refused to list the databases of {resource} ({said})" + (f": {fix}" if fix else "")
-
-
-def azure_databases(spec: dict, credential, get=None, sleep=None) -> List[str]:
-    """The server's databases as Azure Resource Manager lists them, page by page, with the system databases and those
-    that can't be opened left out, matching spec's "pattern" if it has one. credential is the Unity Catalog service
-    credential's provider (dbutils.credentials.getServiceCredentialsProvider), which gives the token."""
-    import time
-    import urllib.error
-    get, sleep = get or _arm_get, sleep or time.sleep
-    resource = spec["azure_resource_id"]
-    match = like(spec.get("pattern") or "%")
-    url, names = f"{ARM}{resource}/databases?api-version={ARM_API_VERSION}", []
-    while url:
-        for attempt in range(ARM_RETRIES + 1):
-            try:
-                page = get(url, credential.get_token(ARM_SCOPE).token)
-                break
-            except urllib.error.HTTPError as e:
-                if attempt == ARM_RETRIES or e.code not in (429, 500, 502, 503, 504):
-                    raise RuntimeError(_arm_refusal(e, resource)) from e
-                # Azure's throttling says how long to wait; otherwise 5, 10 and 20 s.
-                sleep(min(float(e.headers.get("Retry-After") or 5 * 2 ** attempt), 60.0))
-        names += [str(item["name"]) for item in page.get("value") or []
-                  if str((item.get("properties") or {}).get("status") or "online").lower() in READABLE_STATUSES]
-        url = page.get("nextLink")
-        # The token goes only to Azure Resource Manager, whatever a page says comes next.
-        if url and not url.startswith(ARM + "/"):
-            raise RuntimeError(f"Azure's next page is outside {ARM}, so it isn't followed: {url[:200]}")
-    return sorted({n for n in names if n.lower() not in SYSTEM_DATABASES and match.match(n)},
-                  key=lambda n: (n.lower(), n))
 
 UNSUPPORTED_TYPES = {"geography", "geometry", "hierarchyid", "sql_variant"}
 PARTITION_TYPES = {"tinyint", "smallint", "int", "bigint", "decimal", "numeric",
@@ -308,7 +191,7 @@ def spec_errors(spec: dict) -> List[str]:
         errors.append("spec needs secret_key or secret_key_template with src_host")
     if spec.get("kind") != "list" and not spec.get("databases"):
         errors.append("spec needs databases: a list, or \"*\" for every database on the server")
-    return errors + pattern_errors(spec.get("pattern") or "") + azure_errors(spec)
+    return errors + pattern_errors(spec.get("pattern") or "")
 
 
 def _query(cfg: dict, sql: str, slots=None, sleep=None, rand=None) -> List[dict]:
@@ -342,16 +225,11 @@ def needs_listing(spec: dict) -> bool:
     return spec.get("kind") == "list" or spec.get("databases") == "*"
 
 
-def list_databases(spec: dict, query=None, credential=None, get=None) -> List[str]:
+def list_databases(spec: dict, query=None) -> List[str]:
     """The server's user databases, read through master and matching spec's "pattern" if it has one: what Test
-    connection shows, and what discovering a whole server ("databases": "*") reads. When the spec names a service
-    credential and the server's resource id, Azure lists them instead (azure_databases), with that credential."""
+    connection shows, and what discovering a whole server ("databases": "*") reads."""
     cfg = cfg_for(spec, SERVER_DATABASE)
     _sqlserver_only(cfg)
-    if lists_through_azure(spec):
-        if credential is None:
-            raise ValueError(f"listing through Azure needs the service credential '{spec['azure_credential']}'")
-        return azure_databases(spec, credential, get=get)
     names = [str(r["name"]) for r in (query or _query)(cfg, databases_sql(spec.get("pattern") or ""))]
     return sorted(names, key=lambda n: (n.lower(), n))
 
@@ -386,12 +264,12 @@ def secret_key_for(spec: dict, database: str) -> str:
     return tpl.replace("{database}", database) if tpl else spec.get("secret_key")
 
 
-LISTING_KEYS = ("pattern", "azure_credential", "azure_resource_id", "secret_key_template", "jdbc_connection")
+LISTING_KEYS = ("pattern", "secret_key_template", "jdbc_connection")
 
 
 def listing_of(spec: dict) -> dict:
     """How the spec listed its databases, kept on each of its discovery rows so a later re-discovery of the same
-    selection reads the same way: the LIKE pattern, the Azure resource and its credential, the secret template,
-    and the name of the JDBC connection it was made through. Only the keys the spec has (the secret itself is
+    selection reads the same way: the LIKE pattern, the secret template, and the name of the JDBC connection it was
+    made through. Only the keys the spec has (the secret itself is
     never kept), so an empty dict means none of them."""
     return {key: spec[key] for key in LISTING_KEYS if str(spec.get(key) or "").strip()}
