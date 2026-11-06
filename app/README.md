@@ -372,8 +372,10 @@ A job with no record, every job made before it, is Ready.
 **Groups and their databases.** A job's groups are sized by its tables per group (10,000 by default): each server
 gets one group for about that many of its tables, and its databases are spread so the groups hold about the same number
 of tables. A database that fits goes whole into one group. A database with more tables than a group holds (with the
-same small remainder a server's groups allow) is spread by the app over as many of its server's groups as it needs, its
-tables cut in name order into parts that differ by at most one table. A database can also be split by hand: an edit, an
+same small remainder a server's groups allow) is spread by the app over as many of its server's groups as it needs,
+the ones holding the fewest tables, its tables cut in name order into parts sized to the room in each group: the
+lightest group takes the biggest part, so the groups end as level as the rule allows, and a group already above the
+level takes no part. Databases are placed biggest first. A database can also be split by hand: an edit, an
 add or a registration that leaves one database's tables in more than one group is written, and its answer warns once,
 naming the database, its groups and the live jobs holding them. A later write to a database that is split already says
 nothing; the job page's tree marks every split database. A split

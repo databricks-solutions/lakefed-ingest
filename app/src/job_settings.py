@@ -434,23 +434,20 @@ def plan_databases(job_rows: List[dict], entries: List[dict], job_name: str, gro
                                          "pattern; add this database by Import CSV, with its secret")
                     continue
                 reach["secret_key"] = render(secrets, {**source, "src_database": e["database"]})
-            if lightest.parts(key[0], len(models)) > 1:
-                groups_now = lightest.spread(key[0], e["database"], len(models))
-            else:
-                groups_now = [lightest.place(key[0], e["database"], len(models))]
+            groups_now = lightest.spread(key[0], e["database"], len(models))
         else:
             reach = {"src_connection": e["server"], "use_remote_query": True, "src_host": None, "src_port": None,
                      "secret_key": None}
             place = new_spread.get(key[0], {}).get(str(e["database"]).lower(), 0)
-            groups_now = [f"{q.identifier(job_name)}_{q.identifier(e['server'])}_c{index + 1:02d}"
-                          for index in placement.indexes(place)]
-            new_groups.update(groups_now)
+            groups_now = placement.as_spread(placement.named(
+                place, lambda index: f"{q.identifier(job_name)}_{q.identifier(e['server'])}_c{index + 1:02d}"))
+            new_groups.update(groups_now.groups)
         planned = []
         # A database with more tables than a group holds is spread: each table to one of its groups by its place among
-        # the job's tables in name order (placement.part_of).
+        # the job's tables in name order (placement.Spread.group_for).
         for ordinal, model_key in enumerate(sorted(models)):
             model = models[model_key]
-            group = groups_now[placement.part_of(ordinal, len(models), len(groups_now))]
+            group = groups_now.group_for(ordinal, len(models))
             row = {f: model.get(f) for f in _TABLE_COPY}
             row.update(reach, src_database=e["database"], task_collection=group, task_enabled=e["enabled"])
             if not row.get("src_type"):

@@ -73,15 +73,14 @@ def groups_by_server(servers: List[dict], groups_per_server: placement.Groups = 
 
 
 def group_of_placement(job_name: str, placements: Dict[str, Dict[str, placement.Place]]
-                       ) -> Callable[[str, str], Union[str, List[str]]]:
+                       ) -> Callable[[str, str], Union[str, placement.Spread]]:
     """Where a new job's database goes, from its even placement (placement.server_placements over the selection's
-    databases): its server's group with that index, or for a database spread over several groups their names, its
-    first part first (new_job.plan puts each table in one of them)."""
-    def group_of(server: str, database: str) -> Union[str, List[str]]:
+    databases): its server's group with that index, or for a database spread over several groups a Spread of their
+    names with the tables each takes (new_job.plan puts each table in one of them)."""
+    def group_of(server: str, database: str) -> Union[str, placement.Spread]:
         place = placements.get(server, {}).get(str(database or "").lower(), 0)
-        names = [f"{nj.q.identifier(job_name)}_{nj.q.identifier(server)}_c{index + 1:02d}"
-                 for index in placement.indexes(place)]
-        return names[0] if len(names) == 1 else names
+        return placement.named(
+            place, lambda index: f"{nj.q.identifier(job_name)}_{nj.q.identifier(server)}_c{index + 1:02d}")
     return group_of
 
 

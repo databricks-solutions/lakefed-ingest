@@ -725,7 +725,8 @@ export function TablesPerGroup({ value, onChange, saved }: { value: number | nul
   return (
     <label><span>Tables per group<Info label="About tables per group">Each server's databases are split into groups of about this many
       tables, spread evenly; a group runs on its own cluster. A database that fits goes whole into one group, and a bigger one
-      is spread over as many groups as it needs, each group loading its own part.</Info>
+      is spread over as many groups as it needs, the ones holding the fewest tables, each group loading a part sized to its
+      room.</Info>
       {Number(text) !== DEFAULT_TABLES_PER_GROUP && <button className="ghost link reset"
         onClick={() => commit(String(DEFAULT_TABLES_PER_GROUP))}>Reset</button>}</span>
       <input type="number" min={MIN_TABLES_PER_GROUP} max={MAX_TABLES_PER_GROUP} step={100} value={text}

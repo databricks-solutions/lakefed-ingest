@@ -67,13 +67,13 @@ def settings_of(given: dict, new_job: bool = False) -> dict:
 
 
 def _placer(job_name: str, lines: List[dict], groups_per_server: placement.Groups,
-            group_of: Optional[Callable[[str, str], Union[str, List[str], None]]],
+            group_of: Optional[Callable[[str, str], Union[str, placement.Spread, None]]],
             join: Optional[placement.Lightest] = None) -> Callable[[str, str, tuple], str]:
-    """Where each line's table goes: its database's group if the job has it already (group_of; a list of groups for a
-    database spread over several, placement.even); the lightest group of its server if the job has that server (join);
+    """Where each line's table goes: its database's group if the job has it already (group_of; a placement.Spread for a
+    database spread over several groups); the lightest group of its server if the job has that server (join);
     else an even placement over its server's new groups, by the tables the file gives each database. A database with
     more tables than a group holds goes to several groups, each table to one of them by its place among the database's
-    tables in name order (placement.part_of), so a resumed write places every table again the same way."""
+    tables in name order (placement.Spread.group_for), so a resumed write places every table again the same way."""
     known = group_of or (lambda server, database: None)
     sizes: Dict[tuple, int] = {}
     tables_of: Dict[tuple, set] = {}
@@ -95,7 +95,7 @@ def _placer(job_name: str, lines: List[dict], groups_per_server: placement.Group
     def name(server: str, index: int) -> str:
         return f"{q.identifier(job_name)}_{q.identifier(server)}_c{index + 1:02d}"
 
-    def database_groups(server: str, database: str) -> Union[str, List[str]]:
+    def database_groups(server: str, database: str) -> Union[str, placement.Spread]:
         existing = known(server, database)
         if existing is not None:
             return existing
@@ -104,16 +104,14 @@ def _placer(job_name: str, lines: List[dict], groups_per_server: placement.Group
             if join.parts(server, tables) > 1:
                 return join.spread(server, database, tables)
             return join.place(server, database)
-        return [name(server, index) for index in placement.indexes(placements.get(server, {}).get(database.lower(), 0))]
+        return placement.named(placements.get(server, {}).get(database.lower(), 0), lambda index: name(server, index))
 
     def place(server: str, database: str, table: tuple = ("", "")) -> str:
         groups = database_groups(server, database)
         if isinstance(groups, str):
             return groups
-        if len(groups) == 1:
-            return groups[0]
         ordinal = ordinals.get((server, database.lower()), {})
-        return groups[placement.part_of(ordinal.get(table, 0), len(ordinal), len(groups))]
+        return groups.group_for(ordinal.get(table, 0), len(ordinal))
     return place
 
 

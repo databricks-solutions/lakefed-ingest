@@ -3,6 +3,8 @@ database that fits whole, as before. Its tables are cut, in name order, into par
 each part into one of the groups with the fewest tables; the same tables always land the same way. Databases added to
 a job later do the same over their server's lightest groups, and a regroup moves a split database part by part.
 Plain: no database."""
+from typing import Dict
+
 import pytest
 
 import by_database
@@ -43,10 +45,28 @@ def test_a_database_needs_as_many_groups_as_its_tables_with_no_group_for_a_small
     assert placement.parts_for(25_000, None, 5) == 1              # sized by a number of groups: whole
 
 
-def test_a_database_is_cut_into_parts_that_differ_by_at_most_one_table():
-    assert placement.part_sizes(10, 3) == [4, 3, 3]
-    assert placement.part_sizes(25_001, 3) == [8_334, 8_334, 8_333]
-    assert [placement.part_of(n, 10, 3) for n in range(10)] == [0, 0, 0, 0, 1, 1, 1, 2, 2, 2]
+def test_a_database_is_cut_into_parts_sized_to_the_room_in_its_groups():
+    assert placement.room_shares([0, 0, 0], 10) == [4, 3, 3]               # equal groups: parts differ by one table
+    assert placement.room_shares([0, 0, 0], 25_001) == [8_334, 8_334, 8_333]
+    assert placement.room_shares([0, 7_500], 12_000) == [9_750, 2_250]      # the emptier group takes more
+    assert placement.room_shares([20, 6, 4], 30) == [0, 14, 16]            # a group above the level takes none
+    assert placement.room_shares([5, 0], 3) == [0, 3]
+    assert placement.room_shares([3, 1], 3) == [0, 3]                      # the level is 3.5: the lighter takes the odd one
+    assert placement.room_shares([4], 7) == [7]
+
+
+def test_a_table_goes_to_the_part_its_place_in_name_order_falls_in():
+    spread = placement.Spread(groups=("a", "b", "c"), shares=(4, 3, 3))
+    assert [spread.group_for(n, 10) for n in range(10)] == list("aaaabbbccc")
+    unequal = placement.Spread(groups=("a", "b"), shares=(2_250, 9_750))
+    assert [unequal.group_for(n, 12_000) for n in (0, 2_249, 2_250, 11_999)] == ["a", "a", "b", "b"]
+
+
+def test_a_database_with_other_tables_than_it_was_placed_for_is_cut_in_the_same_proportions():
+    spread = placement.Spread(groups=("a", "b"), shares=(1, 3))
+    assert [spread.group_for(n, 8) for n in range(8)] == list("aabbbbbb")
+    assert [spread.group_for(n, 2) for n in range(2)] == ["a", "b"]
+    assert placement.Spread(groups=("only",), shares=(5,)).group_for(3, 99) == "only"
 
 
 def test_databases_that_fit_are_placed_exactly_as_before():
@@ -56,11 +76,43 @@ def test_databases_that_fit_are_placed_exactly_as_before():
 
 def test_a_database_bigger_than_a_group_is_spread_over_the_lightest_groups_and_the_rest_stay_whole():
     spread = placement.even([("huge", 250), ("a", 60), ("b", 40), ("c", 30)], 4, per_group=100)
-    assert spread["huge"] == (0, 1, 2)                       # 250 tables at 100 a group: three parts of 84, 83, 83
+    assert spread["huge"] == placement.Spread(groups=(0, 1, 2), shares=(84, 83, 83))   # 250 tables at 100 a group
     assert {spread[name] for name in ("a", "b", "c")} <= {0, 1, 2, 3}
     assert all(isinstance(spread[name], int) for name in ("a", "b", "c"))
     assert spread["a"] == 3                                  # the empty group takes the next biggest whole
     assert placement.indexes(spread["huge"]) == (0, 1, 2) and placement.indexes(spread["a"]) == (3,)
+
+
+def _loads(placements: Dict[str, object], tables: Dict[str, int], groups: int):
+    """What each group holds when every database goes where ``placements`` (placement.even) says."""
+    loads = [0] * groups
+    for name, place in placements.items():
+        if isinstance(place, placement.Spread):
+            for index, share in zip(place.groups, place.shares):
+                loads[index] += share
+        else:
+            loads[place] += tables[name]
+    return loads
+
+
+def test_a_server_of_30500_tables_ends_with_its_groups_level_and_not_at_13500_8000_9000():
+    tables = {"sales": 15_000, "orders": 12_000, "billing": 3_000, "hr": 500}
+    spread = placement.even(list(tables.items()), 3, per_group=10_000)
+    assert spread["sales"] == placement.Spread(groups=(0, 1), shares=(7_500, 7_500))
+    assert spread["orders"] == placement.Spread(groups=(0, 2), shares=(2_250, 9_750))     # the room left, not 6,000 each
+    assert (spread["billing"], spread["hr"]) == (1, 0)
+    assert _loads(spread, tables, 3) == [10_250, 10_500, 9_750]
+
+
+def test_the_groups_end_level_to_within_the_smallest_database_left_whole():
+    tables = {f"db{n}": size for n, size in enumerate((25_000, 18_000, 700, 300))}
+    loads = _loads(placement.even(list(tables.items()), 5, per_group=10_000), tables, 5)
+    assert sum(loads) == sum(tables.values()) and max(loads) - min(loads) <= 700
+
+
+def test_a_database_that_fits_still_goes_whole_into_the_group_with_the_fewest_tables():
+    spread = placement.even([("huge", 250), ("a", 60), ("b", 40), ("c", 30)], 4, per_group=100)
+    assert (spread["a"], spread["b"], spread["c"]) == (3, 3, 1)       # after the huge one: 84, 83, 83 and 0
 
 
 def test_a_new_jobs_big_database_has_each_table_in_one_group_and_its_groups_even():
@@ -70,6 +122,18 @@ def test_a_new_jobs_big_database_has_each_table_in_one_group_and_its_groups_even
     assert sorted(groups["huge"].values()) == [83, 83, 84] and len(groups["small"]) == 1
     assert sum(groups["huge"].values()) == 250 and len(plan["lines"]) == 270
     assert sorted(plan["groups"]) == ["job_sql_a_c01", "job_sql_a_c02", "job_sql_a_c03"]
+
+
+def test_a_new_jobs_groups_end_level_and_each_part_holds_the_tables_its_group_has_room_for():
+    plan = nj.plan("Job", _file(("sales", 150), ("orders", 120), ("billing", 30), ("hr", 5)), SETTINGS,
+                   placement.TablesPerGroup(100))
+    assert plan["errors"] == []
+    totals = {}
+    for line in plan["lines"]:
+        totals[line["group"]] = totals.get(line["group"], 0) + 1
+    assert totals == {"job_sql_a_c01": 102, "job_sql_a_c02": 105, "job_sql_a_c03": 98}
+    orders = {line["row"]["src_table"]: line["group"] for line in plan["lines"] if line["row"]["src_database"] == "orders"}
+    assert [orders[f"t{n:04d}"] for n in (1, 22, 23, 120)] == ["job_sql_a_c01", "job_sql_a_c01", "job_sql_a_c03", "job_sql_a_c03"]
 
 
 def test_a_big_databases_tables_go_to_its_groups_in_name_order_whatever_the_file_order():
@@ -91,19 +155,28 @@ def test_a_job_sized_by_a_number_of_groups_keeps_its_big_database_whole():
 def test_the_by_database_create_gives_a_big_database_its_groups():
     placements = placement.server_placements([("sql_a", "huge", 250), ("sql_a", "small", 20)], {"sql_a": 3}, 100)
     group_of = by_database.group_of_placement("Job", placements)
-    assert group_of("sql_a", "HUGE") == ["job_sql_a_c01", "job_sql_a_c02", "job_sql_a_c03"]
+    assert group_of("sql_a", "HUGE") == placement.Spread(groups=("job_sql_a_c01", "job_sql_a_c02", "job_sql_a_c03"),
+                                                         shares=(84, 83, 83))
     assert isinstance(group_of("sql_a", "small"), str)
 
 
 def test_a_big_database_added_later_spreads_over_its_servers_lightest_groups_and_nothing_placed_moves():
     join = placement.Lightest({"sql_a": {"g1": 50, "g2": 10, "g3": 20}}, per_group=100)
     assert join.parts("sql_a", 90) == 1 and join.parts("sql_a", 250) == 3
-    assert join.spread("sql_a", "huge", 250) == ["g1", "g2", "g3"]
-    assert join.spread("sql_a", "HUGE", 250) == ["g1", "g2", "g3"]          # spread already: it keeps its groups
+    huge = placement.Spread(groups=("g1", "g2", "g3"), shares=(60, 100, 90))      # all three end at 110
+    assert join.spread("sql_a", "huge", 250) == huge
+    assert join.spread("sql_a", "HUGE", 250) == huge                              # spread already: it keeps its groups
     join = placement.Lightest({"sql_a": {"g1": 50, "g2": 10, "g3": 20}}, per_group=100)
-    assert join.spread("sql_a", "big", 150) == ["g2", "g3"]                  # two parts, into the two lightest
-    assert join.place("sql_a", "next", 1) == "g1"                            # 50 against 10 + 75 and 20 + 75
+    assert join.spread("sql_a", "big", 150) == placement.Spread(groups=("g2", "g3"), shares=(80, 70))   # the two lightest
+    assert join.place("sql_a", "next", 1) == "g1"                            # 50 against 90 and 90
     assert placement.Lightest({"sql_a": {"g1": 1}}).spread("sql_b", "x", 5) is None
+
+
+def test_a_group_already_above_the_level_takes_no_part_of_a_database_added_later():
+    join = placement.Lightest({"sql_a": {"g1": 500, "g2": 0, "g3": 0}}, per_group=100)
+    assert join.spread("sql_a", "huge", 250) == placement.Spread(groups=("g2", "g3"), shares=(125, 125))
+    join = placement.Lightest({"sql_a": {"g1": 500, "g2": 0}}, per_group=100)
+    assert join.spread("sql_a", "huge", 150) == placement.Spread(groups=("g2",), shares=(150,))    # all in the one that has room
 
 
 def test_tables_added_to_a_job_put_a_big_new_database_over_its_lightest_groups():
@@ -116,6 +189,20 @@ def test_tables_added_to_a_job_put_a_big_new_database_over_its_lightest_groups()
     plan = nj.plan_for_job("Job", _file(("huge", 250)), "ct", job_rows, placement.TablesPerGroup(100))
     assert plan["errors"] == [] and plan["new_groups"] == []
     assert sorted(_groups_of(plan)["huge"].values()) == [83, 83, 84]
+
+
+def test_tables_added_to_a_job_whose_groups_differ_are_sized_to_the_room_in_each():
+    held = {"job_sql_a_c01": 60, "job_sql_a_c02": 10, "job_sql_a_c03": 20}
+    job_rows = [{"id": n, "task_collection": group, "src_connection": "sql_a", "use_remote_query": True,
+                 "src_host": None, "src_port": None, "src_type": "sqlserver", "src_database": "old",
+                 "src_schema": "dbo", "src_table": f"{group}_{n:03d}", "select_list": "id", "primary_key": "id",
+                 "load_type": "ct", "write_mode": "merge", "sink_catalog": "main", "sink_schema": "s",
+                 "sink_table": f"{group}_{n:03d}", "client_id": "old", "client_attrs": None,
+                 "freshness_sla_minutes": None}
+                for group, tables in held.items() for n in range(tables)]
+    plan = nj.plan_for_job("Job", _file(("huge", 250)), "ct", job_rows, placement.TablesPerGroup(100))
+    assert plan["errors"] == []
+    assert _groups_of(plan)["huge"] == {"job_sql_a_c01": 53, "job_sql_a_c02": 104, "job_sql_a_c03": 93}     # all three end at 113 or 114
 
 
 @pytest.fixture
