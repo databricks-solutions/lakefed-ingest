@@ -114,6 +114,47 @@ Delivery is at-least-once (checkpoint advances post-commit) and the MERGE is ide
 no gaps and no duplicates. An append sink is not idempotent; how it avoids duplicates is under
 [Append sinks](#append-sinks-optional).
 
+## Text keys compare like the source
+
+SQL Server compares a text key by its column's collation: usually case-insensitively (`abc` and `ABC` are
+the same key), and always ignoring trailing spaces. Delta compares strings exactly. So a sink's text key
+columns get the Databricks collation that compares like the source's, and every MERGE matches under it:
+
+| SQL Server key collation | Sink key collation |
+|---|---|
+| case-insensitive, accent-sensitive (`*_CI_AS`, the default) | `UTF8_LCASE_RTRIM` |
+| case- and accent-insensitive (`*_CI_AI`) | `UNICODE_CI_AI_RTRIM` |
+| case-sensitive or binary (`*_CS_*`, `*_BIN*`) | `UTF8_BINARY_RTRIM` |
+
+Without it, a key whose case changes at the source (`abc` updated to `ABC`) would arrive under its new
+spelling and land as a second row. The collation is set when a table is seeded. A table seeded before it
+existed is checked once, on its next write: the sink's key columns are altered in place (a metadata
+change, followed by a one-time recompute of the sink's file statistics so key filters skip files again),
+and a table whose sink already holds a key under two spellings is reseeded (reason
+`key_collation`). Change Tracking reports a case-only key change under the old spelling, so the sink row
+takes the new spelling when that row next changes; it's one row throughout. Queries and joins on those
+columns compare like the source too (`WHERE id = 'abc'` finds `ABC`). Combining one with a plain string
+column in a `UNION`, or comparing the two, needs an explicit collation on one side, e.g.
+`CAST(id AS STRING COLLATE UTF8_BINARY)`. Sources other than SQL Server
+keep exact keys for now. Kana and width sensitivity (`_KS`, `_WS`) are not mapped.
+
+The source's collation is read once per table, so three cases need care:
+
+- **A collation changed at the source later** (an `ALTER ... COLLATE` on the source column) is not applied to the
+  sink, not even by a reseed. Case-insensitive to case-sensitive would treat keys that now differ only by case as one
+  key; the reverse brings the duplicate rows back. After such a change, drop the sink table: the next run finds it
+  missing and reseeds it under the new collation (for a shared sink, every database that writes it reseeds).
+- **A shared sink** takes the key collation of the first database that writes it. Keep databases whose key
+  collations differ (for example, a case-sensitive one among case-insensitive ones) in separate sinks: under the
+  first one's collation, keys that differ only by case would be matched as one.
+- **The first sweep after upgrading** to this version is a one-time heavier pass: one source query per existing
+  table, plus the column change and a statistics recompute for each sink not yet collated.
+
+Comparing under a collation costs more CPU per row than an exact comparison. A MERGE into a shared sink
+reads only its database's files (the `__client_id__` filter is exact), so this barely shows there; a MERGE
+into a large dedicated sink that scans the whole table took about twice as long in a test (160 million
+rows).
+
 ## Cursor (watermark) tables
 
 For tables without Change Tracking, `load_type = 'cursor'` follows a monotonically increasing

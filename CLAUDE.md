@@ -74,7 +74,8 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   CHECK constraints enforce valid combos; a unique index allows one row per (sink, client_id).
 - `checkpoint` — generic: `strategy` + `position` (text; CT version for `ct`, JSON {col,type,value} for
   `cursor`), phase (`seeding → incremental` for ct and cursor, `loaded` for full), status, freshness,
-  `ct_begin_version`, `pending_position`/`pending_run_id` (an append in flight). `reseed_queue` (ct, cursor).
+  `ct_begin_version`, `pending_position`/`pending_run_id` (an append in flight), `key_collation` (the collation
+  the sink's text keys were set to; NULL = not checked yet). `reseed_queue` (ct, cursor).
 - `database_check`: one stamp per (collection, source database) found unchanged as a whole (CT version,
   time), in place of each table's `last_success_at`; `planner.stamp_vouches` says which tables it covers.
 - `check_work`: the check job's work list: the databases with work per (work_id, collection).
@@ -239,6 +240,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   overwrite via `insert_overwrite_sql(..., cfg)` (REPLACE WHERE client_id) or, in append mode, append
   (`_write_snapshot` / `_insert_into`), stage via `staging_table_name(sink, cfg)`. Wrap writes in
   `with_write_retry` (Delta conflict retry, exponential backoff).
+- Text keys compare like the source's collation (SQL Server: usually case-insensitive): sink key columns carry
+  `ct_engine.databricks_collation`'s collation, and every MERGE builds its ON / SET with the sink's
+  `sink_key_collations` (`merge_on`, `merge_set`, run through `merge_collated`). Never compare keys exactly.
 
 ## Job orchestration version (`job_orchestration/`)
 

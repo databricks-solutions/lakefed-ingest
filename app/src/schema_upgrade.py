@@ -21,7 +21,7 @@ import queries as q
 
 # The schema version this app's code expects; tests/schema_upgrade_test.py pins it to the engine's
 # state_store.SCHEMA_VERSION, so the two can't drift.
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 # The upgrade's own advisory lock, two int keys in a class of its own (not the poller's, a collection's or the
 # migration's, state_store.SCHEMA_LOCK).
 UPGRADE_LOCK = (0x6C667375, 0)
