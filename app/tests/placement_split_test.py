@@ -1,6 +1,6 @@
 """The app spreads a database too big for one group over several groups by itself (placement.py), and keeps every
-database that fits whole, as before. Its tables are cut, in name order, into parts that differ by at most one table,
-each part into one of the groups with the fewest tables; the same tables always land the same way. Databases added to
+database that fits whole, as before. Its tables are cut, in name order, into parts sized to the room in the groups with
+the fewest tables, so the groups end level; the same tables always land the same way. Databases added to
 a job later do the same over their server's lightest groups, and a regroup moves a split database part by part.
 Plain: no database."""
 from typing import Dict

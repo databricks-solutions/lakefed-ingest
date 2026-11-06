@@ -1,6 +1,6 @@
 """A new job whose database is bigger than a group, created through the API against Postgres as the app's own role:
-the app spreads the database over the groups it needs, each table written once, the parts even, and the Create's
-answer warns that the database is split (placement_split_test.py has the placement itself).
+the app spreads the database over the groups it needs, each table written once, the parts sized to the room in each
+group, and the Create's answer warns that the database is split (placement_split_test.py has the placement itself).
 
 Skipped unless LAKEFED_APP_TEST_PG names a Postgres server (see app_role_pg_test.py)."""
 import os
@@ -34,3 +34,21 @@ def test_creating_a_job_spreads_a_database_bigger_than_a_group_and_warns_about_i
     [warning] = answer["warnings"]
     assert [item["database"] for item in warning["databases"]] == ["huge"]
     assert len(warning["databases"][0]["groups"]) == 3
+
+
+def test_creating_a_job_with_two_databases_bigger_than_a_group_leaves_its_groups_level(client):
+    sizes = (("sales", 150), ("orders", 120), ("billing", 30), ("hr", 5))
+    csv = HEAD + "".join(f'sql_a,{name},dbo,t{t:04d},"id",id\n' for name, tables in sizes
+                         for t in range(1, tables + 1))
+    made = client.post("/api/ingestion-jobs", json={"name": "Level", "settings": SETTINGS, "csv": csv,
+                                                    "tables_per_group": 100, "dry_run": False, "request_id": "level-1"})
+    assert made.status_code in (200, 202), made.text
+    if "task" in made.json():
+        client.get(f"/api/tasks/{made.json()['task']['id']}")
+    groups = client.sql("select task_collection, count(*) from lakefed_ingest.control group by 1 order by 1")
+    assert [n for _, n in groups] == [102, 105, 98]
+    orders = client.sql("select task_collection, count(*) from lakefed_ingest.control where src_database = 'orders' "
+                        "group by 1 order by 1")
+    assert [n for _, n in orders] == [22, 98]            # 22 where 98 tables of the other databases leave room
+    assert client.sql("select count(*), count(distinct (src_database, src_table)) from lakefed_ingest.control") == \
+        [(305, 305)]
