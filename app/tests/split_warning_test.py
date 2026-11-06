@@ -59,6 +59,24 @@ def test_a_split_comes_back_as_a_warning_not_a_refusal(monkeypatch):
                          "databases": [{"database": "sales_01", "groups": ["lfc_a", "lfc_b"]}], "jobs": []}]
 
 
+def test_a_database_split_before_the_write_is_no_warning_and_the_others_still_are(monkeypatch):
+    monkeypatch.setattr(q, "database_key", lambda row: row["src_database"])
+    split = [("k1", "sales_01", ["lfc_a", "lfc_b"]), ("k2", "hr_01", ["lfc_a", "lfc_c"])]
+    rows = [{"src_database": "sales_01"}, {"src_database": "hr_01"}]
+    [warning] = main._split_database_warnings(FakeCursor(split), rows, already_split={"k1"})
+    assert warning["databases"] == [{"database": "hr_01", "groups": ["lfc_a", "lfc_c"]}]
+    assert "sales_01" not in warning["message"]
+    assert main._split_database_warnings(FakeCursor(split), rows, already_split={"k1", "k2"}) == []
+
+
+def test_the_databases_split_before_a_write_are_the_keys_the_split_check_finds(monkeypatch):
+    monkeypatch.setattr(q, "database_key", lambda row: row["src_database"])
+    cursor = FakeCursor([("k1", "sales_01", ["lfc_a", "lfc_b"])])
+    assert main._split_database_keys(cursor, [{"src_database": "sales_01"}]) == {"k1"}
+    assert cursor.statements == [q.split_databases_sql()]
+    assert main._split_database_keys(FakeCursor([]), []) == set()
+
+
 def test_the_warning_names_the_live_jobs_holding_its_groups_and_gives_their_ids(monkeypatch):
     monkeypatch.setattr(q, "database_key", lambda row: row["src_database"])
     cursor = FakeCursor([("k1", "sales_01", ["lfc_a", "lfc_b"])], jobs=[(7, "Sales"), (9, "Ops")])

@@ -41,6 +41,7 @@ class FakeCursor:
     """Just enough of a psycopg cursor for main.py's transactional paths."""
     def __init__(self, db):
         self.db, self.description, self._rows, self.rowcount = db, None, [], 0
+        db.wrote = False        # a cursor is one transaction: nothing is written in it yet
         self.connection = type("C", (), {"rollback": lambda s: db.rolled_back.append(True)})()
 
     def execute(self, sql, params=()):
@@ -61,6 +62,8 @@ class FakeCursor:
         if not row_of_batch:
             self.db.batch_rows.clear()
         self.db.statements.append((sql, params))
+        self.db.wrote = self.db.wrote or sql.startswith(("insert into lakefed_ingest.control (",
+                                                          "update lakefed_ingest.control set"))
         if "for update" in sql:
             ids = params[0]
             rows = [CONTROL[i] for i in sorted(ids) if i in CONTROL]
@@ -75,7 +78,8 @@ class FakeCursor:
             sinks = [f"{c}.{sc}.{t}" for c, sc, t in zip(*params)]
             self._rows = [(s,) for s in sinks if s in self.db.mixed]
         elif sql == q.split_databases_sql():
-            self._rows = [(k, k.split("\x1f")[1], ["c1", "c2"]) for k in params[0] if k in self.db.split]
+            split = self.db.split if self.db.wrote else self.db.split_before
+            self._rows = [(k, k.split("\x1f")[1], ["c1", "c2"]) for k in params[0] if k in split]
         elif sql.startswith("insert into lakefed_ingest.control ("):
             if self.db.unique_violation:
                 import psycopg
@@ -110,7 +114,9 @@ class FakeDB:
         self.statements, self.rolled_back, self.running, self.unique_violation = [], [], set(), False
         self.batch_rows = []        # what a batched insert's rows return, gathered row by row
         self.mixed = set()          # sinks the mixed-sink check reports
-        self.split = set()          # databases (q.database_key) the one-collection check reports split
+        self.split = set()          # databases (q.database_key) the one-collection check reports split once rows are written
+        self.split_before = set()   # the ones it reports before that, so already split when the write starts
+        self.wrote = False
 
     def of(self, prefix):
         return [p for sql, p in self.statements if sql.startswith(prefix)]
@@ -480,13 +486,33 @@ def test_tables_come_a_page_at_a_time_with_the_cursor_of_the_next(monkeypatch):
 def test_adding_a_table_that_puts_its_database_in_a_second_collection_is_written_with_a_warning(client):
     first = client.post("/api/tables", json=ROW)
     assert first.status_code == 200 and first.json()["warnings"] == []
-    assert client.db.of(q.split_databases_sql()) == [([q.database_key(ROW)],)]
+    assert client.db.of(q.split_databases_sql()) == [([q.database_key(ROW)],)] * 2     # asked before and after the write
     client.db.split = {q.database_key(ROW)}
     r = client.post("/api/tables", json=ROW)
     assert r.status_code == 200 and r.json()["id"]
     [warning] = r.json()["warnings"]
     assert warning["kind"] == "split_database" and warning["databases"] == [{"database": "db1", "groups": ["c1", "c2"]}]
     assert "db1" in warning["message"] and "c1, c2" in warning["message"]
+
+
+def test_a_write_to_a_database_that_was_split_before_it_is_no_warning(client):
+    client.db.split = client.db.split_before = {q.database_key(ROW)}
+    r = client.post("/api/tables", json=ROW)
+    assert r.status_code == 200 and r.json()["id"] and r.json()["warnings"] == []
+
+
+def test_the_split_is_looked_for_before_the_first_row_is_written(client):
+    client.post("/api/tables", json=ROW)
+    statements = [sql for sql, _ in client.db.statements]
+    check, write = statements.index(q.split_databases_sql()), statements.index(q.insert_control_sql())
+    assert check < write
+
+
+def test_editing_a_table_of_a_database_that_was_split_already_is_applied_with_no_warning(client):
+    client.db.split = client.db.split_before = {q.database_key(CONTROL[7])}
+    r = client.post("/api/tables/edit", json={"ids": [7], "changes": {"freshness_sla_minutes": 30}, "dry_run": False})
+    assert r.status_code == 200 and r.json()["summary"]["applied"] is True
+    assert r.json()["warnings"] == []
 
 
 def test_moving_some_of_a_databases_tables_to_another_collection_is_applied_with_a_warning(client):

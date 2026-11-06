@@ -22,7 +22,7 @@ import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Collection, Dict, Iterable, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -219,16 +219,30 @@ def _refuse_mixed_sinks(cur, rows):
                                  "a sink is either dedicated to one source table or shared by client_id")
 
 
-def _split_database_warnings(cur, rows) -> List[dict]:
-    """After writing control rows, in the same transaction: a warning, as a list of at most one, when a database they
-    belong to now has tables in more than one ingestion group. The write stands. A split database is checked and
-    loaded correctly (tests/split_database_test.py): each group asks it for changes to its own tables and loads only
-    those. What it costs is extra work on the source, which the warning names."""
+def _split_database_rows(cur, rows) -> list:
+    """The split-databases check (queries.split_databases_sql) over the databases of some control rows: a (key,
+    database, groups) row for each that has tables in more than one ingestion group now."""
     keys = sorted({q.database_key(r) for r in rows})
     if not keys:
         return []
     cur.execute(q.split_databases_sql(), (keys,))
-    split = cur.fetchall()
+    return cur.fetchall()
+
+
+def _split_database_keys(cur, rows) -> Set[str]:
+    """Before writing control rows, in the same transaction: the keys (queries.database_key) of the databases among
+    their rows' that already have tables in more than one ingestion group, which _split_database_warnings leaves out."""
+    return {row[0] for row in _split_database_rows(cur, rows)}
+
+
+def _split_database_warnings(cur, rows, already_split: Collection[str] = frozenset()) -> List[dict]:
+    """After writing control rows, in the same transaction: a warning, as a list of at most one, when a database they
+    belong to now has tables in more than one ingestion group and did not before the write (already_split, from
+    _split_database_keys). A later write to a database that is split already says nothing; the job page's tree marks
+    it. The write stands. A split database is checked and loaded correctly (tests/split_database_test.py): each group
+    asks it for changes to its own tables and loads only those. What it costs is extra work on the source, which the
+    warning names."""
+    split = [row for row in _split_database_rows(cur, rows) if row[0] not in already_split]
     if not split:
         return []
     cur.execute(q.clash_jobs_sql(), (sorted({group for row in split for group in row[2]}),))
@@ -419,6 +433,8 @@ def _apply_plans(cur, rows, plans, user, batch) -> List[dict]:
     _refuse_connection_edits(rows, plans, cur=cur, user=user)
     by_id = {r["id"]: r for r in rows}
     before = [(by_id[p["id"]]["task_collection"], by_id[p["id"]].get("src_database")) for p in plans]
+    edited = [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans]
+    already_split = _split_database_keys(cur, edited)
     for p in plans:
         if not p["changes"]:
             continue
@@ -431,10 +447,9 @@ def _apply_plans(cur, rows, plans, user, batch) -> List[dict]:
         if p["reseed"]:
             cur.execute(q.flip_to_seeding_sql(), (f"reseed after edit: {p['reseed']}", [p["id"]]))
             cur.execute(q.log_reseed_sql(), (f"edit:{p['reseed']}", [p["id"]]))
-    edited = [dict(by_id[p["id"]], **{f: v[1] for f, v in p["changes"].items()}) for p in plans]
     _rewrite_rollups(cur, before + [(row["task_collection"], row.get("src_database")) for row in edited])
     _refuse_mixed_sinks(cur, edited)
-    return _split_database_warnings(cur, edited)
+    return _split_database_warnings(cur, edited, already_split)
 
 
 def _locked_rows(cur, ids):
@@ -2497,6 +2512,7 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
                 _refuse_connection_rows(connection, plan["new"], cur=cur)
             else:
                 _refuse_host_reads(plan["new"], user, {})
+            already_split = _split_database_keys(cur, plan["new"])
             written = _insert_controls(cur, plan["new"], user, batch, skip_taken=True, progress=progress)
             off = [control_id for row, control_id in written if not row["task_enabled"]]
             if off:
@@ -2509,7 +2525,7 @@ def add_job_databases(job_id: int, body: JobDatabasesRequest, request: Request):
                     _log_lines(cur, [(user, "enable" if enabled else "disable", i, None, "task_enabled", not enabled,
                                       enabled, None, batch) for i in ids])
             _refuse_mixed_sinks(cur, plan["new"])
-            warnings = _split_database_warnings(cur, plan["new"])
+            warnings = _split_database_warnings(cur, plan["new"], already_split)
             if plan["new_groups"]:
                 _, members = _load_schedule(job_id, cur)
                 active = [m for m in members if m["removed_at"] is None]
@@ -2729,9 +2745,10 @@ def _write_planned_tables(cur, job: dict, plan: dict, user: str, batch: str, pro
         _refuse_connection_rows(connection, rows, cur=cur)
     else:
         _refuse_host_reads(rows, reader or user, {})
+    already_split = _split_database_keys(cur, rows)
     written = _insert_controls(cur, rows, user, batch, skip_taken=skip_taken, progress=progress)
     _refuse_mixed_sinks(cur, [row for row, _ in written])
-    warnings = _split_database_warnings(cur, [row for row, _ in written])
+    warnings = _split_database_warnings(cur, [row for row, _ in written], already_split)
     if plan["new_groups"]:
         _, members = _load_schedule(job_id, cur)
         active = [m for m in members if m["removed_at"] is None]
@@ -3157,11 +3174,12 @@ def add_table(row: dict, request: Request):
     _refuse_host_reads([row], _user(request))
     with _write() as cur:
         _lock_collections(cur, [row.get("task_collection")])
+        already_split = _split_database_keys(cur, [row])
         cur.execute(q.insert_control_sql(), q.control_params(row))
         new_id = cur.fetchone()[0]
         _rewrite_rollups(cur, [(row.get("task_collection"), row.get("src_database"))])
         _refuse_mixed_sinks(cur, [row])
-        warnings = _split_database_warnings(cur, [row])
+        warnings = _split_database_warnings(cur, [row], already_split)
         _log(cur, _user(request), "add", new_id, row.get("task_collection"))
         _touch(cur, _user(request), groups=[row.get("task_collection")])
     return {"id": new_id, "warnings": warnings}
@@ -4254,6 +4272,7 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
         batch = uuid.uuid4().hex[:12]
         with _write() as cur:
             _lock_collections(cur, [body.task_collection])
+            already_split = _split_database_keys(cur, [row for _, row in valid])
             for name, row in valid:
                 cur.execute(q.insert_control_if_absent_sql(), q.control_params(row))
                 res = cur.fetchone()
@@ -4264,7 +4283,7 @@ def register(discovery_id: str, body: RegisterRequest, request: Request):
                                 "errors": [] if res else ["sink already used by another control row"]})
             _rewrite_rollups(cur, [(row.get("task_collection"), row.get("src_database")) for _, row in valid])
             _refuse_mixed_sinks(cur, [row for _, row in valid])     # all or nothing, like an edit
-            warnings = _split_database_warnings(cur, [row for _, row in valid])
+            warnings = _split_database_warnings(cur, [row for _, row in valid], already_split)
             _touch(cur, _user(request), groups=[body.task_collection])
     else:
         results += [{"table": name, "status": "valid", "errors": []} for name, _ in valid]
@@ -4328,6 +4347,7 @@ def import_csv(body: ImportRequest, request: Request):
             adding = [line["row"] for line in plan["lines"] if line["status"] != "registered"]
             _refuse_rows_off_connections(adding, cur=cur)
             _refuse_host_reads(adding, _user(request))
+            already_split = _split_database_keys(cur, adding)
             for line in plan["lines"]:
                 if line["status"] == "registered":
                     line["status"] = "skipped"
@@ -4343,7 +4363,7 @@ def import_csv(body: ImportRequest, request: Request):
             imported = [line["row"] for line in plan["lines"] if line["status"] == "imported"]
             _rewrite_rollups(cur, [(row.get("task_collection"), row.get("src_database")) for row in imported])
             _refuse_mixed_sinks(cur, imported)
-            warnings = _split_database_warnings(cur, imported)
+            warnings = _split_database_warnings(cur, imported, already_split)
             _touch(cur, _user(request), groups=[group])
     return {"task_collection": group, "settings": plan["settings"], "counts": counted(plan["lines"]),
             "lines": [{k: v for k, v in line.items() if k != "row"} for line in plan["lines"]], "warnings": warnings}
@@ -4744,9 +4764,10 @@ def _write_chunk(cur, plans: List[dict], job: ChunkJob, state: dict) -> List[dic
             job.check(cur, todo)
         else:
             _refuse_job_rows(todo, job.connection, job.user, cur=cur)
+        already_split = _split_database_keys(cur, todo)
         _insert_controls(cur, todo, job.user, job.batch, log_per_statement=by_database.TABLES_PER_TRANSACTION)
         _refuse_mixed_sinks(cur, todo)
-        warnings = _split_database_warnings(cur, todo)
+        warnings = _split_database_warnings(cur, todo, already_split)
     else:
         warnings = []
     if groups:
@@ -5257,9 +5278,10 @@ def _create_job(body: NewJobRequest, request: Request, inline: bool = False, pro
                                                       run.job_variant or "default", run.stagger, run.paused,
                                                       run.notify_emails or None, json.dumps(stored), user or None))
                 sid = cur.fetchone()[0]
+                already_split = _split_database_keys(cur, rows)
                 _insert_controls(cur, rows, user, batch, progress=progress)
                 _refuse_mixed_sinks(cur, rows)
-                warnings = _split_database_warnings(cur, rows)
+                warnings = _split_database_warnings(cur, rows, already_split)
                 for group in plan["groups"]:
                     cur.execute(q.insert_member_sql(), (sid, group, offs[group]))
                 _log_lines(cur, [(user, "schedule_create", None, group, "schedule", None,

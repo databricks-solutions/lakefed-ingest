@@ -374,8 +374,9 @@ gets one group for about that many of its tables, and its databases are spread s
 of tables. A database that fits goes whole into one group. A database with more tables than a group holds (with the
 same small remainder a server's groups allow) is spread by the app over as many of its server's groups as it needs, its
 tables cut in name order into parts that differ by at most one table. A database can also be split by hand: an edit, an
-add or a registration that leaves one database's tables in more than one group is written, and its answer warns,
-naming the database, its groups and the live jobs holding them; the job page's tree marks a split database. A split
+add or a registration that leaves one database's tables in more than one group is written, and its answer warns once,
+naming the database, its groups and the live jobs holding them. A later write to a database that is split already says
+nothing; the job page's tree marks every split database. A split
 database loads correctly (each group checks it for changes to its own tables and loads only those;
 `tests/split_database_test.py`), but each extra group adds its own change queries on the database's server every
 cycle, and its group runs open more connections to that server at the same time. Nothing already placed moves when a

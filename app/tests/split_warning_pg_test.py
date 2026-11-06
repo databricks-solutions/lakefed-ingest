@@ -13,6 +13,7 @@ from app_role_pg_test import client  # noqa: E402,F401  (the app-role fixture: L
 from delete_job_pg_test import _job, _row  # noqa: E402
 
 import main  # noqa: E402
+import queries as q  # noqa: E402
 
 URI = os.environ.get("LAKEFED_APP_TEST_PG")
 pytestmark = pytest.mark.skipif(not URI, reason="LAKEFED_APP_TEST_PG not set")
@@ -46,9 +47,29 @@ def test_a_database_in_one_group_is_no_warning(client):
     assert _warnings([SOURCE_ROW]) == []
 
 
-def _warnings(rows):
+def test_a_database_that_was_split_before_the_write_is_found_and_left_out_of_the_warning(client):
+    _row(client.owner, "clash_f", "t1")
+    _row(client.owner, "clash_g", "t2")
+    assert _split_keys([SOURCE_ROW]) == {q.database_key(SOURCE_ROW)}
+    assert _warnings([SOURCE_ROW], already_split=_split_keys([SOURCE_ROW])) == []
+
+
+def test_a_database_in_one_group_is_not_among_those_split_before_the_write(client):
+    _row(client.owner, "clash_h", "t1")
+    assert _split_keys([SOURCE_ROW]) == set()
+
+
+def _split_keys(rows):
     conn = main.db.connect()
     try:
-        return main._split_database_warnings(conn.cursor(), rows)
+        return main._split_database_keys(conn.cursor(), rows)
+    finally:
+        conn.close()
+
+
+def _warnings(rows, already_split=frozenset()):
+    conn = main.db.connect()
+    try:
+        return main._split_database_warnings(conn.cursor(), rows, already_split)
     finally:
         conn.close()

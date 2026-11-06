@@ -286,6 +286,20 @@ def test_moving_one_table_of_a_database_to_another_group_of_the_job_is_written_w
     assert groups == [("Invoice", "cust_c02"), ("OrderLine", "cust_c01")]
 
 
+def test_a_later_edit_of_a_table_in_a_database_split_already_is_written_with_no_warning(client):
+    import psycopg
+    with psycopg.connect(client.target, autocommit=True) as conn:
+        conn.execute("update lakefed_ingest.control set task_collection = 'cust_c02' "
+                     "where src_database = 'db_1' and src_table = 'Invoice'")
+        [(invoice,)] = conn.execute("select id from lakefed_ingest.control where src_database = 'db_1' "
+                                    "and src_table = 'Invoice'").fetchall()
+    r = client.post("/api/tables/edit", json={"ids": [invoice], "changes": {"freshness_sla_minutes": 45},
+                                              "dry_run": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["summary"]["applied"] is True
+    assert r.json()["warnings"] == []
+
+
 def test_the_tree_flags_a_database_split_over_groups_of_the_job(client):
     import psycopg
     with psycopg.connect(client.target, autocommit=True) as conn:
