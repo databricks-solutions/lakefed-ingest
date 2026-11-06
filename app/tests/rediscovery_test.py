@@ -218,6 +218,34 @@ def test_a_run_adds_what_the_rules_allow_through_the_add_tables_path_as_re_disco
     assert syncs == []
 
 
+def test_a_database_found_is_placed_against_the_jobs_own_tables_per_group(monkeypatch):
+    """A job of 100 tables per group finds a 250-table database: it is spread over the job's three groups, which the
+    default size of 10,000 would have kept whole in one."""
+    fake, records, syncs = FakeDB(), [], []
+    held = [{**job_row("eng_001", f"t{n}"), "id": n, "task_collection": f"g{1 + n % 3}"} for n in range(9)]
+    found = [found_row("eng_001", "t0"), *(found_row("eng_big", f"t{n:03d}") for n in range(250))]
+    _fake_run(monkeypatch, fake, records, syncs, options={"tables_per_group": 100}, job_rows=held, found=found)
+    main._run_rediscovery(7, NOW)
+    inserted = fake.of("insert into lakefed_ingest.control (")
+    groups = {}
+    for row in inserted:
+        assert row[q.CONTROL_INSERT_COLUMNS.index("src_database")] == "eng_big"
+        group = row[q.CONTROL_INSERT_COLUMNS.index("task_collection")]
+        groups[group] = groups.get(group, 0) + 1
+    assert sorted(groups) == ["g1", "g2", "g3"] and sum(groups.values()) == 250
+
+
+def test_a_database_found_stays_whole_when_the_job_has_no_size_of_its_own(monkeypatch):
+    fake, records, syncs = FakeDB(), [], []
+    held = [{**job_row("eng_001", f"t{n}"), "id": n, "task_collection": f"g{1 + n % 3}"} for n in range(9)]
+    found = [found_row("eng_001", "t0"), *(found_row("eng_big", f"t{n:03d}") for n in range(250))]
+    _fake_run(monkeypatch, fake, records, syncs, job_rows=held, found=found)
+    main._run_rediscovery(7, NOW)
+    inserted = fake.of("insert into lakefed_ingest.control (")
+    assert len({row[q.CONTROL_INSERT_COLUMNS.index("task_collection")] for row in inserted}) == 1
+    assert len(inserted) == 250
+
+
 def test_a_run_that_meets_a_running_group_is_deferred_and_writes_nothing(monkeypatch):
     fake, records, syncs = FakeDB(), [], []
     _fake_run(monkeypatch, fake, records, syncs)
@@ -320,10 +348,12 @@ def _tick_rows(sql: str, claims: list):
     raise AssertionError(sql)
 
 
-def _fake_run(monkeypatch, fake: FakeDB, records: list, syncs: list) -> None:
+def _fake_run(monkeypatch, fake: FakeDB, records: list, syncs: list, options=None, job_rows=None, found=None) -> None:
     """The whole run with the database faked: the job has eng_001.t1 under a whole server (filter 'eng'), and the
-    discovery finds eng_002 as new. The discover job's run is started and reads as succeeded."""
-    job = {"id": 7, "name": "lakefed job", "cadence_minutes": 1440, "stagger": False, "options": {}, "paused": False,
+    discovery finds eng_002 as new. The discover job's run is started and reads as succeeded. A test can give the job's
+    options, the rows it holds (job_rows) and what the discovery finds (found, which then lists every database)."""
+    job = {"id": 7, "name": "lakefed job", "cadence_minutes": 1440, "stagger": False, "options": options or {},
+           "paused": False,
            "job_variant": "default", "timezone": "UTC", "created_at": None, "deleted_at": None,
            "created_by": "ops@example.com"}
     # The job reads by host, so its maker must be an app manager (host_reads_test.py has the refusals).
@@ -333,9 +363,9 @@ def _fake_run(monkeypatch, fake: FakeDB, records: list, syncs: list) -> None:
     selection = [{"scope": "server", "server": "h1", "src_database": None, "tables": None, "filter": "eng",
                   "source_kind": "discovery", "source_id": "d1"}]
     sources = [host_source(listing={"pattern": "eng%", "secret_key_template": "creds-{database}"})]
-    job_rows = [job_row("eng_001", "t1")]
-    statuses = [{"server": "h1", "src_database": name, "status": "ok", "error": None} for name in ("eng_001", "eng_002")]
-    found = [found_row("eng_001", "t1"), found_row("eng_002", "t1")]
+    job_rows = job_rows or [job_row("eng_001", "t1")]
+    found = found or [found_row("eng_001", "t1"), found_row("eng_002", "t1")]
+    statuses = [status(name, "ok") for name in sorted({row["src_database"] for row in found})]
     answers = {
         q.schedule_sql(): [job], q.schedule_members_sql(): members, q.collections_sql(): [{"task_collection": "g1"}],
         q.job_selection_sql(): selection, q.selection_discoveries_sql(): sources,
