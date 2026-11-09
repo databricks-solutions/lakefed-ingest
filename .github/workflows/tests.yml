@@ -1,7 +1,8 @@
 # The unit tests for every pull request and every push to main: the whole pytest suite (both versions and the
 # operations app, pytest.ini), the Postgres-backed tests against a throwaway Postgres 16, and the frontend's type
 # check and build. Nothing here reaches Databricks or a source database, so it needs no secrets; live tests stay
-# manual (README, Tests).
+# manual (README, Tests). Hardened as the databricks-solutions org asks: actions pinned to full commit SHAs, a read-only
+# token that isn't kept in the checkout, pull_request only (never pull_request_target), and no install scripts.
 name: tests
 
 on:
@@ -27,16 +28,18 @@ jobs:
         # 3.11 for the operations app (Databricks Apps), 3.12 for the jobs (Databricks Runtime 18).
         python: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: app/src/requirements.txt
 
       # The frontend tests run node --test on TypeScript files, which needs Node's built-in type stripping (22.18+).
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: "24"
           cache: npm
@@ -64,12 +67,13 @@ jobs:
           exit 1
 
       - name: Install Python packages
-        run: pip install pytest httpx pyyaml -r app/src/requirements.txt
+        run: |
+          pip install --only-binary=:all: pytest httpx pyyaml -r app/src/requirements.txt
 
       - name: Install, type-check and build the frontend
         working-directory: app/src
         run: |
-          npm ci --no-audit --no-fund
+          npm ci --ignore-scripts --no-audit --no-fund
           npm run check
 
       - name: Run the tests
