@@ -246,6 +246,9 @@ source databases at the **same** sink (e.g. every client's `dbo.orders` → `mai
   partitioned seed stages in a per-client table, so clients can seed the same sink at once.
 - Schema drift between clients is absorbed by schema evolution: a column one client has and
   another lacks is added to the sink and is NULL for the others.
+- Text columns are plain `STRING` in every sink, whatever the source's `char(n)`, `varchar(n)`, `nchar(n)` or
+  `nvarchar(n)` length, so a client whose column is wider (or a source column widened later) never fails a write
+  on a length limit.
 - Checkpoints stay per control row, so each client's CT version / watermark is independent.
 - `client_id` is per row, so consolidated and dedicated sinks can coexist (for different sink
   tables). It must match `^[A-Za-z0-9_.:-]{1,128}$`, and `__client_id__` must not be in `select_list`.
@@ -439,5 +442,8 @@ sink and reseeds that table so historical rows are backfilled. With the job para
 added and is NULL on rows written before (useful for append sinks, where a reseed appends a full
 snapshot of every table that gained the column). New sinks get
 `delta.enableTypeWidening`; for older sinks run
-`ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')`.
+`ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')`. Text columns are always plain
+`STRING`, never `CHAR(n)` or `VARCHAR(n)`, whose lengths Delta checks on every write
+(`DELTA_EXCEED_CHAR_VARCHAR_LIMIT`). A sink created with them before has those columns changed to `STRING` the first
+time a run writes to it: a metadata change that rewrites no rows.
 
