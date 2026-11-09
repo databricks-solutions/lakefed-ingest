@@ -29,7 +29,8 @@ own directory.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install pytest            # unit tests need nothing else; tests/validation_test.py also needs pytds
+pip install pytest httpx pyyaml -r app/src/requirements.txt   # tests/validation_test.py also needs pytds
+(cd app/src && npm ci)        # the frontend tests' packages
 ```
 
 ### Run Tests
@@ -39,6 +40,8 @@ pytest tests                             # default version
 pytest tests/planner_test.py::test_name  # single test
 pytest job_orchestration/tests           # job orchestration version
 ```
+CI (`.github/workflows/tests.yml`) runs the whole suite on every pull request (Python 3.11 and 3.12, a throwaway
+Postgres 16 with SSL for the `*_pg_test.py` suites, and `npm run check`); it is required to merge into main.
 
 ### Deploy
 ```bash

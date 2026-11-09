@@ -125,14 +125,20 @@ The unit tests need no cluster or database. From the repository root:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install pytest httpx -r app/src/requirements.txt
+.venv/bin/pip install pytest httpx pyyaml -r app/src/requirements.txt
+(cd app/src && npm ci)                        # the frontend tests' packages (Node 22.18 or later)
 .venv/bin/pytest                              # every suite (test paths in pytest.ini)
 .venv/bin/pytest tests                        # the tests/ suite only
 ```
 
 Some tests are skipped unless their outside system is given: the Postgres tests (`*_pg_test.py`) need
 `LAKEFED_APP_TEST_PG` or `LAKEFED_TEST_PG` naming a Postgres server, and `tests/validation_test.py` runs against a
-live SQL Server when the `LAKEFED_TEST_SQLSERVER_*` environment variables are set.
+live SQL Server when the `LAKEFED_TEST_SQLSERVER_*` environment variables are set. The Postgres server needs SSL on
+(the app connects with `sslmode=require`) and room for a few hundred connections, for example
+`postgres -c ssl=on -c max_connections=400`.
+
+Every pull request runs all of this in GitHub Actions ([.github/workflows/tests.yml](.github/workflows/tests.yml)) on
+Python 3.11 and 3.12, with a throwaway Postgres and the frontend's type check and build, and must pass it to merge.
 
 For a dev or test source, `tests/synthetic/` builds a SQL Server database with 1,800 Change Tracking tables, applies
 changes to it, and reconciles the Delta tables with the source; see [tests/synthetic/README.md](tests/synthetic/README.md).
