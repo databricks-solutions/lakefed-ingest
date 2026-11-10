@@ -1,4 +1,4 @@
-import { Fragment, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type ApiError, type Row } from "../api";
@@ -279,8 +279,18 @@ function TargetNames({ jobId, stored, onClose }: { jobId: string; stored: Row; o
 export default function IngestionJob() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
-  // The warnings of the Create that landed here (NewJob.tsx), shown with the page the Create ends on.
-  const createWarnings: Row[] = ((useLocation().state as Row | null)?.warnings ?? []) as Row[];
+  const location = useLocation();
+  const [createWarnings, setCreateWarnings] = useState<Row[]>([]);
+  useEffect(() => setCreateWarnings([]), [id]);
+  // The warnings of the Create that landed here (NewJob.tsx) are read into the page once and taken off the history
+  // entry, which the browser keeps through a reload or a Back, so they show the once.
+  useEffect(() => {
+    const warnings = (location.state as Row | null)?.warnings as Row[] | undefined;
+    if (warnings?.length) {
+      setCreateWarnings(warnings);
+      navigate(location.pathname, { replace: true, state: null });
+    }
+  }, [location.key]);
   const [pages, setPages] = useState<string[]>([]);
   const before = pages[pages.length - 1];
   const qc = useQueryClient();

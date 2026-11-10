@@ -127,3 +127,11 @@ def test_the_job_page_shows_the_warnings_a_job_keeps_while_it_prepares():
     text = (FRONTEND / "pages" / "IngestionJob.tsx").read_text()
     preparation = text[text.index("function Preparation("):]
     assert "<WriteWarnings warnings={p.warnings} />" in preparation[:preparation.index("\nexport default")]
+
+
+def test_a_creates_warnings_are_read_into_the_page_and_taken_off_the_history_entry_so_a_reload_shows_them_no_more():
+    text = (FRONTEND / "pages" / "IngestionJob.tsx").read_text()
+    page = text[text.index("export default function IngestionJob()"):]
+    assert "const [createWarnings, setCreateWarnings] = useState<Row[]>([]);" in page
+    assert "navigate(location.pathname, { replace: true, state: null });" in page
+    assert "useLocation().state" not in page
