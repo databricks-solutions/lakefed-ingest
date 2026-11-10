@@ -1,0 +1,7 @@
+# Changes to CI and to what CI installs need a review from one of these owners, once the main ruleset requires code-owner review.
+/.github/                   @chris-koester-db @matthewmoorcroft @alexnastetsky
+/requirements-ci.txt        @chris-koester-db @matthewmoorcroft @alexnastetsky
+/requirements-test.in       @chris-koester-db @matthewmoorcroft @alexnastetsky
+/app/src/requirements.txt   @chris-koester-db @matthewmoorcroft @alexnastetsky
+/app/src/package.json       @chris-koester-db @matthewmoorcroft @alexnastetsky
+/app/src/package-lock.json  @chris-koester-db @matthewmoorcroft @alexnastetsky
