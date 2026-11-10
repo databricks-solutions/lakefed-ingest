@@ -37,23 +37,21 @@ class DiscoveryRun:
     rows_by_kind: Counter
     retry_waits_s: float
     cpu_s: float
-    azure: bool = False
     order: List[str] = field(default_factory=list)
 
     def calls(self) -> int:
         return sum(self.calls_by_kind.values())
 
     def wall_s(self, latency: sim.Latency, workers: int) -> float:
-        """Simulated wall time: the listing (one call, or the Azure pages in order), then the databases on a pool."""
-        listing_key = "azure" if self.azure else sim.MASTER
-        listing = self.ledger[listing_key].seconds(latency) if listing_key in self.ledger else 0.0
+        """Simulated wall time: the listing (one call through master), then the databases on a pool."""
+        listing = self.ledger[sim.MASTER].seconds(latency) if sim.MASTER in self.ledger else 0.0
         return listing + sim.pool_makespan([self.ledger[name].seconds(latency) for name in self.order], workers)
 
 
-def discover(catalog: server_catalog.ServerCatalog, pattern: str = "", via_azure: bool = False,
+def discover(catalog: server_catalog.ServerCatalog, pattern: str = "",
              limit: Optional[int] = None, on_found: Optional[FoundCallback] = None,
              on_refused: Optional[RefusalCallback] = None) -> DiscoveryRun:
-    """Run the discover job's reads over ``catalog``: list its databases (through master, or through Azure's list), then
+    """Run the discover job's reads over ``catalog``: list its databases through master, then
     discover each one in listing order, as discover_tables.ipynb does. ``on_found(database, rows)`` gets each database's
     rows as they are read, so a whole server is never held in memory; ``on_refused(database, message)`` gets each
     database the server refuses. ``limit`` takes the first databases of the listing (for the small runs)."""
@@ -64,7 +62,7 @@ def discover(catalog: server_catalog.ServerCatalog, pattern: str = "", via_azure
     retried: List[str] = []
     discovered = tables_found = 0
     with sim.discovery_boundary(server):
-        listed = sim.list_through_azure(server, spec) if via_azure else sim.list_through_master(spec)
+        listed = sim.list_through_master(spec)
         if limit is not None:
             listed = listed[:limit]
         for name in listed:
@@ -85,7 +83,7 @@ def discover(catalog: server_catalog.ServerCatalog, pattern: str = "", via_azure
     return DiscoveryRun(listed=listed, refused=refused, retried=retried, discovered=discovered, tables=tables_found,
                         ledger=server.ledger, calls_by_kind=server.calls_by_kind, rows_by_kind=server.rows_by_kind,
                         retry_waits_s=sum(server.waits_by_kind.values()), cpu_s=time.perf_counter() - started,
-                        azure=via_azure, order=list(listed))
+                        order=list(listed))
 
 
 # The columns discover_tables.ipynb writes to lakefed_ingest.discovered_table, in its order;

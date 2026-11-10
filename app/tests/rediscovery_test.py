@@ -5,6 +5,7 @@ import contextlib
 import json
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 import pytest
 
@@ -218,6 +219,30 @@ def test_a_run_adds_what_the_rules_allow_through_the_add_tables_path_as_re_disco
     assert syncs == []
 
 
+def test_a_job_listed_through_azure_whose_server_cannot_be_read_from_master_says_what_to_do(monkeypatch):
+    # Review of 9 Nov: such a job's login can't open master, so its re-discovery failed with "Login failed" or error
+    # 4060 and nothing on the page said why.
+    azure = {"pattern": "eng%", "secret_key_template": "creds-{database}", "azure_credential": "lab_reader",
+             "azure_resource_id": "/subscriptions/0000-1111/resourceGroups/rg-lab/providers/Microsoft.Sql/servers/lab-sql"}
+    failed = {"state": "TERMINATED", "result": "FAILED", "message": "Cannot open database \"master\"", "ended": None}
+    fake, records, syncs = FakeDB(), [], []
+    _fake_run(monkeypatch, fake, records, syncs, listing=azure, run_result=failed)
+    main._run_rediscovery(7, NOW)
+    record = json.loads(records[-1][1][0])
+    [line] = [e for e in record["errors"] if e.startswith("h1: its discovery run ended FAILED")]
+    assert line.endswith(rd.AZURE_LISTING_NOTE) and 'Cannot open database "master"' in line
+
+
+def test_a_job_not_listed_through_azure_gets_the_plain_failure_with_no_azure_note(monkeypatch):
+    failed = {"state": "TERMINATED", "result": "FAILED", "message": "Cannot open database \"master\"", "ended": None}
+    fake, records, syncs = FakeDB(), [], []
+    _fake_run(monkeypatch, fake, records, syncs, run_result=failed)
+    main._run_rediscovery(7, NOW)
+    record = json.loads(records[-1][1][0])
+    assert 'h1: its discovery run ended FAILED: Cannot open database "master"' in record["errors"]
+    assert not any("Azure" in e for e in record["errors"])
+
+
 def test_a_run_that_meets_a_running_group_is_deferred_and_writes_nothing(monkeypatch):
     fake, records, syncs = FakeDB(), [], []
     _fake_run(monkeypatch, fake, records, syncs)
@@ -320,9 +345,11 @@ def _tick_rows(sql: str, claims: list):
     raise AssertionError(sql)
 
 
-def _fake_run(monkeypatch, fake: FakeDB, records: list, syncs: list) -> None:
+def _fake_run(monkeypatch, fake: FakeDB, records: list, syncs: list, listing: Optional[dict] = None,
+              run_result: Optional[dict] = None) -> None:
     """The whole run with the database faked: the job has eng_001.t1 under a whole server (filter 'eng'), and the
-    discovery finds eng_002 as new. The discover job's run is started and reads as succeeded."""
+    discovery finds eng_002 as new. The discover job's run is started and reads as succeeded, unless run_result says
+    how it ended. listing is the listing the server's discovery recorded."""
     job = {"id": 7, "name": "lakefed job", "cadence_minutes": 1440, "stagger": False, "options": {}, "paused": False,
            "job_variant": "default", "timezone": "UTC", "created_at": None, "deleted_at": None,
            "created_by": "ops@example.com"}
@@ -332,7 +359,7 @@ def _fake_run(monkeypatch, fake: FakeDB, records: list, syncs: list) -> None:
                 "synced_at": None, "sync_error": None, "added_at": None, "removed_at": None, "delete_pending": False}]
     selection = [{"scope": "server", "server": "h1", "src_database": None, "tables": None, "filter": "eng",
                   "source_kind": "discovery", "source_id": "d1"}]
-    sources = [host_source(listing={"pattern": "eng%", "secret_key_template": "creds-{database}"})]
+    sources = [host_source(listing=listing or {"pattern": "eng%", "secret_key_template": "creds-{database}"})]
     job_rows = [job_row("eng_001", "t1")]
     statuses = [{"server": "h1", "src_database": name, "status": "ok", "error": None} for name in ("eng_001", "eng_002")]
     found = [found_row("eng_001", "t1"), found_row("eng_002", "t1")]
@@ -360,8 +387,8 @@ def _fake_run(monkeypatch, fake: FakeDB, records: list, syncs: list) -> None:
     monkeypatch.setattr(main, "_sync", lambda sid, user: syncs.append(sid))
     monkeypatch.setattr(main.jobs, "DISCOVER_JOB_ID", "42")
     monkeypatch.setattr(main.jobs, "run_now", lambda job_id, parameters: 99)
-    monkeypatch.setattr(main.jobs, "run_ended", lambda run_id: {"state": "TERMINATED", "result": "SUCCESS",
-                                                               "message": None, "ended": None})
+    ended = run_result or {"state": "TERMINATED", "result": "SUCCESS", "message": None, "ended": None}
+    monkeypatch.setattr(main.jobs, "run_ended", lambda run_id: ended)
     monkeypatch.setattr(main, "REDISCOVERY_POLL_S", 0)
 
 

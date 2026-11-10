@@ -117,6 +117,11 @@ def key_errors(server: str, database: str, key: Optional[str]) -> List[str]:
             f"only, 1 to 128 characters{instance}"]
 
 
+# What a blank target field of a previewed row is checked as, so the row check has a target to look at while the real
+# one is not typed yet (as plan_import checks a file against placeholder settings).
+PREVIEW_TARGET = {"sink_catalog": "catalog", "sink_schema": "schema", "sink_table": "table"}
+
+
 def target_errors(settings: dict) -> List[str]:
     """The target fields left blank: needed to create the job, never to preview what it would take."""
     return [f"set the {label}" for key, label in js.TARGET_SETTINGS if not str(settings[key] or "").strip()]
@@ -179,6 +184,12 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int]
     settings = settings_of(given, new_job)
     out = {"errors": given_errors(given) + setting_errors(settings, require_target, unity_catalog), "lines": [],
            "groups": [], "settings": settings}
+    # A preview is asked for before the target is typed: a blank target field is checked as a placeholder, so no line is
+    # judged by that field. Create checks the target itself (target_errors). With no table name every line would write
+    # the same blank table, so only then is no line said to clash with another.
+    previewed_target = {key: PREVIEW_TARGET[key] for key, _ in js.TARGET_SETTINGS
+                        if not require_target and not str(settings[key] or "").strip()}
+    table_unset = not str(settings["sink_table"] or "").strip()
     if not str(job_name or "").strip():
         out["errors"].insert(0, "name the job")
     if isinstance(groups_per_server, int) and not 1 <= groups_per_server <= MAX_GROUPS_PER_SERVER:
@@ -230,13 +241,13 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int]
         identity = {name: js.render(template, row) for name, template in settings["identity"].items()}
         identity.update(file_attrs)                                                           # the file's own values win
         row["client_attrs"] = json.dumps(identity) if identity else None
-        problems += [e for e in q.validate_control_row(row)
+        problems += [e for e in q.validate_control_row({**row, **previewed_target})
                      if e not in problems and not (shared and e.startswith("client_id "))]
         if taken_groups and row["task_collection"] in taken_groups:
             problems.append(f"group {row['task_collection']} is already in use: give the job another name")
         sink = ".".join(str(row.get(k) or "").lower() for k, _ in js.TARGET_SETTINGS)
         key = (sink, str(row.get("client_id") or ""))
-        if key in seen:
+        if key in seen and not table_unset:
             problems.append(f"line {seen[key]} already writes {sink}" + (f" for {key[1]}" if key[1] else
                             ": turn fan-in on, or put {database} in the target names"))
         seen.setdefault(key, line["line"])

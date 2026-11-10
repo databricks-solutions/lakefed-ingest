@@ -1,5 +1,5 @@
 import { Fragment, createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
-         useSyncExternalStore, type ReactNode } from "react";
+         useSyncExternalStore, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { type BarPart, type BarSummary, type StateCounts, progressParts, progressSummary, stateParts, stateSummary } from "./bars";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
@@ -7,6 +7,7 @@ import { AgGridReact } from "ag-grid-react";
 import { themeQuartz, type ColDef, type GridApi, type GridOptions } from "ag-grid-community";
 import { ApiError, type Row } from "./api";
 import { longWait } from "./pending";
+import { SOURCE_TYPE_NAMES, hostLabel, isCut, tipKeepsClick } from "./cells";
 
 // AG Grid in the workspace look: the design system's font, border, header and accent colors (styles.css).
 export const gridTheme = themeQuartz.withParams({
@@ -65,7 +66,7 @@ const HEADINGS: Record<string, string> = {
 const VALUE_WORDS: Record<string, Record<string, string>> = {
   load_type: { ct: "Change tracking", cursor: "Cursor column", full: "Full reload", cdc: "Change data capture" },
   write_mode: { merge: "Merge: current state", append: "Append: change log" },
-  src_type: { sqlserver: "SQL Server", oracle: "Oracle", postgresql: "PostgreSQL", mysql: "MySQL" },
+  src_type: SOURCE_TYPE_NAMES,
   trigger: { ONE_TIME: "Manual", PERIODIC: "Scheduled", RETRY: "Retry", RUN_JOB_TASK: "Started by a job",
              FILE_ARRIVAL: "File arrival", TABLE: "Table update", CONTINUOUS: "Continuous" },
 };
@@ -242,12 +243,15 @@ export function BigCount({ value }: { value: unknown }) {
 /** Text shown on hover, focus or tap in the page itself (data-tip), not the browser's title: drawn at the page's top
  * level, below its target or above it when there is no room, and always kept inside the window, so no table or
  * scrolling box can cut it off. It closes on scroll, resize, Escape or a tap elsewhere, so it never stays behind
- * at an old place. `focusable` makes it a tab stop (for text that is cut off, or a help note). */
-export function Tip({ text, children, focusable = false }: { text: string; children: ReactNode; focusable?: boolean }) {
+ * at an old place. `focusable` makes it a tab stop (for text that is cut off, or a help note). A click on the text
+ * stays with the tooltip unless the text has none or `passClick` is set: then it reaches the row or link around it. */
+export function Tip({ text, children, focusable = false, passClick = false }: {
+  text: string; children: ReactNode; focusable?: boolean; passClick?: boolean;
+}) {
   const ref = useRef<HTMLSpanElement>(null);
   const id = useId();
   const [at, setAt] = useState<DOMRect | null>(null);
-  const show = () => ref.current && setAt(ref.current.getBoundingClientRect());
+  const show = () => text && ref.current && setAt(ref.current.getBoundingClientRect());
   const hide = () => setAt(null);
   useEffect(() => {
     if (!at) return;
@@ -267,7 +271,7 @@ export function Tip({ text, children, focusable = false }: { text: string; child
   return (
     <span ref={ref} className="tip-target" data-tip={text} tabIndex={focusable ? 0 : undefined}
       aria-describedby={at ? id : undefined} onMouseEnter={show} onFocus={show} onMouseLeave={hide} onBlur={hide}
-      onClick={(e) => { e.stopPropagation(); if (at) hide(); else show(); }}>
+      onClick={(e) => { if (tipKeepsClick(text, passClick)) e.stopPropagation(); if (at) hide(); else show(); }}>
       {children}
       {at && createPortal(<TipPop id={id} text={text} target={at} />, document.body)}
     </span>
@@ -290,18 +294,42 @@ function TipPop({ id, text, target }: { id: string; text: string; target: DOMRec
     style={{ left: place.left, top: place.top, visibility: place.ready ? "visible" : "hidden" }}>{text}</div>;
 }
 
-/** A host name on one line: cut with an ellipsis when it does not fit, its full name (and port) on hover. */
-export function Host({ host, port }: { host: string; port?: unknown }) {
-  const full = port ? `${host}:${port}` : host;
+/** Text on one line: cut with an ellipsis when it does not fit, the whole text on hover or focus (as the Databricks
+ * lists do). Only text that is cut is a tab stop. With `tipOnlyWhenCut` a short text has no tooltip repeating it. With
+ * `passClick` a click on the text also reaches the row it sits in, so a row can be chosen by clicking any of its text. */
+export function Cut({ text, className = "cut", tipOnlyWhenCut = false, passClick = false }: {
+  text: string; className?: string; tipOnlyWhenCut?: boolean; passClick?: boolean;
+}) {
   const ref = useRef<HTMLSpanElement>(null);
-  const [cut, setCut] = useState(false);       // only a name that is cut off is a tab stop
+  const [cut, setCut] = useState(false);
   useLayoutEffect(() => {
-    const measure = () => ref.current && setCut(ref.current.scrollWidth > ref.current.clientWidth + 1);
+    const measure = () => ref.current && setCut(isCut(ref.current.scrollWidth, ref.current.clientWidth));
     measure();
     window.addEventListener("resize", measure);
     return () => window.removeEventListener("resize", measure);
-  }, [full]);
-  return <Tip text={full} focusable={cut}><span ref={ref} className="host">{full}</span></Tip>;
+  }, [text]);
+  return <Tip text={tipOnlyWhenCut && !cut ? "" : text} focusable={cut} passClick={passClick}>
+    <span ref={ref} className={className}>{text}</span></Tip>;
+}
+
+/** A host name on one line: cut with an ellipsis when it does not fit, its full name (and port) on hover. */
+export function Host({ host, port }: { host: string; port?: unknown }) {
+  return <Cut text={hostLabel(host, port)} className="host" />;
+}
+
+/** A small button that puts `text` on the clipboard and says "Copied" for a moment; it does not select the row it sits in. */
+export function CopyButton({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async (e: ReactMouseEvent) => {
+    e.stopPropagation();
+    try { await navigator.clipboard.writeText(text); } catch { return; }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+  return <button type="button" className="ghost copy-button" aria-label={label} title={copied ? "Copied" : label} onClick={copy}>
+    {copied ? "Copied" : <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.5">
+      <rect x="5.5" y="5.5" width="8" height="8" rx="1" /><path d="M10.5 5.5v-3h-8v8h3" /></svg>}
+  </button>;
 }
 
 /** "database" for one, "databases" for any other count. */
