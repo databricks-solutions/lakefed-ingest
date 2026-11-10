@@ -121,3 +121,9 @@ def test_the_warning_box_links_each_job_a_warning_names():
     assert "export function WriteWarnings(" in text
     assert "Array.isArray(warning.jobs) && warning.jobs.map((job: Row) => (" in text
     assert "Open ingestion job <Link to={`/ingestion-jobs/${job.id}`}>{job.name}</Link>" in text
+
+
+def test_the_job_page_shows_the_warnings_a_job_keeps_while_it_prepares():
+    text = (FRONTEND / "pages" / "IngestionJob.tsx").read_text()
+    preparation = text[text.index("function Preparation("):]
+    assert "<WriteWarnings warnings={p.warnings} />" in preparation[:preparation.index("\nexport default")]

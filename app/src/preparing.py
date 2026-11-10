@@ -289,6 +289,14 @@ def found(record: dict, entries: Iterable[dict], counts: Dict[str, int], now: Op
     return refreshed(dict(record, set_aside=set_aside, counts=_counted(set_aside, counts)), now)
 
 
+def with_warnings(record: dict, warnings: List[dict]) -> dict:
+    """The record with the write's warnings (the split-database warning, as Create answers it when it waits for its
+    write), each listing at most LISTED databases: the record is read by every page of jobs, and the warning's message
+    counts them all."""
+    return dict(record, warnings=[dict(warning, databases=list(warning.get("databases") or [])[:LISTED])
+                                  for warning in warnings])
+
+
 def cleared(record: dict, keys: Iterable[str], now: Optional[datetime] = None) -> dict:
     """The record once these databases are taken after all: off the list, and off the counts."""
     gone = set(keys)
@@ -476,7 +484,7 @@ def view(options: Optional[dict], reads: Optional[dict] = None) -> dict:
             "writing_started": bool(record.get("writing_started")),
             "targets": {k: settings.get(k) for k in TARGET_FIELDS},
             "reading": reading_view(reads) if state != READY else None,
-            "progress": record.get("progress") or {},
+            "progress": record.get("progress") or {}, "warnings": record.get("warnings") or [],
             "set_aside": _listed(set_aside), "left_out": _listed(left_out),
             "stopped": stopped_of(options), "listed": LISTED,
             "counts": {"set_aside": sum(by_kind.values()), "waiting": waiting_count(record), **waiting_by_kind,

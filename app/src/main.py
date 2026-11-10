@@ -5393,6 +5393,15 @@ def _update_prepare(sid: int, change, cur=None) -> tuple:
         return apply(cur)
 
 
+def _keep_prepare_warnings(sid: int, warnings: List[dict], cur) -> None:
+    """In the write's own transaction: the split-database warnings of a chunk joined to those the job's record keeps
+    (preparing.with_warnings), as _create_by_database puts them in its task's result. A preparation has no page waiting
+    for its answer, so the job page reads them from the record while the job prepares."""
+    if warnings:
+        _update_prepare(sid, lambda record, job: (preparing.with_warnings(record, _merged_warnings(
+            list(record.get("warnings") or []) + warnings)), None), cur)
+
+
 def _move_prepare(sid: int, state: Optional[str] = None, stage: Optional[str] = None, progress: Optional[dict] = None,
                   cur=None) -> dict:
     """For the prepare task: move the job's record to a state and stage (preparing.moved), with its progress
@@ -6315,8 +6324,8 @@ def _prepare_write(sid: int, task_id: int, owner: str, held: threading.Event, jo
         try:
             with _write() as cur:
                 _prepare_fence(cur, sid, task_id, owner)
-                # A preparation has no page waiting for its answer: the job page's tree flags a split database instead.
-                _write_chunk(cur, [plan for _, plan in pairs], chunk_job, state)
+                warnings = _write_chunk(cur, [plan for _, plan in pairs], chunk_job, state)
+                _keep_prepare_warnings(sid, warnings, cur)
                 _move_prepare(sid, progress={"tables_written": state["tables_written"], "tables_total": total,
                                              "percent": preparing.percent(state["tables_written"], total)}, cur=cur)
             return []

@@ -350,6 +350,21 @@ def test_the_job_goes_through_writing_and_syncing_to_ready_and_turns_on_when_ask
     assert all(row["created_by"] == "op@example.com" for row in [prepared.tasks.rows[1]])
 
 
+def test_a_database_the_prepare_write_splits_over_groups_is_warned_about_on_the_job_page(prepared, monkeypatch):
+    """The prepare path has no page waiting for its answer, so the warning of the write that makes the split is kept
+    on the job's record, which the job page reads while the job prepares (review of PR 41)."""
+    def split_rows(cur, rows):
+        written = {row["src_database"] for row in prepared.store.controls}
+        return [(q.database_key(row), row["src_database"], ["g1", "g2"]) for row in rows
+                if row["src_database"] in written and row["src_database"] == "eng_004"]
+
+    monkeypatch.setattr(main, "_split_database_rows", split_rows)
+    _create(prepared)
+    prepared.tasks.run()
+    [warning] = p.view({p.OPTION: _record(prepared)})["warnings"]
+    assert warning["kind"] == "split_database" and warning["databases"] == [{"database": "eng_004", "groups": ["g1", "g2"]}]
+
+
 def test_the_same_request_id_sent_again_answers_the_job_it_recorded(prepared):
     first = _create(prepared).json()
     again = _create(prepared)

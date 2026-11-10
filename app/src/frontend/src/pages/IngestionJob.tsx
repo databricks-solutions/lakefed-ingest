@@ -216,6 +216,7 @@ function Preparation({ jobId, deleteRefusal, onDelete }: { jobId: string; delete
         aria-label={`${line}: ${fmtInt(bar.done)} of ${fmtInt(bar.total)}`} />}
       <p className="muted small">Run now: {AVAILABLE_WHEN_READY}. {scheduleWhenReady(p)}.</p>
       <ErrorBox error={prepare.error || act.error} />
+      <WriteWarnings warnings={p.warnings} />
       {listed.length > 0 && <>
         <div className="table-wrap"><table className="data dense">
           <thead><tr><th>Server</th><th>Database</th><th>Why it was set aside</th></tr></thead>
