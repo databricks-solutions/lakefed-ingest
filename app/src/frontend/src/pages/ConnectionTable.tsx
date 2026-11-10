@@ -1,12 +1,12 @@
 import type { ReactNode } from "react";
 import type { Row } from "../api";
 import { CopyButton, Cut } from "../components";
-import { connectionTypeName } from "../cells";
+import { connectionTypeName, hostLabel } from "../cells";
 
 /** The Unity Catalog connections to choose from, one line to a row as Catalog Explorer's connections list is: the name
  * and host take the room there is, the type has a narrow column of its own and is never broken, and the owner is cut
  * with an ellipsis. Anything cut shows whole on hover or focus, a click on any of a row's text chooses it, and the
- * host can be copied without choosing it. `empty` is the note shown in place of rows when there are none. */
+ * host, with its port, can be copied without choosing it. `empty` is the note shown in place of rows when there are none. */
 export function ConnectionTable({ rows, chosen, disabled, onChoose, empty }: {
   rows: Row[]; chosen: string; disabled: boolean; onChoose: (name: string) => void; empty: ReactNode;
 }) {
@@ -21,8 +21,8 @@ export function ConnectionTable({ rows, chosen, disabled, onChoose, empty }: {
             <td className="cell"><b><Cut text={c.name} tipOnlyWhenCut passClick /></b></td>
             <td className="cell"><Cut text={connectionTypeName(c.connection_type)} tipOnlyWhenCut passClick /></td>
             <td className="cell mono">{c.host && <span className="cell-line">
-              <Cut text={c.host} tipOnlyWhenCut passClick />
-              <CopyButton text={c.host} label={`Copy host of ${c.name}`} /></span>}</td>
+              <Cut text={hostLabel(c.host, c.port)} tipOnlyWhenCut passClick />
+              <CopyButton text={hostLabel(c.host, c.port)} label={`Copy host of ${c.name}`} /></span>}</td>
             <td className="cell"><Cut text={c.owner ?? ""} tipOnlyWhenCut passClick /></td>
           </tr>
         ))}

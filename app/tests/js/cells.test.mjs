@@ -30,6 +30,7 @@ test("the table of names is the one the Source type column uses", () => {
 test("a host is shown with its port when it has one", () => {
   assert.equal(hostLabel("db.example.com", "1433"), "db.example.com:1433");
   assert.equal(hostLabel("db.example.com", 1433), "db.example.com:1433");
+  assert.equal(hostLabel("db.example.com", 14330), "db.example.com:14330");
   assert.equal(hostLabel("db.example.com"), "db.example.com");
   assert.equal(hostLabel("db.example.com", null), "db.example.com");
   assert.equal(hostLabel("db.example.com", ""), "db.example.com");

@@ -38,12 +38,12 @@ def test_discover_lists_the_connections_through_the_table_component():
 
 def test_the_type_column_shows_the_display_name_and_every_text_cell_is_cut_not_wrapped():
     assert "connectionTypeName(c.connection_type)" in TABLE
-    for cell in ("c.name", "c.host", "c.owner ?? \"\""):
+    for cell in ("c.name", "hostLabel(c.host, c.port)", "c.owner ?? \"\""):
         assert f"<Cut text={{{cell}}} tipOnlyWhenCut passClick />" in TABLE
 
 
 def test_the_host_can_be_copied_without_choosing_the_row():
-    assert "<CopyButton text={c.host} " in TABLE
+    assert "<CopyButton text={hostLabel(c.host, c.port)} " in TABLE
     assert "e.stopPropagation();" in COMPONENTS.split("export function CopyButton")[1]
 
 
@@ -75,3 +75,11 @@ def test_a_click_on_any_text_of_a_row_chooses_the_row():
     cut = COMPONENTS.split("export function Cut(")[1].split("export function Host")[0]
     assert "passClick={passClick}" in cut
     assert TABLE.count("passClick") == 4 and TABLE.count("<Cut ") == 4
+
+
+def test_the_host_is_shown_and_copied_with_its_port_as_bulk_import_shows_it():
+    """The review of 9 Nov: a connection on port 14330 showed and copied just its host. cells.test.mjs reads hostLabel
+    itself (host:port, or the host alone when there is no port); here the table is checked to use it for both."""
+    assert 'import { connectionTypeName, hostLabel } from "../cells";' in TABLE
+    assert TABLE.count("hostLabel(c.host, c.port)") == 2
+    assert "text={c.host}" not in TABLE
