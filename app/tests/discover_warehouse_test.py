@@ -141,16 +141,12 @@ def test_asking_after_a_listing_refuses_a_connection_the_app_cant_see(client):
     assert answer.status_code == 404 and "USE CONNECTION" in answer.json()["detail"]
 
 
-def test_listing_through_azure_still_runs_the_discovery_job(client, monkeypatch):
-    client.use([_answer("SUCCEEDED", rows=[])])
-    started = []
-    monkeypatch.setattr(main.jobs, "DISCOVER_JOB_ID", "555")
-    monkeypatch.setattr(main, "_refuse_run_of", lambda job_id, request: None)
-    monkeypatch.setattr(main.jobs, "run_now", lambda job_id, params: started.append(params) or 42)
+def test_the_old_azure_settings_in_a_listing_request_change_nothing_it_goes_to_the_warehouse(client):
+    client.use([_answer("SUCCEEDED", rows=[])])    # the fixture fails the test if the discovery job is started
     body = client.post("/api/discoveries/source", json={
         "src_connection": "sql_a", "kind": "list", "azure_credential": "reader",
         "azure_resource_id": "/subscriptions/1/resourceGroups/rg/providers/Microsoft.Sql/servers/srv"}).json()
-    assert body["run_id"] == 42 and started
+    assert body["via"] == "warehouse"
 
 
 def test_with_no_warehouse_set_the_listing_runs_the_discovery_job_as_before(client, monkeypatch):
@@ -270,7 +266,6 @@ def test_rediscovery_reads_a_connections_server_through_the_warehouse_not_the_jo
     monkeypatch.setattr(main.warehouse_reads, "advance", lambda *a, **k: next(steps))
     monkeypatch.setattr(main, "REDISCOVERY_WAREHOUSE_POLL_S", 0)
     assert main._through_warehouse({"src_connection": "sql_a", "databases": "*"})
-    assert not main._through_warehouse({"src_connection": "sql_a", "azure_credential": "reader"})
     assert not main._through_warehouse({"src_host": "h", "secret_key": "k"})
     assert main._discover_through_warehouse({"src_connection": "sql_a", "databases": "*", "pattern": "eng%",
                                              "requested_by": "re-discovery"}, "d7") is None

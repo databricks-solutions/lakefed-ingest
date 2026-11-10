@@ -683,6 +683,69 @@ def test_the_target_is_needed_to_create_but_not_to_preview_the_lines():
     assert nj.setting_errors(nj.settings_of(no_target), require_target=False) == []
 
 
+def test_a_preview_with_no_target_marks_no_line_invalid_for_it():
+    # Report of 2 Nov: tables chosen before the target was typed showed "1,002 lines can't be added: line 2,
+    # lfc_eng_010.dbo.customers: sink_catalog is required; sink_schema is required" while no more than BACKGROUND_ROWS
+    # tables were read, and nothing once more were (that preview goes by database and checks no line).
+    text = HEAD + 'sql_a,lfc_eng_010,dbo,customers,"id, name",id\n' + 'sql_a,lfc_eng_010,dbo,orders,"id, qty",id\n'
+    no_target = {**PLAIN, "sink_catalog": "", "sink_schema": ""}
+    previewed = nj.plan("Job", text, no_target, require_target=False)
+    assert [(line["status"], line["errors"]) for line in previewed["lines"]] == [("valid", []), ("valid", [])]
+    created = nj.plan("Job", text, no_target)
+    assert created["errors"][:2] == ["set the target catalog", "set the target schema"] and created["lines"] == []
+
+
+def test_a_preview_with_no_target_does_not_depend_on_how_the_row_check_words_a_blank_target(monkeypatch):
+    # Review of 9 Nov: the preview used to drop the row check's "sink_catalog is required" by its exact words, so a
+    # reworded message would have brought the false errors back. It now hands the check a placeholder instead.
+    check = nj.q.validate_control_row
+
+    def reworded(row):
+        blank = [f"{key} needs a value" for key in ("sink_catalog", "sink_schema", "sink_table") if not row.get(key)]
+        return [e for e in check(row) if not e.endswith(" is required")] + blank
+
+    monkeypatch.setattr(nj.q, "validate_control_row", reworded)
+    text = HEAD + 'sql_a,lfc_eng_010,dbo,customers,"id, name",id\n'
+    no_target = {**PLAIN, "sink_catalog": "", "sink_schema": "", "sink_table": ""}
+    previewed = nj.plan("Job", text, no_target, require_target=False)
+    assert [(line["status"], line["errors"]) for line in previewed["lines"]] == [("valid", [])]
+    assert not previewed["lines"][0]["row"]["sink_catalog"]      # the placeholder is only for the check
+
+
+def test_a_preview_still_reports_a_real_problem_in_a_line_while_the_target_is_blank():
+    text = HEAD + 'sql_a,lfc_eng_010,dbo,customers,"id, name",\n'      # a change-tracked table with no primary key
+    previewed = nj.plan("Job", text, {**PLAIN, "sink_catalog": ""}, require_target=False)
+    assert previewed["lines"][0]["status"] == "invalid"
+    assert previewed["lines"][0]["errors"] == ["primary_key is required for load_type ct"]
+
+
+def test_a_preview_with_no_target_table_says_no_line_writes_another_lines_table():
+    # With no table name yet every line's target is the same blank name, so none can be said to clash with another.
+    text = HEAD + 'sql_a,db1,dbo,customers,"id",id\n' + 'sql_a,db1,dbo,orders,"id",id\n'
+    previewed = nj.plan("Job", text, {**PLAIN, "sink_table": ""}, require_target=False)
+    assert [(line["status"], line["errors"]) for line in previewed["lines"]] == [("valid", []), ("valid", [])]
+
+
+@pytest.mark.parametrize("blank", [{"sink_catalog": ""}, {"sink_schema": ""}, {"sink_catalog": "", "sink_schema": ""}])
+def test_a_preview_with_a_catalog_or_schema_blank_still_finds_two_lines_writing_one_table(blank):
+    # Review of 9 Nov: the preview showed these lines as fine and Create refused them later. They do write one table;
+    # only a blank table name makes every line look like a clash.
+    text = HEAD + 'sql_a,db1,dbo,customers,"id",id\n' + 'sql_a,db2,dbo,customers,"id",id\n'
+    lines = nj.plan("Job", text, {**TABLE_ONLY, **blank}, require_target=False)["lines"]
+    assert lines[0]["status"] == "valid" and lines[1]["status"] == "invalid"
+    assert lines[1]["errors"] == [f"line 2 already writes {lines[1]['sink']}: turn fan-in on, or put {{database}} in the "
+                                  "target names"]
+    assert lines[1]["sink"].endswith(".customers")
+
+
+def test_a_preview_with_its_target_set_still_finds_two_lines_writing_one_table():
+    text = HEAD + 'sql_a,db1,dbo,customers,"id",id\n' + 'sql_a,db2,dbo,customers,"id",id\n'
+    lines = nj.plan("Job", text, TABLE_ONLY, require_target=False)["lines"]
+    assert lines[0]["status"] == "valid" and lines[1]["status"] == "invalid"
+    assert lines[1]["errors"] == ["line 2 already writes main.s.customers: turn fan-in on, or put {database} in the "
+                                  "target names"]
+
+
 def test_a_preview_by_lines_needs_no_name_but_its_create_does(client):
     r = _create(client, name="", settings={**FAN_IN, "sink_catalog": ""})
     assert r.status_code == 200 and r.json()["summary"]["tables"] and r.json()["name_missing"] is True

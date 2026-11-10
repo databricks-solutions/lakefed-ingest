@@ -246,6 +246,9 @@ source databases at the **same** sink (e.g. every client's `dbo.orders` → `mai
   partitioned seed stages in a per-client table, so clients can seed the same sink at once.
 - Schema drift between clients is absorbed by schema evolution: a column one client has and
   another lacks is added to the sink and is NULL for the others.
+- Text columns are plain `STRING` in every sink, whatever the source's `char(n)`, `varchar(n)`, `nchar(n)` or
+  `nvarchar(n)` length, so a client whose column is wider (or a source column widened later) never fails a write
+  on a length limit.
 - Checkpoints stay per control row, so each client's CT version / watermark is independent.
 - `client_id` is per row, so consolidated and dedicated sinks can coexist (for different sink
   tables). It must match `^[A-Za-z0-9_.:-]{1,128}$`, and `__client_id__` must not be in `select_list`.
@@ -427,11 +430,12 @@ recommended settings (load type from Change Tracking / rowversion / primary key,
 column), into Lakebase, for the app's Bulk import page, or, without the app, for you to query `discovered_table`
 and insert control rows yourself. Check constraints reject invalid combinations (e.g.
 `ct` on a non-SQL Server source). See `notebooks/load_control_example.ipynb`.
-A whole server's databases are listed through `master` (the spec's `pattern` is a LIKE filter), or, for an
-Azure SQL server whose login can't open `master`, through Azure Resource Manager: the spec's `azure_credential` (a
-Unity Catalog service credential whose managed identity has Reader on the server; the job's runner needs `ACCESS` on
-it) and `azure_resource_id` (`/subscriptions/<id>/resourceGroups/<group>/providers/Microsoft.Sql/servers/<server>`,
-or `managedInstances/<instance>`). The databases are then read through the connection as usual.
+A whole server's databases are listed through `master` (the spec's `pattern` is a LIKE filter), so the login needs
+`VIEW ANY DATABASE` and `SELECT` on `sys.databases` in `master` (the access Lakeflow Connect asks of its SQL Server
+database user, "Microsoft SQL Server database user requirements"), or on Azure SQL Database membership in the
+`##MS_DefinitionReader##` server role, which lets the login see the databases. `##MS_DatabaseConnector##` only lets a
+login open them, so add it as well when the login must read each database. Databases named in the spec are read by
+name and never need `master`.
 
 **Schema changes.** Writes use schema evolution. Adding a column to `select_list` adds it to the
 sink and reseeds that table so historical rows are backfilled. With the job parameter
@@ -439,5 +443,8 @@ sink and reseeds that table so historical rows are backfilled. With the job para
 added and is NULL on rows written before (useful for append sinks, where a reseed appends a full
 snapshot of every table that gained the column). New sinks get
 `delta.enableTypeWidening`; for older sinks run
-`ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')`.
+`ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')`. Text columns are always plain
+`STRING`, never `CHAR(n)` or `VARCHAR(n)`, whose lengths Delta checks on every write
+(`DELTA_EXCEED_CHAR_VARCHAR_LIMIT`). A sink created with them before has those columns changed to `STRING` the first
+time a run writes to it: a metadata change that rewrites no rows.
 

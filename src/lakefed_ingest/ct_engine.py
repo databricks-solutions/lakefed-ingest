@@ -369,10 +369,10 @@ def _read(spark, cfg: dict, query: str, session_init: Optional[str] = None):
         if session_init:
             raise ValueError(f"control row {cfg.get('id')}: a read through a connection runs no session statement")
         sql, args = remote_query_sql(cfg, query)
-        return spark.sql(sql, args=args)
+        return plain_strings(spark.sql(sql, args=args))
     adapter = source_adapters.for_cfg(cfg)
     conf = _jdbc_config(cfg)
-    return (
+    return plain_strings(
         spark.read.format("jdbc")
         .options(**adapter.read_options(cfg))
         .option("url", adapter.jdbc_url(conf["host"], conf["port"], cfg["src_database"],
@@ -384,6 +384,72 @@ def _read(spark, cfg: dict, query: str, session_init: Optional[str] = None):
         .options(**({"sessionInitStatement": session_init} if session_init else {}))
         .load()
     )
+
+
+# ---- text types ---------------------------------------------------------------------------------------
+# Every text column in Databricks is a plain STRING, never CHAR(n) or VARCHAR(n). Spark JDBC reports a source's
+# char / varchar / nchar / nvarchar columns with their declared length (a CharType / VarcharType, or a string
+# carrying it in CHAR_VARCHAR_METADATA), and a table created from that read gets CHAR(n) / VARCHAR(n) columns
+# whose length Delta checks on every write (DELTA_EXCEED_CHAR_VARCHAR_LIMIT): a wider value from another database
+# sharing the sink, a widened source column, or a driver that reports a short length then fails the table after
+# its whole read. So every read's text columns become plain strings (``plain_strings``, in ``_read``), and a sink
+# made before has its CHAR / VARCHAR columns changed to STRING when a run first meets it (``widen_char_varchar``,
+# in ``ensure_sink_table``): a metadata change, no rows rewritten.
+CHAR_VARCHAR_METADATA = "__CHAR_VARCHAR_TYPE_STRING"
+_CHAR_VARCHAR = re.compile(r"^(var)?char\(\d+\)$", re.I)
+
+
+def char_varchar_type(field) -> Optional[str]:
+    """``char(n)`` / ``varchar(n)`` (lower case) when a Spark field is a length-limited text type, else None:
+    a CharType / VarcharType, or a string that carries its declared length in its metadata."""
+    meta = getattr(field, "metadata", None) or {}
+    raw = meta.get(CHAR_VARCHAR_METADATA) if isinstance(meta, dict) else None
+    if raw and _CHAR_VARCHAR.match(str(raw).strip()):
+        return str(raw).strip().lower()
+    try:
+        shown = field.dataType.simpleString().strip()
+    except Exception:
+        return None
+    return shown.lower() if _CHAR_VARCHAR.match(shown) else None
+
+
+def char_varchar_columns(schema) -> List[str]:
+    """The names of a schema's CHAR / VARCHAR columns, in schema order."""
+    return [f.name for f in (getattr(schema, "fields", None) or []) if char_varchar_type(f)]
+
+
+def plain_strings(df):
+    """``df`` with its CHAR / VARCHAR columns as plain strings (cast, which carries no length), every other column
+    as it is; ``df`` itself when it has none. A table created or evolved from it never gets a length limit."""
+    try:
+        schema = df.schema
+    except AttributeError:            # a test double without a schema
+        return df
+    limited = set(char_varchar_columns(schema))
+    if not limited:
+        return df
+    # df[name], not F.col(name): F.col goes through the JVM class lookup that holds the notebook class loader's lock,
+    # once per column (see _tag), and this runs on most reads. Quoted, so a name with a dot or backtick resolves.
+    return df.select(*[df[delta_column(f.name)].cast("string").alias(f.name) if f.name in limited
+                       else df[delta_column(f.name)] for f in schema.fields])
+
+
+def to_string_sql(sink_fqn: str, column: str) -> str:
+    return f"ALTER TABLE {sink_fqn} ALTER COLUMN {delta_column(column)} TYPE STRING"
+
+
+def widen_char_varchar(spark, sink_fqn: str, table) -> List[str]:
+    """Change a sink's CHAR / VARCHAR columns to STRING (one metadata-only ALTER each, retried on a Delta
+    conflict); returns the columns changed. Idempotent: a column already STRING isn't in the list."""
+    try:
+        columns = char_varchar_columns(table.schema)
+    except AttributeError:            # a test double without a schema
+        return []
+    for column in columns:
+        with_write_retry(lambda c=column: spark.sql(to_string_sql(sink_fqn, c)), what=f"{sink_fqn}.{column} to STRING")
+    if columns:
+        print(f"[schema] {sink_fqn}: CHAR / VARCHAR columns changed to STRING: {', '.join(columns)}")
+    return columns
 
 
 def _unit(slots, cfg: Optional[dict] = None):
@@ -840,6 +906,8 @@ def ensure_sink_table(spark, cfg: dict, sink_fqn: str, slots=None) -> None:
                     spark.catalog.dropTempView(view)
         with_write_retry(create, what=f"create {sink_fqn}")
     table = spark.table(sink_fqn)
+    if widen_char_varchar(spark, sink_fqn, table):     # a sink made before every text column was a STRING
+        table = spark.table(sink_fqn)
     columns = list(table.columns)
     check_sink_mode(cfg, sink_fqn, columns)
     _known_sinks[sink_fqn] = columns

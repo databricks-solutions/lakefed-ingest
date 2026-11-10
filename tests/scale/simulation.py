@@ -2,7 +2,7 @@
 
 discovery.py reads a source through ct_engine: ``_spark()`` and ``_read(spark, row, sql)`` return a frame whose
 ``collect()`` gives the rows. ``discovery_boundary`` swaps those two for a SimulatedServer, which answers the database
-listing through master, the three catalog queries of each database, and the Azure Resource Manager list, from a
+listing through master and the three catalog queries of each database, from a
 synthetic server (tests/synthetic/server_catalog.py). Nothing sleeps and nothing connects: each call is booked to the
 database it reads (or to master), as a count of calls and rows, and the waits discovery takes between retries are booked
 the same way. Latency is applied afterwards, so one run gives the wall time for any per-call latency: ``Latency`` turns
@@ -16,7 +16,6 @@ import heapq
 import re
 from collections import Counter
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import paths  # noqa: F401  (puts src/lakefed_ingest, tests/synthetic and app/src on sys.path)
@@ -97,7 +96,7 @@ def _kind(sql: str) -> str:
 
 class SimulatedServer:
     """One synthetic SQL Server instance answering discovery's reads. ``ledger`` holds what each database cost, by name
-    (master for the listing, and "azure" for the Azure list); a read of a database the catalog can't open is refused as
+    (master for the listing); a read of a database the catalog can't open is refused as
     SQL Server refuses it, and a paused database fails its first read with a transient error."""
 
     def __init__(self, catalog: server_catalog.ServerCatalog, server_name: str = "scale-sql"):
@@ -153,18 +152,6 @@ class SimulatedServer:
         self._book(database, kind, rows=len(rows))
         return [dict(r) for r in rows]
 
-    def arm_get(self, url: str, token: str) -> dict:
-        """One page of the Azure Resource Manager list of the server's databases (the ``get`` discovery takes)."""
-        match = re.search(r"[?&]page=(\d+)", url)
-        page = int(match.group(1)) if match else 0
-        body = self.catalog.arm_page(page, url.split("?")[0])
-        self._book("azure", "arm", rows=len(body["value"]))
-        return body
-
-    def credential(self) -> SimpleNamespace:
-        """A Unity Catalog service credential's provider: only get_token, which the listing calls."""
-        return SimpleNamespace(get_token=lambda scope: SimpleNamespace(token="simulated-token"))
-
 
 @contextlib.contextmanager
 def discovery_boundary(server: SimulatedServer) -> Iterator[SimulatedServer]:
@@ -187,14 +174,6 @@ def list_through_master(spec: dict) -> List[str]:
     """The databases discovery lists through master (Test connection, or a whole server). Run it inside
     discovery_boundary."""
     return discovery.list_databases(spec)
-
-
-def list_through_azure(server: SimulatedServer, spec: dict) -> List[str]:
-    """The databases discovery lists through Azure Resource Manager, with the simulated credential and list."""
-    spec = {**spec, "azure_credential": "lab-scale-credential",
-            "azure_resource_id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/scale"
-                                 f"/providers/Microsoft.Sql/servers/{server.server_name}"}
-    return discovery.list_databases(spec, credential=server.credential(), get=server.arm_get)
 
 
 def discover_one(server: SimulatedServer, spec: dict, database: str) -> List[dict]:

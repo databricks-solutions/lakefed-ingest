@@ -246,11 +246,19 @@ export interface ErrorCodes { error_class?: string | null; sql_server_error?: nu
  *  18456"), the source's message, and what to do next. */
 export interface ConnectionFailure { code: string | null; message: string; hint: string }
 
+/** What a login needs to list a server's databases from master. On SQL Server that is VIEW ANY DATABASE and SELECT on
+ *  sys.databases (the access Lakeflow Connect asks of its database user, "Microsoft SQL Server database user
+ *  requirements"). On Azure SQL Database the ##MS_DefinitionReader## server role carries VIEW ANY DATABASE, which is what
+ *  shows the databases in sys.databases; ##MS_DatabaseConnector## only lets a login open them (CONNECT ANY DATABASE). */
+export const MASTER_ACCESS = "Give the login a user in master with VIEW ANY DATABASE and SELECT on sys.databases. On Azure SQL "
+  + "Database, add the login to the ##MS_DefinitionReader## server role instead, which lets it see the databases; add "
+  + "##MS_DatabaseConnector## too if it also has to open each one.";
+
 const SQL_SERVER_HINTS: Record<number, string> = {
   18456: "The server refused the connection's login: check its user and password in Catalog Explorer (Connections, the "
          + "connection, Edit), and that the login exists on the server.",
-  4060: "The login can't open master, where the server lists its databases: type the databases below, or give the login "
-        + "a user in master (VIEW ANY DATABASE) and test again.",
+  4060: `The login can't open master, where the server lists its databases. ${MASTER_ACCESS} Then test again, or type the `
+        + "databases below.",
   40615: "The server's firewall refuses Databricks: allow serverless compute on the server (a network connectivity "
          + "configuration's private endpoint or firewall rule), then test again.",
   40613: "The database isn't available right now (a paused serverless database takes a minute or so to resume): test again.",
