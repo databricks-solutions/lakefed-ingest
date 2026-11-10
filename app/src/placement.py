@@ -219,7 +219,8 @@ class Lightest:
             return None
         key = (server, str(database or "").lower())
         if key not in self._spread:
-            chosen = sorted(sorted(loads, key=lambda name: loads[name])[:parts_for(tables, self.per_group, len(loads))])
+            lightest = sorted(loads, key=lambda name: (loads[name], name))
+            chosen = sorted(lightest[:parts_for(tables, self.per_group, len(loads))])
             shares = room_shares([loads[group] for group in chosen], tables)
             for group, share in zip(chosen, shares):
                 loads[group] += share

@@ -172,6 +172,16 @@ def test_a_big_database_added_later_spreads_over_its_servers_lightest_groups_and
     assert placement.Lightest({"sql_a": {"g1": 1}}).spread("sql_b", "x", 5) is None
 
 
+def test_a_tie_between_groups_goes_to_the_first_by_name_whatever_order_the_groups_are_listed_in():
+    """Review of PR 41: spread() kept the order the groups were listed in on equal loads, place() takes the first by
+    name, so a database that fits could land in another group than before."""
+    tied = {"sql_a": {"g2": 5, "g1": 5}}
+    assert placement.Lightest(tied, per_group=100).place("sql_a", "small") == "g1"
+    assert placement.Lightest(tied, per_group=100).spread("sql_a", "small", 3) == placement.Spread(groups=("g1",), shares=(3,))
+    level = placement.Lightest({"sql_a": {"g3": 0, "g1": 0, "g2": 0}}, per_group=100)
+    assert level.spread("sql_a", "big", 150) == placement.Spread(groups=("g1", "g2"), shares=(75, 75))
+
+
 def test_a_group_already_above_the_level_takes_no_part_of_a_database_added_later():
     join = placement.Lightest({"sql_a": {"g1": 500, "g2": 0, "g3": 0}}, per_group=100)
     assert join.spread("sql_a", "huge", 250) == placement.Spread(groups=("g2", "g3"), shares=(125, 125))
