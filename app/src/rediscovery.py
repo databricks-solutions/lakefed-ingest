@@ -24,6 +24,15 @@ BEAT_S = 15
 STALE_S = 120
 RESTARTED = "the app restarted; run it again"
 LISTING_KEYS = ("pattern",)
+# The two listing keys of the Azure Resource Manager listing the app no longer has. A discovery made with it still holds
+# them, and a login that only that listing could read from can't open master, where a server is listed now.
+RETIRED_LISTING_KEYS = ("azure_credential", "azure_resource_id")
+MASTER = "master"
+AZURE_LISTING_NOTE = (
+    "This job's databases were first listed through Azure, which the app no longer does, so they are read from master "
+    "now. If the login can't open master, give it access there (VIEW ANY DATABASE and SELECT on sys.databases, or on "
+    "Azure SQL Database the ##MS_DefinitionReader## server role) or type the database names in Add tables. The job's "
+    "tables keep running as they are.")
 REPORT_LIMIT = 20
 # The phases a running re-discovery records: reading a server again (its discovery run goes), then writing the tables.
 DISCOVERING, ADDING = "discovering", "adding"
@@ -119,7 +128,7 @@ def specs(parts: List[dict], sources: List[dict]) -> Tuple[List[Tuple[str, dict]
         if not mine:
             errors.append(f"{server}: its discovery is no longer kept, so it can't be read again")
             continue
-        newest = max(mine, key=lambda s: str(s.get("finished_at") or ""))
+        newest = _newest(mine)
         listing = newest.get("listing")
         if whole and listing is None:
             errors.append(f"{server}: it was discovered before re-discovery kept how it lists databases: discover it "
@@ -170,6 +179,43 @@ def specs(parts: List[dict], sources: List[dict]) -> Tuple[List[Tuple[str, dict]
                 spec["databases"] = list(group_names)
             out.append((server, spec))
     return out, errors
+
+
+def _newest(discoveries: List[dict]) -> dict:
+    """The discovery row read last."""
+    return max(discoveries, key=lambda s: str(s.get("finished_at") or ""))
+
+
+def azure_listed_servers(parts: List[dict], sources: List[dict]) -> Set[str]:
+    """The servers a job takes whole whose newest discovery listed its databases through Azure. They are read through
+    master now, and the login that needed Azure may not be able to open it: a failed read of one of these says why."""
+    out: Set[str] = set()
+    for server in {server_key(p["server"]) for p in parts if p["scope"] == "server" and p.get("source_kind") == "discovery"}:
+        mine = [s for s in sources if server_key(s["server"]) == server]
+        listing = _newest(mine).get("listing") if mine else None
+        if any((listing or {}).get(key) for key in RETIRED_LISTING_KEYS):
+            out.add(server)
+    return out
+
+
+def read_error(server: str, reason: str, azure_servers: Set[str]) -> str:
+    """How a failed read of a whole server shows on the job page. A server that was listed through Azure also gets
+    what to do about it, since its login may not open master and the source's own message does not say so."""
+    line = f"{server}: {reason}"
+    return f"{line.rstrip('. ')}. {AZURE_LISTING_NOTE}" if server in azure_servers else line
+
+
+def database_errors(errors: List[dict], azure_servers: Set[str]) -> List[str]:
+    """The databases a re-discovery could not open (``wanted``'s errors) as the lines the job page shows. When the one
+    that failed is master of a server that was listed through Azure, the line says what to do about it."""
+    lines = []
+    for error in errors:
+        line = f"{error['database']}: {error['error']}"
+        server, _, database = error["database"].rpartition("/")
+        if database.lower() == MASTER and server_key(server) in azure_servers:
+            line = f"{line.rstrip('. ')}. {AZURE_LISTING_NOTE}"
+        lines.append(line)
+    return lines
 
 
 def table_key(server: str, database: str, schema: str, table: str) -> tuple:

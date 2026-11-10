@@ -7092,7 +7092,9 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
     if not any(p["scope"] != "tables" for p in discovery_parts):
         return {"found": 0, "added": 0, "note": "the job's selection is specific tables, which add nothing"}
     ids = sorted({i for p in discovery_parts for i in str(p["source_id"] or "").split(",") if i})
-    readings, errors = rediscovery.specs(discovery_parts, db.query(q.selection_discoveries_sql(), (ids,)))
+    sources = db.query(q.selection_discoveries_sql(), (ids,))
+    readings, errors = rediscovery.specs(discovery_parts, sources)
+    azure_servers = rediscovery.azure_listed_servers(discovery_parts, sources)
     new_ids = []
     for server, spec in readings:
         discovery_id = uuid.uuid4().hex[:12]
@@ -7101,20 +7103,21 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
             report(phase=rediscovery.DISCOVERING, run_id=None, server=server)
             failed = _discover_through_warehouse(spec, discovery_id)
             if failed:
-                errors.append(f"{server}: {failed}")
+                errors.append(rediscovery.read_error(server, failed, azure_servers))
             continue
         try:
             spec, parameters = _rediscovery_reading(spec, job.get("created_by"))
         except HTTPException as refused:
-            errors.append(f"{server}: {_error_text(refused)}")
+            errors.append(rediscovery.read_error(server, _error_text(refused), azure_servers))
             continue
         run_id = jobs.run_now(_require(jobs.DISCOVER_JOB_ID, "discovery"),
                               {"discovery_id": discovery_id, "spec": json.dumps(spec), **parameters})
         report(phase=rediscovery.DISCOVERING, run_id=run_id, server=server)
         ended = _wait_for_run(run_id)
         if ended.get("result") != "SUCCESS":
-            errors.append(f"{server}: its discovery run ended {ended.get('result') or ended.get('state')}"
-                          + (f": {ended['message']}" if ended.get("message") else ""))
+            reason = (f"its discovery run ended {ended.get('result') or ended.get('state')}"
+                      + (f": {ended['message']}" if ended.get("message") else ""))
+            errors.append(rediscovery.read_error(server, reason, azure_servers))
     statuses = db.query(q.discovery_statuses_sql(), (new_ids,)) if new_ids else []
     found = db.query(q.source_rows_sql("discovery"), (new_ids,)) if new_ids else []
     taken = {r["task_collection"] for r in db.query(q.collections_sql())}
@@ -7133,7 +7136,7 @@ def _rediscover(sid: int, report=lambda **fields: None) -> dict:
             outcome = {"found": len(picked["add"]), "added": 0, "skipped": 0,
                        "new_databases": picked["new_databases"][:limit],
                        "vanished": {"count": len(picked["vanished"]), "tables": picked["vanished"][:limit]},
-                       "errors": (errors + [f"{e['database']}: {e['error']}" for e in picked["errors"]])[:limit],
+                       "errors": (errors + rediscovery.database_errors(picked["errors"], azure_servers))[:limit],
                        "discovery_ids": new_ids}
             if not picked["add"]:
                 return outcome, []
