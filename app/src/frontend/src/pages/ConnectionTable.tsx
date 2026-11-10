@@ -5,8 +5,8 @@ import { connectionTypeName } from "../cells";
 
 /** The Unity Catalog connections to choose from, one line to a row as Catalog Explorer's connections list is: the name
  * and host take the room there is, the type has a narrow column of its own and is never broken, and the owner is cut
- * with an ellipsis. Anything cut shows whole on hover or focus, and the host can be copied. `empty` is the note shown
- * in place of rows when there are none. */
+ * with an ellipsis. Anything cut shows whole on hover or focus, a click on any of a row's text chooses it, and the
+ * host can be copied without choosing it. `empty` is the note shown in place of rows when there are none. */
 export function ConnectionTable({ rows, chosen, disabled, onChoose, empty }: {
   rows: Row[]; chosen: string; disabled: boolean; onChoose: (name: string) => void; empty: ReactNode;
 }) {
@@ -18,12 +18,12 @@ export function ConnectionTable({ rows, chosen, disabled, onChoose, empty }: {
         {rows.map((c) => (
           <tr key={c.name} className="pick-row" onClick={() => { if (!disabled) onChoose(c.name); }}>
             <td><input type="radio" checked={chosen === c.name} readOnly aria-label={`Use ${c.name}`} /></td>
-            <td className="cell"><b><Cut text={c.name} tipOnlyWhenCut /></b></td>
-            <td className="cell"><Cut text={connectionTypeName(c.connection_type)} tipOnlyWhenCut /></td>
+            <td className="cell"><b><Cut text={c.name} tipOnlyWhenCut passClick /></b></td>
+            <td className="cell"><Cut text={connectionTypeName(c.connection_type)} tipOnlyWhenCut passClick /></td>
             <td className="cell mono">{c.host && <span className="cell-line">
-              <Cut text={c.host} tipOnlyWhenCut />
+              <Cut text={c.host} tipOnlyWhenCut passClick />
               <CopyButton text={c.host} label={`Copy host of ${c.name}`} /></span>}</td>
-            <td className="cell"><Cut text={c.owner ?? ""} tipOnlyWhenCut /></td>
+            <td className="cell"><Cut text={c.owner ?? ""} tipOnlyWhenCut passClick /></td>
           </tr>
         ))}
         {empty && <tr><td colSpan={5} className="muted">{empty}</td></tr>}

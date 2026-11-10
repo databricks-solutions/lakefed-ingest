@@ -7,7 +7,7 @@ import { AgGridReact } from "ag-grid-react";
 import { themeQuartz, type ColDef, type GridApi, type GridOptions } from "ag-grid-community";
 import { ApiError, type Row } from "./api";
 import { longWait } from "./pending";
-import { SOURCE_TYPE_NAMES, hostLabel, isCut } from "./cells";
+import { SOURCE_TYPE_NAMES, hostLabel, isCut, tipKeepsClick } from "./cells";
 
 // AG Grid in the workspace look: the design system's font, border, header and accent colors (styles.css).
 export const gridTheme = themeQuartz.withParams({
@@ -243,8 +243,11 @@ export function BigCount({ value }: { value: unknown }) {
 /** Text shown on hover, focus or tap in the page itself (data-tip), not the browser's title: drawn at the page's top
  * level, below its target or above it when there is no room, and always kept inside the window, so no table or
  * scrolling box can cut it off. It closes on scroll, resize, Escape or a tap elsewhere, so it never stays behind
- * at an old place. `focusable` makes it a tab stop (for text that is cut off, or a help note). */
-export function Tip({ text, children, focusable = false }: { text: string; children: ReactNode; focusable?: boolean }) {
+ * at an old place. `focusable` makes it a tab stop (for text that is cut off, or a help note). A click on the text
+ * stays with the tooltip unless the text has none or `passClick` is set: then it reaches the row or link around it. */
+export function Tip({ text, children, focusable = false, passClick = false }: {
+  text: string; children: ReactNode; focusable?: boolean; passClick?: boolean;
+}) {
   const ref = useRef<HTMLSpanElement>(null);
   const id = useId();
   const [at, setAt] = useState<DOMRect | null>(null);
@@ -268,7 +271,7 @@ export function Tip({ text, children, focusable = false }: { text: string; child
   return (
     <span ref={ref} className="tip-target" data-tip={text} tabIndex={focusable ? 0 : undefined}
       aria-describedby={at ? id : undefined} onMouseEnter={show} onFocus={show} onMouseLeave={hide} onBlur={hide}
-      onClick={(e) => { e.stopPropagation(); if (at) hide(); else show(); }}>
+      onClick={(e) => { if (tipKeepsClick(text, passClick)) e.stopPropagation(); if (at) hide(); else show(); }}>
       {children}
       {at && createPortal(<TipPop id={id} text={text} target={at} />, document.body)}
     </span>
@@ -292,8 +295,11 @@ function TipPop({ id, text, target }: { id: string; text: string; target: DOMRec
 }
 
 /** Text on one line: cut with an ellipsis when it does not fit, the whole text on hover or focus (as the Databricks
- * lists do). Only text that is cut is a tab stop. With `tipOnlyWhenCut` a short text has no tooltip repeating it. */
-export function Cut({ text, className = "cut", tipOnlyWhenCut = false }: { text: string; className?: string; tipOnlyWhenCut?: boolean }) {
+ * lists do). Only text that is cut is a tab stop. With `tipOnlyWhenCut` a short text has no tooltip repeating it. With
+ * `passClick` a click on the text also reaches the row it sits in, so a row can be chosen by clicking any of its text. */
+export function Cut({ text, className = "cut", tipOnlyWhenCut = false, passClick = false }: {
+  text: string; className?: string; tipOnlyWhenCut?: boolean; passClick?: boolean;
+}) {
   const ref = useRef<HTMLSpanElement>(null);
   const [cut, setCut] = useState(false);
   useLayoutEffect(() => {
@@ -302,7 +308,8 @@ export function Cut({ text, className = "cut", tipOnlyWhenCut = false }: { text:
     window.addEventListener("resize", measure);
     return () => window.removeEventListener("resize", measure);
   }, [text]);
-  return <Tip text={tipOnlyWhenCut && !cut ? "" : text} focusable={cut}><span ref={ref} className={className}>{text}</span></Tip>;
+  return <Tip text={tipOnlyWhenCut && !cut ? "" : text} focusable={cut} passClick={passClick}>
+    <span ref={ref} className={className}>{text}</span></Tip>;
 }
 
 /** A host name on one line: cut with an ellipsis when it does not fit, its full name (and port) on hover. */

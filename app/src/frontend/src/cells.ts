@@ -22,3 +22,10 @@ export function hostLabel(host: string, port?: unknown): string {
 export function isCut(scrollWidth: number, clientWidth: number): boolean {
   return scrollWidth > clientWidth + 1;
 }
+
+/** Whether a click on text with a tooltip stays with the tooltip, which it shows or hides, instead of also reaching the
+ * row, link or button around the text. Text with no tooltip has nothing to show, so its click always goes on to what
+ * is around it; `passClick` lets a click on text that has one do both. */
+export function tipKeepsClick(text: string, passClick: boolean): boolean {
+  return text !== "" && !passClick;
+}

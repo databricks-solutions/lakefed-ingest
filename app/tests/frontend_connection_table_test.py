@@ -39,7 +39,7 @@ def test_discover_lists_the_connections_through_the_table_component():
 def test_the_type_column_shows_the_display_name_and_every_text_cell_is_cut_not_wrapped():
     assert "connectionTypeName(c.connection_type)" in TABLE
     for cell in ("c.name", "c.host", "c.owner ?? \"\""):
-        assert f"<Cut text={{{cell}}} tipOnlyWhenCut />" in TABLE
+        assert f"<Cut text={{{cell}}} tipOnlyWhenCut passClick />" in TABLE
 
 
 def test_the_host_can_be_copied_without_choosing_the_row():
@@ -65,3 +65,13 @@ def test_the_shared_table_rules_and_the_other_host_cells_are_as_they_were():
     assert "<Cut text={hostLabel(host, port)} className=\"host\" />" in COMPONENTS
     assert 'tipOnlyWhenCut' not in COMPONENTS.split("export function Host")[1].split("export function CopyButton")[0]
     assert "table.data { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }" in STYLES
+
+
+def test_a_click_on_any_text_of_a_row_chooses_the_row():
+    """The review of 9 Nov: every cell's text sat in a tooltip whose click stopped there, so clicking the name chose
+    nothing. A tooltip with no text lets the click through, and the table asks the others to as well."""
+    tip = COMPONENTS.split("export function Tip(")[1].split("function TipPop")[0]
+    assert "if (tipKeepsClick(text, passClick)) e.stopPropagation();" in tip and "{ e.stopPropagation();" not in tip
+    cut = COMPONENTS.split("export function Cut(")[1].split("export function Host")[0]
+    assert "passClick={passClick}" in cut
+    assert TABLE.count("passClick") == 4 and TABLE.count("<Cut ") == 4
