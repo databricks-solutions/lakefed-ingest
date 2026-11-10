@@ -1,0 +1,5 @@
+# The test tools CI installs next to the operations app's packages (app/src/requirements.txt). requirements-ci.txt
+# is compiled from both, with hashes; to update it, see the command at its top.
+pytest
+httpx
+pyyaml

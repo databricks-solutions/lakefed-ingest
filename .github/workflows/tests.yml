@@ -2,7 +2,8 @@
 # operations app, pytest.ini), the Postgres-backed tests against a throwaway Postgres 16, and the frontend's type
 # check and build. Nothing here reaches Databricks or a source database, so it needs no secrets; live tests stay
 # manual (README, Tests). Hardened as the databricks-solutions org asks: actions pinned to full commit SHAs, a read-only
-# token that isn't kept in the checkout, pull_request only (never pull_request_target), and no install scripts.
+# token that isn't kept in the checkout, pull_request only (never pull_request_target), no install scripts, Python
+# packages from a hash-locked file (requirements-ci.txt) and the Postgres image by digest.
 name: tests
 
 on:
@@ -37,7 +38,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-          cache-dependency-path: app/src/requirements.txt
+          cache-dependency-path: requirements-ci.txt
 
       # The frontend tests run node --test on TypeScript files, which needs Node's built-in type stripping (22.18+).
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
@@ -54,8 +55,10 @@ jobs:
             -keyout "$RUNNER_TEMP/pgssl/server.key" -out "$RUNNER_TEMP/pgssl/server.crt"
           sudo chown 999:999 "$RUNNER_TEMP/pgssl/server.key" "$RUNNER_TEMP/pgssl/server.crt"   # the image's postgres user
           sudo chmod 600 "$RUNNER_TEMP/pgssl/server.key"
+          # postgres:16 pinned by digest (16.15 on 2026-11-10). Dependabot doesn't see this line: update it by hand.
           docker run -d --name pg -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust \
-            -v "$RUNNER_TEMP/pgssl:/certs:ro" postgres:16 \
+            -v "$RUNNER_TEMP/pgssl:/certs:ro" \
+            postgres:16@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657 \
             -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key -c max_connections=400
           # The image starts a temporary server for its init scripts first; wait for the real one.
           for i in $(seq 1 60); do
@@ -67,9 +70,11 @@ jobs:
           docker logs pg
           exit 1
 
+      # Every package, its version and its hashes come from requirements-ci.txt (compiled from app/src/requirements.txt
+      # and requirements-test.in; the command is at its top). pip refuses anything not in it or with another hash.
       - name: Install Python packages
         run: |
-          pip install --only-binary=:all: pytest httpx pyyaml -r app/src/requirements.txt
+          pip install --require-hashes --only-binary=:all: -r requirements-ci.txt
 
       - name: Install, type-check and build the frontend
         working-directory: app/src
