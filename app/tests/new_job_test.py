@@ -695,6 +695,30 @@ def test_a_preview_with_no_target_marks_no_line_invalid_for_it():
     assert created["errors"][:2] == ["set the target catalog", "set the target schema"] and created["lines"] == []
 
 
+def test_a_preview_with_no_target_does_not_depend_on_how_the_row_check_words_a_blank_target(monkeypatch):
+    # Review of 9 Nov: the preview used to drop the row check's "sink_catalog is required" by its exact words, so a
+    # reworded message would have brought the false errors back. It now hands the check a placeholder instead.
+    check = nj.q.validate_control_row
+
+    def reworded(row):
+        blank = [f"{key} needs a value" for key in ("sink_catalog", "sink_schema", "sink_table") if not row.get(key)]
+        return [e for e in check(row) if not e.endswith(" is required")] + blank
+
+    monkeypatch.setattr(nj.q, "validate_control_row", reworded)
+    text = HEAD + 'sql_a,lfc_eng_010,dbo,customers,"id, name",id\n'
+    no_target = {**PLAIN, "sink_catalog": "", "sink_schema": "", "sink_table": ""}
+    previewed = nj.plan("Job", text, no_target, require_target=False)
+    assert [(line["status"], line["errors"]) for line in previewed["lines"]] == [("valid", [])]
+    assert not previewed["lines"][0]["row"]["sink_catalog"]      # the placeholder is only for the check
+
+
+def test_a_preview_still_reports_a_real_problem_in_a_line_while_the_target_is_blank():
+    text = HEAD + 'sql_a,lfc_eng_010,dbo,customers,"id, name",\n'      # a change-tracked table with no primary key
+    previewed = nj.plan("Job", text, {**PLAIN, "sink_catalog": ""}, require_target=False)
+    assert previewed["lines"][0]["status"] == "invalid"
+    assert previewed["lines"][0]["errors"] == ["primary_key is required for load_type ct"]
+
+
 def test_a_preview_with_no_target_table_says_no_line_writes_another_lines_table():
     # With no table name yet every line's target is the same blank name, so none can be said to clash with another.
     text = HEAD + 'sql_a,db1,dbo,customers,"id",id\n' + 'sql_a,db1,dbo,orders,"id",id\n'
