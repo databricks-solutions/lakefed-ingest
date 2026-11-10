@@ -67,10 +67,11 @@ def settings_of(given: dict, new_job: bool = False) -> dict:
 
 
 def _placer(job_name: str, lines: List[dict], groups_per_server: placement.Groups,
-            group_of: Optional[Callable[[str, str], Union[str, placement.Spread, None]]],
+            group_of: Optional[Callable[[str, str], Union[str, placement.Spread, placement.Within, None]]],
             join: Optional[placement.Lightest] = None) -> Callable[[str, str, tuple], str]:
     """Where each line's table goes: its database's group if the job has it already (group_of; a placement.Spread for a
-    database spread over several groups); the lightest group of its server if the job has that server (join);
+    database spread over several groups, a placement.Within for one the job holds in several, whose new tables each go to
+    the lightest of those groups); the lightest group of its server if the job has that server (join);
     else an even placement over its server's new groups, by the tables the file gives each database. A database with
     more tables than a group holds goes to several groups, each table to one of them by its place among the database's
     tables in name order (placement.Spread.group_for), so a resumed write places every table again the same way."""
@@ -95,7 +96,7 @@ def _placer(job_name: str, lines: List[dict], groups_per_server: placement.Group
     def name(server: str, index: int) -> str:
         return f"{q.identifier(job_name)}_{q.identifier(server)}_c{index + 1:02d}"
 
-    def database_groups(server: str, database: str) -> Union[str, placement.Spread]:
+    def database_groups(server: str, database: str) -> Union[str, placement.Spread, placement.Within]:
         existing = known(server, database)
         if existing is not None:
             return existing
@@ -110,6 +111,8 @@ def _placer(job_name: str, lines: List[dict], groups_per_server: placement.Group
         groups = database_groups(server, database)
         if isinstance(groups, str):
             return groups
+        if isinstance(groups, placement.Within):
+            return join.place_within(server, database, groups.groups, table) if join else groups.groups[0]
         ordinal = ordinals.get((server, database.lower()), {})
         return groups.group_for(ordinal.get(table, 0), len(ordinal))
     return place
@@ -296,7 +299,8 @@ def job_inputs(job_name: str, job_rows: List[dict], groups_per_server: placement
                unity_catalog: bool = False) -> dict:
     """What a job's own rows say about the tables added to it: {"errors": the job's settings differ between its tables
     (nothing is planned while there are any), "given": the settings each table takes, "group_of": where a database
-    goes (a database the job has keeps its group, a new one joins its server's groups, a new server gets new groups),
+    goes (a database the job has keeps its group, or for one held in several groups each new table goes to the lightest
+    of them; a new one joins its server's groups, a new server gets new groups),
     "have": the (target, client_id) pairs the job already writes, "known": its groups}."""
     read = js.read(job_rows, unity_catalog)
     mixed = [name for name in _JOB_SETTINGS if "mixed" in read.get(name, {})]
@@ -304,22 +308,29 @@ def job_inputs(job_name: str, job_rows: List[dict], groups_per_server: placement
         return {"errors": [f"the job's {name.replace('_', ' ')} differs between its tables: set it in Edit first"
                            for name in mixed], "given": {}, "group_of": None, "join": None, "have": set(), "known": set()}
     given = {name: read[name]["value"] for name in _JOB_SETTINGS if read.get(name, {}).get("value") is not None}
-    database_groups: Dict[tuple, str] = {}
+    database_groups: Dict[tuple, List[str]] = {}
     server_groups: Dict[str, set] = {}
     tables_by_group: Dict[str, Dict[str, int]] = {}
     for r in job_rows:
         server = js.server_of(r)
-        database_groups.setdefault((server, str(r.get("src_database") or "").lower()), r["task_collection"])
+        held = database_groups.setdefault((server, str(r.get("src_database") or "").lower()), [])
+        if r["task_collection"] not in held:
+            held.append(r["task_collection"])
         server_groups.setdefault(server, set()).add(r["task_collection"])
         loads = tables_by_group.setdefault(server, {})
         loads[r["task_collection"]] = loads.get(r["task_collection"], 0) + 1
 
-    def group_of(server: str, database: str) -> Optional[str]:
-        return database_groups.get((server, database.lower()))
+    def group_of(server: str, database: str) -> Union[str, placement.Within, None]:
+        held = database_groups.get((server, database.lower()))
+        if not held:
+            return None
+        return held[0] if len(held) == 1 else placement.Within(tuple(held))
 
     have = {(".".join(str(r.get(k) or "").lower() for k, _ in js.TARGET_SETTINGS), str(r.get("client_id") or ""))
             for r in job_rows}
     join = placement.Lightest(tables_by_group, placement.split_size(groups_per_server))
+    for r in job_rows:
+        join.hold(js.server_of(r), str(r.get("src_database") or ""), name_in_database(r), r["task_collection"])
     return {"errors": [], "given": given, "group_of": group_of, "join": join, "have": have,
             "known": {g for gs in server_groups.values() for g in gs}}
 

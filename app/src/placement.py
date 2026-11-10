@@ -127,6 +127,13 @@ def _spread_over(groups: Iterable, shares: Iterable[int]) -> Spread:
     return Spread(groups=tuple(group for group, _ in taken), shares=tuple(share for _, share in taken))
 
 
+@dataclass(frozen=True)
+class Within:
+    """A database a job holds in several groups already (it was split): each of its new tables goes to the lightest of
+    these ``groups`` (Lightest.place_within)."""
+    groups: Tuple[str, ...]
+
+
 # Where a database goes: one group's index, or for a spread database its groups' indexes and shares, its first part first.
 Place = Union[int, Spread]
 
@@ -186,6 +193,7 @@ class Lightest:
         self._loads = {server: dict(groups) for server, groups in tables_by_group.items()}
         self._placed: Dict[Tuple[str, str], str] = {}
         self._spread: Dict[Tuple[str, str], Spread] = {}
+        self._tables: Dict[Tuple[str, str, tuple], str] = {}
         self.per_group = per_group
 
     def knows(self, server: str) -> bool:
@@ -204,6 +212,21 @@ class Lightest:
             self._placed[key] = group
         loads[group] += tables
         return group
+
+    def hold(self, server: str, database: str, table: tuple, group: str) -> None:
+        """Note that the job holds this table (its name in the database, lower case) in this group: a table of a split
+        database it is asked about again keeps its group and adds no load, since the group's load counts it already."""
+        self._tables[(server, str(database or "").lower(), table)] = group
+
+    def place_within(self, server: str, database: str, groups: Iterable[str], table: tuple) -> str:
+        """The group of a table added to a database held in several ``groups``: the table's own group if the job holds
+        it, else the lightest of those groups now (the first by name on a tie), which then counts the table."""
+        key = (server, str(database or "").lower(), table)
+        if key not in self._tables:
+            loads = self._loads.get(server) or {}
+            self._tables[key] = min(groups, key=lambda name: (loads.get(name, 0), name))
+            loads[self._tables[key]] = loads.get(self._tables[key], 0) + 1
+        return self._tables[key]
 
     def parts(self, server: str, tables: int) -> int:
         """How many of the server's groups a new database with ``tables`` tables needs (parts_for); 1 when it fits."""

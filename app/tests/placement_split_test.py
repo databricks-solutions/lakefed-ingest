@@ -215,6 +215,33 @@ def test_tables_added_to_a_job_whose_groups_differ_are_sized_to_the_room_in_each
     assert _groups_of(plan)["huge"] == {"job_sql_a_c01": 53, "job_sql_a_c02": 104, "job_sql_a_c03": 93}     # all three end at 113 or 114
 
 
+def _held_rows(held):
+    """The rows of a job holding database "huge" split over groups: held is {group: its tables}, named x<group><n>."""
+    return [{"id": at, "task_collection": group, "src_connection": "sql_a", "use_remote_query": True, "src_host": None,
+             "src_port": None, "src_type": "sqlserver", "src_database": "huge", "src_schema": "dbo",
+             "src_table": f"x{group}{n:04d}", "select_list": "id", "primary_key": "id", "load_type": "ct",
+             "write_mode": "merge", "sink_catalog": "main", "sink_schema": "s", "sink_table": f"x{group}{n:04d}",
+             "client_id": "huge", "client_attrs": None, "freshness_sla_minutes": None}
+            for at, (group, n) in enumerate((g, n) for g, tables in held.items() for n in range(tables))]
+
+
+def test_tables_added_to_a_database_split_over_groups_go_to_the_lightest_of_its_own_groups():
+    """Review of PR 41: only the group of the database's first row was known, so every new table piled onto it."""
+    rows = _held_rows({"job_sql_a_c01": 100, "job_sql_a_c02": 80})
+    plan = nj.plan_for_job("Job", _file(("huge", 60)), "ct", rows, placement.TablesPerGroup(1000))
+    assert plan["errors"] == [] and plan["new_groups"] == []
+    assert _groups_of(plan)["huge"] == {"job_sql_a_c01": 20, "job_sql_a_c02": 40}      # both end at 120
+
+
+def test_a_table_of_a_split_database_the_job_holds_already_keeps_its_group_and_adds_no_load():
+    rows = _held_rows({"job_sql_a_c01": 100, "job_sql_a_c02": 80})
+    again = HEAD + "".join(f'sql_a,huge,dbo,xjob_sql_a_c01{n:04d},"id",id\n' for n in range(5))
+    plan = nj.plan_for_job("Job", again + _file(("huge", 60))[len(HEAD):], "ct", rows, placement.TablesPerGroup(1000))
+    held = [line for line in plan["lines"] if line["status"] == "in_job"]
+    assert len(held) == 5 and {line["group"] for line in held} == {"job_sql_a_c01"}
+    assert _groups_of(plan)["huge"] == {"job_sql_a_c01": 25, "job_sql_a_c02": 40}      # the five held count for nothing
+
+
 @pytest.fixture
 def main():
     pytest.importorskip("fastapi")
