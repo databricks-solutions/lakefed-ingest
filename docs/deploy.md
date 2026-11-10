@@ -510,4 +510,6 @@ Writes use schema evolution (`MERGE WITH SCHEMA EVOLUTION`, `INSERT WITH SCHEMA 
 ... BY NAME`): adding a column to a control row's `select_list` adds it to the sink, and the job
 reseeds that table so historical rows are backfilled. New sinks are created with type widening on;
 for sinks created earlier run
-`ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')`.
+`ALTER TABLE <sink> SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')`. Text columns are always plain `STRING`;
+a sink created earlier with `CHAR(n)` or `VARCHAR(n)` columns has them changed to `STRING` on the next run that
+writes it, with no rows rewritten.
