@@ -702,6 +702,18 @@ def test_a_preview_with_no_target_table_says_no_line_writes_another_lines_table(
     assert [(line["status"], line["errors"]) for line in previewed["lines"]] == [("valid", []), ("valid", [])]
 
 
+@pytest.mark.parametrize("blank", [{"sink_catalog": ""}, {"sink_schema": ""}, {"sink_catalog": "", "sink_schema": ""}])
+def test_a_preview_with_a_catalog_or_schema_blank_still_finds_two_lines_writing_one_table(blank):
+    # Review of 9 Nov: the preview showed these lines as fine and Create refused them later. They do write one table;
+    # only a blank table name makes every line look like a clash.
+    text = HEAD + 'sql_a,db1,dbo,customers,"id",id\n' + 'sql_a,db2,dbo,customers,"id",id\n'
+    lines = nj.plan("Job", text, {**TABLE_ONLY, **blank}, require_target=False)["lines"]
+    assert lines[0]["status"] == "valid" and lines[1]["status"] == "invalid"
+    assert lines[1]["errors"] == [f"line 2 already writes {lines[1]['sink']}: turn fan-in on, or put {{database}} in the "
+                                  "target names"]
+    assert lines[1]["sink"].endswith(".customers")
+
+
 def test_a_preview_with_its_target_set_still_finds_two_lines_writing_one_table():
     text = HEAD + 'sql_a,db1,dbo,customers,"id",id\n' + 'sql_a,db2,dbo,customers,"id",id\n'
     lines = nj.plan("Job", text, TABLE_ONLY, require_target=False)["lines"]
