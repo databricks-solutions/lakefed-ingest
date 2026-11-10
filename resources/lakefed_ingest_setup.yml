@@ -50,6 +50,7 @@ resources:
             base_parameters:
               db_instance: "{{job.parameters.db_instance}}"
               db_name: "{{job.parameters.db_name}}"
+              lakebase_catalog: "{{job.parameters.lakebase_catalog}}"
           environment_key: lakebase_client
       environments:
         - environment_key: lakebase_client
@@ -68,6 +69,10 @@ resources:
           default: ${var.lakebase_instance}
         - name: db_name
           default: ${var.lakebase_database}
+        # The Unity Catalog catalog the database is registered as: after the table and column descriptions are applied,
+        # each table is described through it, so Unity Catalog (and Genie) shows the new descriptions at once. Blank skips.
+        - name: lakebase_catalog
+          default: ${var.lakebase_catalog}
 
   # The deploy runs the setup job and waits for it, so the schema is applied (or migrated) before the app starts; a
   # run that fails fails the deploy and is run again by the next one. db_name refers to the database catalog, which
@@ -79,6 +84,7 @@ resources:
       job_parameters:
         db_instance: ${resources.database_instances.lakebase.name}
         db_name: ${resources.database_catalogs.lakebase_catalog.database_name}
+        lakebase_catalog: ${resources.database_catalogs.lakebase_catalog.name}
       queue:
         enabled: true
       lifecycle:

@@ -476,6 +476,16 @@ The app's role gets SELECT, INSERT and UPDATE on every table in the schema from 
 cover tables the setup job creates later), and no DELETE, so a record can't be removed through the app. The audit log
 records each write with the value redacted (checked 30 Oct 2026).
 
+## Descriptions in Unity Catalog
+
+`src/lakefed_ingest/lakebase_comments.sql` describes every table and column as a Postgres comment (`COMMENT ON`), and a
+Lakebase database registered in Unity Catalog shows them as the tables' and columns' comments, for Genie and other AI
+tools (see [monitoring.md](monitoring.md), Ask Genie). The setup job applies the file on every run
+(`StateStore.apply_comments`, in one transaction), then describes each table through the catalog (its
+`lakebase_catalog` parameter), because Unity Catalog refreshes a Lakebase table's comments only when a query resolves
+it. Comments change no column or row, so they carry no schema version, and a failure to apply them only warns. A new
+table or column needs its description in the file: `tests/lakebase_comments_pg_test.py` fails without one.
+
 ## `schema_version`: schema versions applied
 
 One row per version (`state_store.SCHEMA_VERSION`) applied: `version`, `applied_at`, `applied_by`.
