@@ -145,8 +145,7 @@ CI installs only what [requirements-ci.txt](requirements-ci.txt) lists, each wit
 `app/src/requirements.txt` and [requirements-test.in](requirements-test.in) (the test tools). After changing either, or
 to take newer versions, compile it again with the command at its top (`uv pip compile ... --generate-hashes`).
 Dependabot ([.github/dependabot.yml](.github/dependabot.yml)) opens weekly pull requests for the actions, the Python
-packages and the npm packages, each release at least 7 days old. Changes to `.github/`, the requirements files and the
-npm lockfile need a review from an owner in [.github/CODEOWNERS](.github/CODEOWNERS).
+packages and the npm packages, each release at least 7 days old.
 
 For a dev or test source, `tests/synthetic/` builds a SQL Server database with 1,800 Change Tracking tables, applies
 changes to it, and reconciles the Delta tables with the source; see [tests/synthetic/README.md](tests/synthetic/README.md).

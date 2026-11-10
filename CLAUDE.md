@@ -44,8 +44,7 @@ CI (`.github/workflows/tests.yml`) runs the whole suite on every pull request (P
 Postgres 16 with SSL for the `*_pg_test.py` suites, and `npm run check`); once the check is added to the
 `protect_main` ruleset, a pull request must pass it to merge into main. It installs only `requirements-ci.txt` (hash-locked,
 compiled by `uv pip compile` from `app/src/requirements.txt` and `requirements-test.in`; recompile it after changing
-either) and pins the Postgres image by digest. Dependabot (`.github/dependabot.yml`) and CODEOWNERS (`.github/`, the
-requirements and the npm lockfile) cover the rest.
+either) and pins the Postgres image by digest. Dependabot (`.github/dependabot.yml`) opens the update pull requests.
 
 ### Deploy
 ```bash
