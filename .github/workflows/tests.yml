@@ -13,9 +13,10 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request cancels its older run; every push to main keeps its own run, so each merge gets a result.
 concurrency:
   group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   tests:

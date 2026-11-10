@@ -138,7 +138,8 @@ live SQL Server when the `LAKEFED_TEST_SQLSERVER_*` environment variables are se
 `postgres -c ssl=on -c max_connections=400`.
 
 Every pull request runs all of this in GitHub Actions ([.github/workflows/tests.yml](.github/workflows/tests.yml)) on
-Python 3.11 and 3.12, with a throwaway Postgres and the frontend's type check and build, and must pass it to merge.
+Python 3.11 and 3.12, with a throwaway Postgres and the frontend's type check and build. Once the check is added to
+the `main` branch's ruleset, a pull request must pass it to merge.
 
 For a dev or test source, `tests/synthetic/` builds a SQL Server database with 1,800 Change Tracking tables, applies
 changes to it, and reconciles the Delta tables with the source; see [tests/synthetic/README.md](tests/synthetic/README.md).

@@ -41,7 +41,8 @@ pytest tests/planner_test.py::test_name  # single test
 pytest job_orchestration/tests           # job orchestration version
 ```
 CI (`.github/workflows/tests.yml`) runs the whole suite on every pull request (Python 3.11 and 3.12, a throwaway
-Postgres 16 with SSL for the `*_pg_test.py` suites, and `npm run check`); it is required to merge into main.
+Postgres 16 with SSL for the `*_pg_test.py` suites, and `npm run check`); once the check is added to the
+`protect_main` ruleset, a pull request must pass it to merge into main.
 
 ### Deploy
 ```bash
