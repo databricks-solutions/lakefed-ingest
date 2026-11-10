@@ -1,7 +1,6 @@
 """Every text column in Databricks is a plain STRING: reads drop CHAR / VARCHAR lengths, and a sink made with them
 has those columns changed to STRING (ct_engine.plain_strings, widen_char_varchar). A CHAR(n) / VARCHAR(n) column
 fails any write of a longer value (DELTA_EXCEED_CHAR_VARCHAR_LIMIT) after the whole table has been read."""
-import sys
 import types
 
 import ct_engine as ce
@@ -60,36 +59,28 @@ class _DF:
     def __init__(self, schema):
         self.schema, self.selected = schema, None
 
+    def __getitem__(self, ref):
+        return _Col(ref)
+
     def select(self, *cols):
         out = _DF(_Schema())
         out.selected = cols
         return out
 
 
-def _fake_pyspark(monkeypatch):
-    functions = types.ModuleType("pyspark.sql.functions")
-    functions.col = lambda ref: _Col(ref)
-    sql = types.ModuleType("pyspark.sql")
-    sql.functions = functions
-    monkeypatch.setitem(sys.modules, "pyspark", types.ModuleType("pyspark"))
-    monkeypatch.setitem(sys.modules, "pyspark.sql", sql)
-    monkeypatch.setitem(sys.modules, "pyspark.sql.functions", functions)
-
-
-def test_plain_strings_casts_only_the_length_limited_columns(monkeypatch):
-    _fake_pyspark(monkeypatch)
-    df = _DF(_Schema(_Field("id", "int"), _Field("RTAXGRPID", metadata={ce.CHAR_VARCHAR_METADATA: "char(1)"}),
+def test_plain_strings_casts_only_the_length_limited_columns():
+    # Columns come from df[...], never F.col: no pyspark.sql.functions here (a fake df answers df[name]).
+    df = _DF(_Schema(_Field("id", "int"), _Field("status_code", metadata={ce.CHAR_VARCHAR_METADATA: "char(1)"}),
                      _Field("we`ird", "varchar(3)"), _Field("name")))
     out = ce.plain_strings(df)
     got = [(c.ref, c.ops) for c in out.selected]
     assert got == [("`id`", ()),
-                   ("`RTAXGRPID`", (("cast", "string"), ("alias", "RTAXGRPID", ()))),
+                   ("`status_code`", (("cast", "string"), ("alias", "status_code", ()))),
                    ("`we``ird`", (("cast", "string"), ("alias", "we`ird", ()))),
                    ("`name`", ())]
 
 
-def test_plain_strings_leaves_a_read_without_them_alone(monkeypatch):
-    _fake_pyspark(monkeypatch)
+def test_plain_strings_leaves_a_read_without_them_alone():
     df = _DF(_Schema(_Field("id", "int"), _Field("name")))
     assert ce.plain_strings(df) is df
     assert ce.plain_strings("no schema") == "no schema"                      # a test double passes through
@@ -133,11 +124,38 @@ def test_widen_char_varchar_alters_each_limited_column_once():
 
 def test_an_existing_sink_with_char_columns_is_changed_to_strings_when_a_run_first_meets_it():
     ce.forget_sinks()
-    spark = _Spark(_Field("id", "int"), _Field("RTAXGRPID", metadata={ce.CHAR_VARCHAR_METADATA: "char(1)"}))
-    cfg = {"src_schema": "dbo", "src_table": "RTAXGRP", "select_list": "id, RTAXGRPID"}
-    ce.ensure_sink_table(spark, cfg, "c.s.rtaxgrp")
-    assert spark.statements == ["ALTER TABLE c.s.rtaxgrp ALTER COLUMN `RTAXGRPID` TYPE STRING"]
-    assert ce.string_collations(spark.table("c.s.rtaxgrp")) == {"rtaxgrpid": ce.BINARY}   # ready for B41's keys
-    ce.ensure_sink_table(spark, cfg, "c.s.rtaxgrp")             # known this run: no more catalog work
+    spark = _Spark(_Field("id", "int"), _Field("status_code", metadata={ce.CHAR_VARCHAR_METADATA: "char(1)"}))
+    cfg = {"src_schema": "dbo", "src_table": "orders", "select_list": "id, status_code"}
+    ce.ensure_sink_table(spark, cfg, "c.s.orders")
+    assert spark.statements == ["ALTER TABLE c.s.orders ALTER COLUMN `status_code` TYPE STRING"]
+    # a plain STRING at Delta's default collation, so the key collation change still finds the column
+    assert ce.string_collations(spark.table("c.s.orders")) == {"status_code": ce.BINARY}
+    ce.ensure_sink_table(spark, cfg, "c.s.orders")              # known this run: no more catalog work
     assert len(spark.statements) == 1
     ce.forget_sinks()
+
+
+def _wired(monkeypatch):
+    """_read with plain_strings marking what it was given, so a test sees whether the read went through it."""
+    monkeypatch.setattr(ce, "plain_strings", lambda df: ("plain", df))
+
+
+def test_a_jdbc_read_goes_through_plain_strings(monkeypatch):
+    _wired(monkeypatch)
+    monkeypatch.setattr(ce, "_jdbc_config", lambda cfg: {"host": "h", "port": 1433, "user": "u", "password": "p"})
+
+    class _Reader:
+        def format(self, f): return self
+        def options(self, **kw): return self
+        def option(self, k, v): return self
+        def load(self): return "jdbc df"
+    spark = types.SimpleNamespace(read=_Reader())
+    cfg = {"id": 1, "src_type": "sqlserver", "src_database": "d", "secret_key": "k"}
+    assert ce._read(spark, cfg, "SELECT 1") == ("plain", "jdbc df")
+
+
+def test_a_remote_query_read_goes_through_plain_strings(monkeypatch):
+    _wired(monkeypatch)
+    spark = types.SimpleNamespace(sql=lambda stmt, args=None: "remote df")
+    cfg = {"id": 1, "src_type": "sqlserver", "src_connection": "conn", "src_database": "d", "use_remote_query": True}
+    assert ce._read(spark, cfg, "SELECT 1") == ("plain", "remote df")

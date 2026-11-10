@@ -428,9 +428,10 @@ def plain_strings(df):
     limited = set(char_varchar_columns(schema))
     if not limited:
         return df
-    from pyspark.sql import functions as F
-    return df.select(*[F.col(delta_column(f.name)).cast("string").alias(f.name) if f.name in limited
-                       else F.col(delta_column(f.name)) for f in schema.fields])
+    # df[name], not F.col(name): F.col goes through the JVM class lookup that holds the notebook class loader's lock,
+    # once per column (see _tag), and this runs on most reads. Quoted, so a name with a dot or backtick resolves.
+    return df.select(*[df[delta_column(f.name)].cast("string").alias(f.name) if f.name in limited
+                       else df[delta_column(f.name)] for f in schema.fields])
 
 
 def to_string_sql(sink_fqn: str, column: str) -> str:
