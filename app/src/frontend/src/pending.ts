@@ -246,10 +246,13 @@ export interface ErrorCodes { error_class?: string | null; sql_server_error?: nu
  *  18456"), the source's message, and what to do next. */
 export interface ConnectionFailure { code: string | null; message: string; hint: string }
 
-/** What a login needs to open master, where SQL Server lists its databases: the access Lakeflow Connect asks of its
- *  SQL Server database user ("Microsoft SQL Server database user requirements"), so one login serves both. */
-export const MASTER_ACCESS = "Give the login a user in master with VIEW ANY DATABASE and SELECT on sys.databases (on Azure SQL "
-  + "Database, membership in the ##MS_DatabaseConnector## server role instead): Lakeflow Connect asks for the same access.";
+/** What a login needs to list a server's databases from master. On SQL Server that is VIEW ANY DATABASE and SELECT on
+ *  sys.databases (the access Lakeflow Connect asks of its database user, "Microsoft SQL Server database user
+ *  requirements"). On Azure SQL Database the ##MS_DefinitionReader## server role carries VIEW ANY DATABASE, which is what
+ *  shows the databases in sys.databases; ##MS_DatabaseConnector## only lets a login open them (CONNECT ANY DATABASE). */
+export const MASTER_ACCESS = "Give the login a user in master with VIEW ANY DATABASE and SELECT on sys.databases. On Azure SQL "
+  + "Database, add the login to the ##MS_DefinitionReader## server role instead, which lets it see the databases; add "
+  + "##MS_DatabaseConnector## too if it also has to open each one.";
 
 const SQL_SERVER_HINTS: Record<number, string> = {
   18456: "The server refused the connection's login: check its user and password in Catalog Explorer (Connections, the "

@@ -115,7 +115,8 @@ def test_discover_says_when_the_login_cant_open_master_and_takes_typed_databases
     discover = (FRONTEND / "pages" / "Discover.tsx").read_text()
     pending = (FRONTEND / "pending.ts").read_text()
     assert "The login may not be able to open master" in discover and "{MASTER_ACCESS}" in discover
-    assert "VIEW ANY DATABASE" in pending and "##MS_DatabaseConnector##" in pending and "sys.databases" in pending
+    assert "VIEW ANY DATABASE" in pending and "##MS_DefinitionReader##" in pending and "sys.databases" in pending
+    assert "##MS_DatabaseConnector## too if it also has to open each one" in pending
     assert "function TypedDatabases" in discover and "Databases typed by hand are read by name" in discover
 
 

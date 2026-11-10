@@ -139,7 +139,7 @@ export function TriBox({ pick, label, onClick }: { pick: Pick; label: string; on
 const cantList = (error: unknown) => /FAILED_JDBC\.CONNECTION|Login failed|Cannot open database|HV000/i.test(String((error as Error)?.message ?? error));
 
 /** A failed connection test: its codes, the source's message and what to do. When the login may not open master, it
- *  needs the access Lakeflow Connect asks for, or the databases can be typed below. */
+ *  needs the access MASTER_ACCESS names, or the databases can be typed below. */
 function TestFailed({ error }: { error: unknown }) {
   const failure = connectionFailure(String((error as Error)?.message ?? error), (error as SourceError)?.codes);
   return <Notice tone="bad">

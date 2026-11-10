@@ -356,15 +356,23 @@ test("a failed connection test shows its codes, the source's message and what to
   assert.match(connectionFailure("x", { sqlstate: "08S01" }).hint, /network path/);
 });
 
-test("a login that can't open master is told the access Lakeflow Connect asks for, and may type the databases instead", () => {
+test("a login that can't open master is told the access to grant, and may type the databases instead", () => {
   const hint = connectionFailure("[FAILED_JDBC.CONNECTION] Cannot open database \"master\" requested by the login",
                                  { error_class: "FAILED_JDBC.CONNECTION", sql_server_error: 4060 }).hint;
   assert.ok(hint.startsWith("The login can't open master, where the server lists its databases."));
   assert.ok(hint.includes(MASTER_ACCESS));
   assert.match(hint, /Then test again, or type the databases below\.$/);
-  for (const name of ["VIEW ANY DATABASE", "sys.databases", "##MS_DatabaseConnector##", "Lakeflow Connect"]) {
+  for (const name of ["VIEW ANY DATABASE", "sys.databases", "##MS_DefinitionReader##", "##MS_DatabaseConnector##"]) {
     assert.ok(MASTER_ACCESS.includes(name), name);
   }
+});
+
+test("on Azure SQL Database the role that lists the databases comes first, and the one that only opens them is a second step", () => {
+  // The review of 9 Nov: ##MS_DatabaseConnector## grants CONNECT ANY DATABASE, not VIEW ANY DATABASE, so a login with only
+  // that role can open master and still see no databases. ##MS_DefinitionReader## is the role that lists all of them.
+  const azure = MASTER_ACCESS.split("On Azure SQL Database")[1];
+  assert.ok(azure.indexOf("##MS_DefinitionReader##") < azure.indexOf("##MS_DatabaseConnector##"));
+  assert.match(azure, /add ##MS_DatabaseConnector## too if it also has to open each one/);
 });
 
 test("a failed test with no code, such as the app refusing the request, says so plainly and still says what to do", () => {
