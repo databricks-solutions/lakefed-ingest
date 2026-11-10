@@ -1522,8 +1522,12 @@ def control_params(row: dict) -> tuple:
 
 # ---- bulk import (table discovery) --------------------------------------------------------------
 
-DEFAULT_PARTITION_THRESHOLD_MB = 1024   # tables at least this large get a partitioned seed / full load
-DEFAULT_PARTITION_SIZE_MB = 512
+# Tables at least this large (SQL Server's allocated size) get a partitioned seed / full load, in partitions of about
+# DEFAULT_PARTITION_SIZE_MB. A run already loads many tables at once, and each partitioned table costs a size and a
+# bounds query, a staging table and a swap, and adds parallel queries on its source, so partitioning pays only for the
+# tables whose single read outlasts the rest of a run: about 10 GB and up at the rates measured (a few MB/s per read).
+DEFAULT_PARTITION_THRESHOLD_MB = 10240
+DEFAULT_PARTITION_SIZE_MB = 2048
 
 
 def discoveries_sql() -> str:
@@ -3333,6 +3337,16 @@ def upload_head_sql() -> str:
             f"order by line limit %s) l on true where u.upload_id = %s")
 
 
+def _partitioning_fields(t: str) -> str:
+    """The jsonb fields of a discovered table's partitioning, as recommended_partitioning gives it with the default
+    threshold and partition size: a table at least that large with a partition candidate loads partitioned on it; any
+    other gets no fields (a blank cell, so the job's default of no partitioning)."""
+    big = f"{t}.partition_candidate is not null and coalesce({t}.size_mb, 0) >= {DEFAULT_PARTITION_THRESHOLD_MB}"
+    return (f"'load_partitioned', case when {big} then 'true' end, "
+            f"'partition_col', case when {big} then {t}.partition_candidate end, "
+            f"'partition_size_mb', case when {big} then '{DEFAULT_PARTITION_SIZE_MB}' end")
+
+
 def source_rows_sql(kind: str) -> str:
     """The tables of an upload (its ok lines; param upload_id) or of discoveries (param: list of discovery ids; a
     table found by more than one, its latest finding), each with its server, database, schema, table, load type, and
@@ -3352,7 +3366,7 @@ def source_rows_sql(kind: str) -> str:
             f"'secret_key', case when d.src_connection is null then d.secret_key end, "
             f"'src_database', t.src_database, 'src_schema', t.src_schema, 'src_table', t.src_table, "
             f"'select_list', t.select_list, 'primary_key', t.primary_key, 'cursor_column', t.cursor_column, "
-            f"'load_type', t.load_type) as fields "
+            f"'load_type', t.load_type, {_partitioning_fields('t')}) as fields "
             f"from {SCHEMA}.discovered_table t join {SCHEMA}.discovery d "
             f"on d.discovery_id = t.discovery_id and d.src_database = t.src_database "
             f"where t.discovery_id = any(%s) "
