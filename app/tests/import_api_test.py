@@ -169,12 +169,13 @@ def test_a_blank_group_name_is_refused(client):
     assert client.db.of("insert into lakefed_ingest.control (") == []
 
 
-def test_an_import_that_would_split_a_database_across_two_groups_is_refused(client):
+def test_an_import_that_splits_a_database_across_two_groups_is_written_with_a_warning(client):
     client.db.split = {q.database_key(dict(src_connection="sql_a", use_remote_query=True, src_database="Sales",
                                            task_collection="g9"))}
     r = _import(client, dry_run=False)
-    assert r.status_code == 409 and "Sales" in r.json()["detail"]["message"]
-    assert "Move all of its tables into one group. Nothing was written." in r.text
+    assert r.status_code == 200 and r.json()["counts"].get("imported")
+    [warning] = r.json()["warnings"]
+    assert "Sales" in warning["message"] and "more than one ingestion group" in warning["message"]
 
 
 def test_a_mistyped_setting_is_refused_and_false_reads_as_false(client):

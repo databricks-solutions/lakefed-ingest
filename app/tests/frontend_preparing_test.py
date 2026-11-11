@@ -79,7 +79,8 @@ def test_edit_keeps_what_waits_for_ready_locked_and_says_why():
 
 
 def test_new_job_opens_the_job_page_once_create_names_the_job():
-    assert "if (r.id != null && (r.created || r.prepare)) navigate(`/ingestion-jobs/${r.id}`);" in NEW_JOB
+    assert ("if (r.id != null && (r.created || r.prepare)) navigate(`/ingestion-jobs/${r.id}`, "
+            "{ state: { warnings: r.warnings ?? [] } });") in NEW_JOB
 
 
 def test_the_jobs_list_takes_its_status_from_the_server():

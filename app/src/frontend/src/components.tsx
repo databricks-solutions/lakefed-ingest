@@ -612,12 +612,29 @@ export function ErrorBox({ error }: { error: unknown }) {
     <div className="alert bad">
       <strong>Error:</strong> {e.message ?? String(error)}
       {e.hint && <div className="hint">{e.hint}</div>}
-      {Array.isArray(e.detail?.jobs) && e.detail.jobs.map((job: Row) => (
-        <div className="hint" key={job.id}>
-          Open ingestion job <Link to={`/ingestion-jobs/${job.id}`}>{job.name}</Link>
+    </div>
+  );
+}
+
+/** What a write that went through wants the user to know (its answer's warnings), as the Databricks UI shows a warning
+ *  that blocks nothing: a yellow alert where the action was taken, saying what was done and what it costs, with a link
+ *  to each job it names. A database a write splits over several ingestion groups is the one warning so far (main.py
+ *  _split_database_warnings); a later write to a database split already has none. */
+export function WriteWarnings({ warnings }: { warnings?: Row[] | null }) {
+  if (!warnings?.length) return null;
+  return (
+    <>
+      {warnings.map((warning, index) => (
+        <div className="alert warn" role="status" key={index}>
+          <strong>Warning:</strong> {warning.message}
+          {Array.isArray(warning.jobs) && warning.jobs.map((job: Row) => (
+            <div className="hint" key={job.id}>
+              Open ingestion job <Link to={`/ingestion-jobs/${job.id}`}>{job.name}</Link>
+            </div>
+          ))}
         </div>
       ))}
-    </div>
+    </>
   );
 }
 

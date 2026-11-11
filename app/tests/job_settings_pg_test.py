@@ -265,3 +265,46 @@ def test_a_jobs_target_tables_count_their_sources_inside_and_outside_it_and_seve
     sources = client.get(f"/api/ingestion-jobs/{client.sid}/targets/sources",
                          params={"target": "bronze.extraction.orderline"}).json()
     assert [(s["database"], s["rows_written_7d"]) for s in sources["items"]] == [("db_1", 10), ("db_2", None)]
+
+
+def test_moving_one_table_of_a_database_to_another_group_of_the_job_is_written_with_a_warning(client):
+    """A split by hand: the edit commits, and its answer warns, naming the database, its groups and the job."""
+    import psycopg
+    with psycopg.connect(client.target) as conn:
+        [(invoice,)] = conn.execute("select id from lakefed_ingest.control where src_database = 'db_1' "
+                                    "and src_table = 'Invoice'").fetchall()
+    r = client.post("/api/tables/edit", json={"ids": [invoice], "changes": {"task_collection": "cust_c02"},
+                                              "dry_run": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["summary"]["applied"] is True
+    [warning] = r.json()["warnings"]
+    assert warning["databases"] == [{"database": "db_1", "groups": ["cust_c01", "cust_c02"]}]
+    assert warning["jobs"] == [{"id": client.sid, "name": "Customer"}]
+    with psycopg.connect(client.target) as conn:
+        groups = conn.execute("select src_table, task_collection from lakefed_ingest.control "
+                              "where src_database = 'db_1' order by src_table").fetchall()
+    assert groups == [("Invoice", "cust_c02"), ("OrderLine", "cust_c01")]
+
+
+def test_a_later_edit_of_a_table_in_a_database_split_already_is_written_with_no_warning(client):
+    import psycopg
+    with psycopg.connect(client.target, autocommit=True) as conn:
+        conn.execute("update lakefed_ingest.control set task_collection = 'cust_c02' "
+                     "where src_database = 'db_1' and src_table = 'Invoice'")
+        [(invoice,)] = conn.execute("select id from lakefed_ingest.control where src_database = 'db_1' "
+                                    "and src_table = 'Invoice'").fetchall()
+    r = client.post("/api/tables/edit", json={"ids": [invoice], "changes": {"freshness_sla_minutes": 45},
+                                              "dry_run": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["summary"]["applied"] is True
+    assert r.json()["warnings"] == []
+
+
+def test_the_tree_flags_a_database_split_over_groups_of_the_job(client):
+    import psycopg
+    with psycopg.connect(client.target, autocommit=True) as conn:
+        conn.execute("update lakefed_ingest.control set task_collection = 'cust_c02' "
+                     "where src_database = 'db_1' and src_table = 'Invoice'")
+    dbs = client.get(f"/api/ingestion-jobs/{client.sid}/tree", params={"server": "sql_01"}).json()
+    assert {d["database"]: d["groups"] for d in dbs["items"]} == {"db_1": ["cust_c01", "cust_c02"],
+                                                                  "db_2": ["cust_c02"]}

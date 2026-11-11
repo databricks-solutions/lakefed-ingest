@@ -3,7 +3,7 @@ read in, the units a selection takes, and the plan of one database. Pure: the en
 Lakebase and write each database's own transaction (main.py)."""
 import contextlib
 import time
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import new_job as nj
 import placement
@@ -72,12 +72,15 @@ def groups_by_server(servers: List[dict], groups_per_server: placement.Groups = 
     return {s["server"]: placement.group_count(s["tables"], groups_per_server) for s in servers}
 
 
-def group_of_placement(job_name: str, placements: Dict[str, Dict[str, int]]) -> Callable[[str, str], str]:
+def group_of_placement(job_name: str, placements: Dict[str, Dict[str, placement.Place]]
+                       ) -> Callable[[str, str], Union[str, placement.Spread]]:
     """Where a new job's database goes, from its even placement (placement.server_placements over the selection's
-    databases): its server's group with that index."""
-    def group_of(server: str, database: str) -> str:
-        index = placements.get(server, {}).get(str(database or "").lower(), 0)
-        return f"{nj.q.identifier(job_name)}_{nj.q.identifier(server)}_c{index + 1:02d}"
+    databases): its server's group with that index, or for a database spread over several groups a Spread of their
+    names with the tables each takes (new_job.plan puts each table in one of them)."""
+    def group_of(server: str, database: str) -> Union[str, placement.Spread]:
+        place = placements.get(server, {}).get(str(database or "").lower(), 0)
+        return placement.named(
+            place, lambda index: f"{nj.q.identifier(job_name)}_{nj.q.identifier(server)}_c{index + 1:02d}")
     return group_of
 
 

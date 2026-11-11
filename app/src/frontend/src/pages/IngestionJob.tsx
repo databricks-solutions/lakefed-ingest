@@ -1,6 +1,6 @@
-import { Fragment, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, qs, type ApiError, type Row } from "../api";
 import { Refused } from "../permissions";
 import { changeInProgress, deleteNotice, rediscoveryBusy, rediscoveryButton, rediscoveryNotice, runButton, runTimeoutNotice,
@@ -11,7 +11,7 @@ import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { FailingTables } from "./FailingTables";
 import { RunningTasks } from "./tasks";
-import { Busy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateSummary, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest, Twisty } from "../components";
+import { Busy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateSummary, WriteWarnings, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest, Twisty } from "../components";
 
 const PAGE = 25;
 
@@ -216,6 +216,7 @@ function Preparation({ jobId, deleteRefusal, onDelete }: { jobId: string; delete
         aria-label={`${line}: ${fmtInt(bar.done)} of ${fmtInt(bar.total)}`} />}
       <p className="muted small">Run now: {AVAILABLE_WHEN_READY}. {scheduleWhenReady(p)}.</p>
       <ErrorBox error={prepare.error || act.error} />
+      <WriteWarnings warnings={p.warnings} />
       {listed.length > 0 && <>
         <div className="table-wrap"><table className="data dense">
           <thead><tr><th>Server</th><th>Database</th><th>Why it was set aside</th></tr></thead>
@@ -278,6 +279,18 @@ function TargetNames({ jobId, stored, onClose }: { jobId: string; stored: Row; o
 export default function IngestionJob() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const [createWarnings, setCreateWarnings] = useState<Row[]>([]);
+  useEffect(() => setCreateWarnings([]), [id]);
+  // The warnings of the Create that landed here (NewJob.tsx) are read into the page once and taken off the history
+  // entry, which the browser keeps through a reload or a Back, so they show the once.
+  useEffect(() => {
+    const warnings = (location.state as Row | null)?.warnings as Row[] | undefined;
+    if (warnings?.length) {
+      setCreateWarnings(warnings);
+      navigate(location.pathname, { replace: true, state: null });
+    }
+  }, [location.key]);
   const [pages, setPages] = useState<string[]>([]);
   const before = pages[pages.length - 1];
   const qc = useQueryClient();
@@ -371,6 +384,7 @@ export default function IngestionJob() {
       {j && <p className="muted small">Created by {j.created_by ?? "unknown"}{j.created_at ? `, ${fmtTime(j.created_at)}` : ""} ·
         Last updated by {j.updated_by ?? "unknown"}{j.updated_at ? `, ${fmtTime(j.updated_at)}` : ""}</p>}
       {confirm.dialog}
+      <WriteWarnings warnings={createWarnings} />
       <RunningTasks jobId={id} />
       {j?.prepare && j.prepare.state !== "ready" && !j.delete
         && <Preparation jobId={id} deleteRefusal={j.delete_blocked} onDelete={() => setDeleting(true)} />}
@@ -493,6 +507,7 @@ function RediscoveryLast({ last }: { last: Row }) {
         {errors.length > 0 && <li>Could not be read: {errors.join("; ")}</li>}
         {skipped.length > 0 && <li>Not added: {skipped.map((s) => `${s.table} (${(s.errors ?? []).join(", ")})`).join("; ")}</li>}
       </ul>}
+      {last.status === "done" && <WriteWarnings warnings={last.warnings} />}
     </div>
   );
 }
