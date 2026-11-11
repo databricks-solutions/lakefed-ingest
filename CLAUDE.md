@@ -97,6 +97,9 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   instance label) and one per ingestion group, rewritten in the same transaction as the rows they count (the engine
   after each database's work, the app after its own edits). The pages read them, so counts are never scanned from
   control; a grain with no control row left is zeroed (`control_rows = 0`), not deleted. See `docs/lakebase_schema.md`.
+- Every table and column has a description in `src/lakefed_ingest/lakebase_comments.sql` (`COMMENT ON`), which Unity
+  Catalog shows for Genie; the setup job applies it on every run (`StateStore.apply_comments`) and describes each table
+  through `lakebase_catalog`. A new table or column needs one (`tests/lakebase_comments_pg_test.py`); no schema version.
 - DDL is applied by `StateStore.migrate` (from `apply_lakebase_schema.ipynb`, and from `ingest.ipynb`
   when `schema_version` is behind `state_store.SCHEMA_VERSION`, so upgrades are deploy-only): one
   transaction, split on `;`, no `DO $$` blocks, no `CREATE INDEX CONCURRENTLY`. Migrations must be

@@ -7,6 +7,15 @@ registered as a Unity Catalog catalog (`lakefed_ingest_lakebase`, via the `datab
 in `lakefed_ingest_setup.yml`), so you query the telemetry **directly from DBSQL**, with no sync job,
 no copy. Writes go to Lakebase (point writes from the ingestion run); reads go through UC federation.
 
+### Ask Genie
+
+Every Lakebase table and column carries a description (`src/lakefed_ingest/lakebase_comments.sql`), which Unity
+Catalog shows as the table's and column's comment. The setup job applies them on every run and describes each table
+through the catalog, so they show at once. Add the catalog's `lakefed_ingest` tables (say `ingest_run`, `ingest_event`,
+`control`, `checkpoint`, `rollup_group` and `rollup_database`) to a Genie space, and ask in plain words: which tables
+failed in the last day and why, which groups are late, how long the last runs took. The queries below make good
+sample questions for it.
+
 ## Tables (Lakebase, UC path `lakefed_ingest_lakebase.lakefed_ingest`)
 
 If your target overrides the `lakebase_catalog` bundle variable, substitute that catalog name in the
