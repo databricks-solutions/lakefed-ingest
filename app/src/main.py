@@ -1966,7 +1966,24 @@ def ingestion_job_live(job_id: int):
     found = db.query(q.check_work_found_sql(), (work_ids,)) if check and work_ids else []
     stamped = db.query(q.database_checks_since_sql(), (groups, check["started"]))[0]["databases"] \
         if check and check.get("started") and groups else None
-    return ij.live_view(wrappers, checks, ingest, groups, found, stamped, _running(), now)
+    check_record = next(iter(db.query(q.check_records_since_sql(), (groups, check["started"]))), None) \
+        if check and ij.is_active(check) and check.get("started") and groups else None
+    view = ij.live_view(wrappers, checks, ingest, groups, found, stamped, _running(), now, check_record)
+    _forget_shared_reads_when_run_ends(job_id, view["active"])
+    return view
+
+
+_run_was_going: Dict[int, bool] = {}    # job id: whether the last live read of it found a run going
+
+
+def _forget_shared_reads_when_run_ends(job_id: int, going: bool) -> None:
+    """The first live read that finds a job's run over drops the shared reads once. The engine writes the last state
+    of its tables without the app's help, so a read shared a few seconds earlier would show the page's last read
+    before the final counts. The page's final read, which follows this answer, then reads them fresh."""
+    was_going = _run_was_going.get(job_id, False)
+    _run_was_going[job_id] = going
+    if was_going and not going:
+        _forget_shared_reads()
 
 
 @app.post("/api/ingestion-jobs/{job_id}/stop")
@@ -2199,9 +2216,18 @@ def _reads_by_host(fetch, groups: List[str]) -> bool:
 def ingestion_job_tree(job_id: int, server: str = "", database: str = "", search: str = "", offset: int = 0,
                        limit: int = 50):
     """One level of a job's tables: its servers; with server, that server's databases; with database too, that
-    database's tables. Searched and paged at each level."""
-    groups = _job_groups(job_id)
+    database's tables. Searched and paged at each level. The first level with no search is one read per job for
+    everyone watching, so more viewers cost no more reads; the levels a viewer opens are read for that viewer."""
     offset, limit = max(0, int(offset)), max(1, min(int(limit), 200))
+    if not server and not search.strip():
+        return _shared(("job_tree_servers", int(job_id), offset, limit),
+                       lambda: _job_tree_level(job_id, server, database, search, offset, limit))
+    return _job_tree_level(job_id, server, database, search, offset, limit)
+
+
+def _job_tree_level(job_id: int, server: str, database: str, search: str, offset: int, limit: int) -> dict:
+    """The rows of one level of a job's tree, as ingestion_job_tree answers."""
+    groups = _job_groups(job_id)
     pattern = f"%{search.strip()}%"
     if not groups:
         rows, level = [], "servers"
@@ -2224,9 +2250,18 @@ def ingestion_job_tree(job_id: int, server: str = "", database: str = "", search
 def ingestion_job_targets(job_id: int, search: str = "", offset: int = 0, limit: int = 25):
     """A job's target tables: each with the source tables of the job writing it (and how many outside it), their
     states, the rows the run records say were written over 7 days, and a link to the table in Catalog Explorer;
-    fan_in counts those written from more than one source table. Searched by name and paged."""
-    groups = _job_groups(job_id)
+    fan_in counts those written from more than one source table. Searched by name and paged. The first page with no
+    search is one read per job for everyone watching, as the tree's first level is."""
     offset, limit = max(0, int(offset)), max(1, min(int(limit), 200))
+    if not search.strip() and offset == 0:
+        return _shared(("job_targets_first", int(job_id), limit),
+                       lambda: _job_targets_page(job_id, search, offset, limit))
+    return _job_targets_page(job_id, search, offset, limit)
+
+
+def _job_targets_page(job_id: int, search: str, offset: int, limit: int) -> dict:
+    """One page of a job's target tables, as ingestion_job_targets answers."""
+    groups = _job_groups(job_id)
     rows = (db.query(q.job_targets_sql(), (groups, groups, groups, f"%{search.strip()}%", limit, offset))
             if groups else [])
     host = db.workspace().config.host.rstrip("/")

@@ -7,11 +7,12 @@ import { changeInProgress, deleteNotice, rediscoveryBusy, rediscoveryButton, red
   type RediscoveryProgress } from "../pending";
 import { AVAILABLE_WHEN_READY, preparingBar, preparingLine, scheduleWhenReady, setAsideWhy, type PrepareView,
   type SetAside } from "../preparing";
+import { useJobPageRefresh } from "../useJobPageRefresh";
 import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { FailingTables } from "./FailingTables";
 import { RunningTasks } from "./tasks";
-import { Busy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateSummary, WriteWarnings, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest, Twisty } from "../components";
+import { Busy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateSummary, WriteWarnings, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, usePageStamp, type ConfirmRequest, Twisty } from "../components";
 
 const PAGE = 25;
 
@@ -130,9 +131,10 @@ function RunningNow({ live }: { live: Row }) {
             <h3><span className="step-number">1</span>Check<Info label="About the check">Looks at each database for changes, then starts
               a group run for each group with work.</Info></h3>
             <div className="table-wrap"><table className="data dense">
-              <thead><tr><th>Status</th><th>Started</th><th>What it found</th><th></th></tr></thead>
+              <thead><tr><th>Status</th><th>Started</th><th>Finished</th><th>What it found</th><th></th></tr></thead>
               <tbody><tr>
                 <td><RunStatus status={null} outcome={check.status} /></td><td>{fmtClock(check.started)}</td>
+                <td>{check.ended ? fmtClock(check.ended) : ""}</td>
                 <td>{found && !checking
                   ? <>{fmtInt(found.databases_with_work)} {plural(found.databases_with_work, "database")} changed
                     {found.unchanged_databases != null && <>, {fmtInt(found.unchanged_databases)} unchanged and stamped</>};{" "}
@@ -335,12 +337,16 @@ export default function IngestionJob() {
   const live = useQuery({ queryKey: ["ingestion-job-live", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/live`),
                           refetchInterval: (q) => (busy ? 3_000 : (q.state.data as Row | undefined)?.active ? 5_000 : 15_000) });
   const refusal = (runNow.error as ApiError | null)?.detail;
+  // While a run is going the whole page is read together every 15 s, and once more when it ends (jobPageRefresh.ts).
+  const pageReadAt = useJobPageRefresh(id, live.data);
   const runs = useQuery({
     queryKey: ["ingestion-job-runs", id, before],
     queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/runs${qs({ before, limit: PAGE })}`),
     refetchInterval: before ? false : 15_000,
   });
   const j = job.data;
+  const readMs = Math.max(job.dataUpdatedAt, pageReadAt);
+  usePageStamp(readMs ? new Date(readMs).toISOString() : undefined, 15, job.error);
   const last = j?.last_job_run;
   const button = runButton(j?.run_now, { starting: runNow.isPending, cancelling: stop.isPending });
   const timeout = runTimeoutNotice(j?.run_now);
