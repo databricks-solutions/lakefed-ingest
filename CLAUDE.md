@@ -29,7 +29,8 @@ own directory.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install pytest            # unit tests need nothing else; tests/validation_test.py also needs pytds
+pip install --require-hashes -r requirements-ci.txt   # CI's hash-locked install; tests/validation_test.py also needs pytds
+(cd app/src && npm ci)        # the frontend tests' packages
 ```
 
 ### Run Tests
@@ -39,6 +40,12 @@ pytest tests                             # default version
 pytest tests/planner_test.py::test_name  # single test
 pytest job_orchestration/tests           # job orchestration version
 ```
+CI (`.github/workflows/tests.yml`) runs the whole suite on every pull request (Python 3.11 and 3.12, a throwaway
+Postgres 16 with SSL for the `*_pg_test.py` suites, and `npm run check`); once the check is added to the
+`protect_main` ruleset, a pull request must pass it to merge into main. It installs only `requirements-ci.txt` (hash-locked,
+compiled by `uv pip compile` from `app/src/requirements.txt` and `requirements-test.in`; recompile it after changing
+either) and pins the Postgres image by digest. Dependabot (`.github/dependabot.yml`) and CODEOWNERS (`.github/`, the
+requirements and the npm lockfile) cover the rest.
 
 ### Deploy
 ```bash

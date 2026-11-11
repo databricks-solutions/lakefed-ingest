@@ -1,0 +1,45 @@
+# Weekly update pull requests for the workflow's actions, the Python packages and the frontend's npm packages, each
+# release at least 7 days old. The tests check runs on every one, as on any pull request.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # requirements-ci.txt, the hash-locked CI install (uv pip compile, regenerated with its hashes).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      python:
+        patterns: ["*"]
+
+  # The operations app's packages for Databricks Apps.
+  - package-ecosystem: pip
+    directory: /app/src
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      app-python:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /app/src
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      npm:
+        patterns: ["*"]
