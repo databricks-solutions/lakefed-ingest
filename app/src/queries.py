@@ -2523,13 +2523,15 @@ group by 1 order by 1 limit %s offset %s"""
 
 def job_databases_sql() -> str:
     """Params: groups (for the job's table count), groups, server, search pattern, limit, offset. ``missing`` is
-    how many of the job's tables the database lacks."""
+    how many of the job's tables the database lacks; ``groups`` names the job's ingestion groups its tables are in,
+    more than one for a split database (the job page flags it)."""
     return f"""
 with job_tables as (
     select count(distinct (lower(src_schema), lower(src_table))) as n from {SCHEMA}.control where task_collection = any(%s)
 )
 select coalesce(t.src_database, '') as database, min(t.client_id) as client_id, count(*) as tables,
        count(*) filter (where t.task_enabled) as enabled_tables, {STATE_COUNTS},
+       array_agg(distinct t.task_collection order by t.task_collection) as groups,
        (select n from job_tables) - count(*) as missing, count(*) over () as total
 {_JOB_ROWS} and {SERVER} = %s and coalesce(t.src_database, '') ilike %s
 group by 1 order by 1 limit %s offset %s"""
@@ -2668,9 +2670,10 @@ def database_key(row: dict) -> str:
 
 def split_databases_sql() -> str:
     """Databases among the given keys (``database_key``) whose control rows are in more than one
-    collection. A database's tables share one collection: its run takes the collection's lock and the
-    check job reads the database once for the collection. Param: list of keys. Returns key, database,
-    collections. The database names (each key's last part) narrow the rows through control_database_idx."""
+    collection: a split database, which the app writes and warns about (main._split_database_warnings), since each
+    collection checks it and loads its own tables, at the cost of more queries on its server. Param: list of keys.
+    Returns key, database, collections. The database names (each key's last part) narrow the rows through
+    control_database_idx."""
     key = f"{database_source_sql('t')} || chr(31) || coalesce(t.src_database, '')"
     return (f"with k as (select unnest(%s::text[]) as key) "
             f"select {key} as key, min(t.src_database) as src_database, "

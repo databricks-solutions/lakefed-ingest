@@ -5,7 +5,7 @@ import { type ColDef } from "ag-grid-community";
 import { api, type Row } from "../api";
 import { useSettings } from "../App";
 import { groupsRefusal, usePermissions } from "../permissions";
-import { Badge, Busy, Cols, ConfirmButton, Cut, ErrorBox, FillBox, ToastOn, Grid, Notice, PageHead, Section, Tag, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme, Host, oneLine, plural } from "../components";
+import { Badge, Busy, Cols, ConfirmButton, Cut, ErrorBox, FillBox, ToastOn, Grid, Notice, PageHead, Section, Tag, WriteWarnings, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme, Host, oneLine, plural } from "../components";
 
 /** The tracked databases list as the Jobs list keeps its columns: the database takes the spare width. */
 const TRACKED_WIDTHS = [null, 260, 90, 130] as const;
@@ -339,6 +339,7 @@ export default function BulkImport() {
                 {register.data ? "Registered" : "Validated"}: {Object.entries(result.counts).map(([k, v]) => `${v} ${k}`).join(", ") || "nothing selected"}.
                 {register.data && result.counts.registered ? " Their first run seeds them." : ""}
               </Notice>
+              <WriteWarnings warnings={register.data?.warnings} />
               {result.results.some((r: Row) => r.errors?.length) && (
                 <Grid fitRows rows={result.results.filter((r: Row) => r.errors?.length).map((r: Row) => ({ ...r, errors: r.errors.join("; ") }))}
                   columns={autoColumns([{ table: "", status: "", errors: "" }], { status: { cellRenderer: (p: any) => <Badge value={p.value} /> }, errors: { flex: 1 } })} />

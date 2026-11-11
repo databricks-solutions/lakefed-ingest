@@ -128,7 +128,8 @@ export default function NewJob() {
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["ingestion-jobs"] }); qc.invalidateQueries({ queryKey: ["schedules"] });
       // The job's page as soon as Create names the job: written already, or recorded and preparing, which its page follows.
-      if (r.id != null && (r.created || r.prepare)) navigate(`/ingestion-jobs/${r.id}`);
+      // Its warnings go with it, as the job page is where the Create lands.
+      if (r.id != null && (r.created || r.prepare)) navigate(`/ingestion-jobs/${r.id}`, { state: { warnings: r.warnings ?? [] } });
     },
     // A Create that failed is a new request when it is sent again, unless it stopped part way: its databases are kept
     // and the same request finishes it.

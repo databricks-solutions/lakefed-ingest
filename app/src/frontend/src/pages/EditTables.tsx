@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
-import { Badge, ConfirmButton, ErrorBox, Grid, Notice, autoColumns, fmtTime, plural } from "../components";
+import { Badge, ConfirmButton, ErrorBox, Grid, Notice, WriteWarnings, autoColumns, fmtTime, plural } from "../components";
 
 // Every edit runs through the server's plan first (preview): what changes, which tables reseed and
 // why, warnings, and validation errors. Apply is only offered for a clean preview of the same edit.
@@ -23,7 +23,7 @@ export const EDIT_FIELDS: { key: string; label?: string; type?: "number" | "chec
 export const BULK_FIELDS = ["task_collection", "task_enabled", "tier", "priority", "freshness_sla_minutes", "load_partitioned",
   "partition_col", "partition_size_mb", "jdbc_options", "sink_catalog", "sink_schema", "src_connection", "use_remote_query"];
 
-interface PlanResult { summary: Row; plans: Row[] }
+interface PlanResult { summary: Row; plans: Row[]; warnings?: Row[] }
 
 function PlanView({ result }: { result: PlanResult }) {
   const s = result.summary;
@@ -40,6 +40,7 @@ function PlanView({ result }: { result: PlanResult }) {
         {s.applied ? "Applied" : "Preview"}: {s.changed} of {s.rows} {plural(s.rows, "table")} change
         {s.reseed ? `, ${s.reseed} will reseed on their next run` : ""}{s.errors ? `, ${s.errors} have errors (nothing can be applied)` : ""}.
       </Notice>
+      <WriteWarnings warnings={result.warnings} />
       <Grid rows={rows} height={Math.min(80 + rows.length * 42, 320)}
         columns={autoColumns(rows, { changes: { minWidth: 320 }, notes: { flex: 1, minWidth: 320, tooltipField: "notes" },
           errors: { minWidth: 240, cellStyle: { color: "var(--bad)" }, tooltipField: "errors" },

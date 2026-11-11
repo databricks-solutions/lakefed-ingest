@@ -3,6 +3,7 @@ target names and identity values written as templates over {server}, {database},
 import json
 
 import job_settings as js
+import placement
 
 
 def row(id=1, database="db_000101", schema="dbo", table="OrderLine", **over):
@@ -250,6 +251,20 @@ def test_a_new_server_gets_its_own_groups_its_databases_spread_evenly():
     again = js.plan_databases(FLEET, entries[:5], job_name="Customer", groups_per_server=4)
     first = {r["src_database"]: r["task_collection"] for r in plan["new"]}
     assert all(first[r["src_database"]] == r["task_collection"] for r in again["new"])
+
+
+def test_a_database_too_big_for_a_group_is_added_in_parts_sized_to_the_room_in_each_of_the_jobs_groups():
+    held = {"cust_c01": 20, "cust_c02": 6, "cust_c03": 4}
+    rows = [row(n, database="db_old", table=f"T{n:02d}", task_collection=group)
+            for n, group in enumerate(g for g, tables in held.items() for _ in range(tables))]
+    entries = [{"line": 2, "server": "sql_01", "database": "db_big", "enabled": True}]
+    plan = js.plan_databases(rows, entries, job_name="Customer", groups_per_server=placement.TablesPerGroup(10))
+    assert plan["errors"] == [] and plan["new_groups"] == []
+    added = {}
+    for r in plan["new"]:
+        added.setdefault(r["task_collection"], []).append(r["src_table"])
+    assert {group: len(tables) for group, tables in added.items()} == {"cust_c02": 14, "cust_c03": 16}
+    assert sorted(added["cust_c02"]) == sorted(r["src_table"] for r in plan["new"])[:14]       # name order, first part first
 
 
 def test_a_database_already_in_the_job_is_left_and_its_enabled_flag_follows_the_file():

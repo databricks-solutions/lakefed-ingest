@@ -1,4 +1,5 @@
-"""A database's tables share one collection: the app's check of that, against a real Postgres.
+"""A database whose tables sit in more than one collection (a split database, which the app warns about): the app's
+lookup of it, against a real Postgres.
 
 Skipped unless LAKEFED_APP_TEST_PG names a Postgres server where the test may create and drop its own
 database."""

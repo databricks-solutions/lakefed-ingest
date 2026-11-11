@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
 import { SOURCE_TYPE_NAMES } from "../cells";
-import { PageHead, ErrorBox, Section, ToastOn } from "../components";
+import { PageHead, ErrorBox, Section, ToastOn, WriteWarnings } from "../components";
 import { groupsRefusal, usePermissions } from "../permissions";
 
 // The values in words, as the Edit view names them.
@@ -49,7 +49,7 @@ export default function AddTable() {
   const locked = groupsRefusal(usePermissions().data, [row.task_collection]);
   const qc = useQueryClient();
   const add = useMutation({
-    mutationFn: () => api.post<{ id: number }>("/tables", {
+    mutationFn: () => api.post<{ id: number; warnings?: Record<string, any>[] }>("/tables", {
       ...row,
       src_port: row.src_port === "" ? null : Number(row.src_port),
       partition_size_mb: row.partition_size_mb === "" ? null : Number(row.partition_size_mb),
@@ -82,6 +82,7 @@ export default function AddTable() {
           <div className="wide"><button className="primary" disabled={add.isPending || !!locked}>Add table</button></div>
         </form>
         <ErrorBox error={add.error} />
+        <WriteWarnings warnings={add.data?.warnings} />
         <ToastOn text={add.data ? `Added control row ${add.data.id}` : null} />
       </Section>
     </>

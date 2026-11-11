@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
-import { Cols, ConfirmButton, Cut, CutCopy, ErrorBox, PageHead, Section, Tag, ToastOn, fmtInt, oneLine, plural } from "../components";
+import { Cols, ConfirmButton, Cut, CutCopy, ErrorBox, PageHead, Section, Tag, ToastOn, WriteWarnings, fmtInt, oneLine, plural } from "../components";
 import { groupsRefusal, usePermissions } from "../permissions";
 
 /** The preview's lines as a job's runs list keeps its columns: the problems take the spare width. */
@@ -116,6 +116,7 @@ export default function ImportCsv() {
         </div>
         {locked && <p className="muted small">Import: {locked}.</p>}
         <ErrorBox error={preview.error ?? apply.error} />
+        <WriteWarnings warnings={apply.data?.warnings} />
         <ToastOn text={apply.data ? `Imported ${fmtInt(counts.imported ?? 0)} ${plural(counts.imported ?? 0, "table")} into ${apply.data.task_collection}`
           + (counts.skipped ? `; ${fmtInt(counts.skipped)} skipped (already registered)` : "") : null} />
       </Section>

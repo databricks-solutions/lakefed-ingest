@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
 import { Cols, Crumbs, ConfirmButton, Cut, ErrorBox, Info, Menu, Notice, PageHead, Pager, Section, StateBar, fmtInt, oneLine, plural, useConfirm, Twisty,
-         Busy, Chevron, OutLink, Required, StatusLine, toast } from "../components";
+         Busy, Chevron, OutLink, Required, StatusLine, WriteWarnings, toast } from "../components";
 import { usePermissions } from "../permissions";
 import { CADENCES, IdentityFields, ParameterField, ParameterFields, RunFields, WritesFields } from "./jobForm";
 import { ImportCsvDialog } from "./NewJob";
@@ -62,7 +62,7 @@ function TableRows({ jobId, server, database, locked, readOnly }: { jobId: strin
         body: <><p>It becomes {LOAD_TYPES[load_type] ?? load_type} in all {fmtInt(preview.changed)} {plural(preview.changed, "table")} of
           this name in the job's databases.</p>
           {Number(preview.reseed) > 0 && <p>The next run loads {fmtInt(preview.reseed)} of them again from their sources.</p>}</> });
-      return ok ? api.post(`/ingestion-jobs/${jobId}/tables/edit`, { ...body, dry_run: false }) : null;
+      return ok ? api.post<Row>(`/ingestion-jobs/${jobId}/tables/edit`, { ...body, dry_run: false }) : null;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["job-tree", jobId] }),
   });
@@ -97,8 +97,19 @@ function TableRows({ jobId, server, database, locked, readOnly }: { jobId: strin
         <tr className="l3"><td colSpan={7}><Pager offset={offset} limit={PAGE} total={tables.data!.total} noun="table" onPage={setOffset} /></td></tr>
       )}
       {(edit.error || enable.error || tables.error) && <tr className="l3"><td colSpan={7}><ErrorBox error={edit.error || enable.error || tables.error} /></td></tr>}
+      {edit.data?.warnings?.length > 0 && <tr className="l3"><td colSpan={7}><WriteWarnings warnings={edit.data?.warnings} /></td></tr>}
       {confirm.dialog}
     </>
+  );
+}
+
+/** A database whose tables are in more than one of the job's ingestion groups: each group checks it and loads its own
+ *  tables, so it costs more change queries and connections on its server (main.py _split_message). */
+export function SplitDatabaseTag({ groups }: { groups?: string[] | null }) {
+  if (!groups || groups.length < 2) return null;
+  return (
+    <span className="tag warn" title={`Its tables are in ingestion groups ${groups.join(", ")}. Each group checks it for changes and loads its own tables, which costs more change queries and connections on its server.`}>
+      split over {fmtInt(groups.length)} groups</span>
   );
 }
 
@@ -131,7 +142,9 @@ function DatabaseRows({ jobId, server, locked, readOnly }: { jobId: string; serv
       {(dbs.data?.items ?? []).map((d: Row) => (
         <Fragment key={d.database}>
           <tr className="l2">
-            <td className="name"><Twisty open={open === d.database} onToggle={() => setOpen(open === d.database ? null : d.database)}><Cut text={d.database} tipOnlyWhenCut /></Twisty></td>
+            <td className="name"><span className="cell-line">
+              <Twisty open={open === d.database} onToggle={() => setOpen(open === d.database ? null : d.database)}><Cut text={d.database} tipOnlyWhenCut /></Twisty>
+              <SplitDatabaseTag groups={d.groups} /></span></td>
             <td className="muted"><Cut text={d.client_id ? `client_id ${d.client_id}` : ""} tipOnlyWhenCut /></td>
             <td></td>
             <td className="num">{fmtInt(d.tables)} {Number(d.missing) > 0 && <span className="tag warn">{fmtInt(d.missing)} missing</span>}</td>
@@ -234,6 +247,7 @@ function AddDatabases({ jobId, servers }: { jobId: string; servers: string[] }) 
       {apply.isPending && <TaskProgress task={task} />}
       {!apply.isPending && resumableWrite(apply.error) && <TaskProgress task={task} onResume={() => apply.mutate()} />}
       <ErrorBox error={check.error || (isUnconfirmed(apply.error) || resumableWrite(apply.error) ? null : apply.error)} />
+      <WriteWarnings warnings={apply.data?.warnings} />
     </div>
   );
 }
@@ -308,6 +322,7 @@ function useAddTables(jobId: string) {
       : <ErrorBox error={isUnconfirmed(add.error) ? null : add.error} />}
     {found && found.invalid.length > 0 && <Notice tone="bad">Nothing was added: {fmtInt(found.invalid.length)} {plural(found.invalid.length, "line")} can't be
       added.<ul>{found.invalid.slice(0, 20).map((l: Row) => <li key={l.line}>line {l.line}, {l.table}: {l.errors.join("; ")}</li>)}</ul></Notice>}
+    <WriteWarnings warnings={add.data?.warnings} />
 
   </>;
   return { open: () => setOpen(true), discover: () => setDiscovering(true), dialog, result };
@@ -666,8 +681,8 @@ function Groups({ jobId, locked, saved }: { jobId: string; locked: Locked; saved
   return (
     <div className="compute">
       <h3>Groups<Info label="About changing the groups">Changing the size spreads each server's databases again over its new
-        number of groups, moving as few databases as it can and never splitting one. Each table keeps its progress, so nothing
-        reloads.</Info></h3>
+        number of groups, moving as few databases as it can; a database already split moves part by part, and none is split
+        further. Each table keeps its progress, so nothing reloads.</Info></h3>
       <div className="form-grid">
         <TablesPerGroup value={size} saved={saved} onChange={(next) => { setSize(next); setPreview(null); }} />
       </div>
@@ -716,7 +731,9 @@ export function TablesPerGroup({ value, onChange, saved }: { value: number | nul
   };
   return (
     <label><span>Tables per group<Info label="About tables per group">Each server's databases are split into groups of about this many
-      tables, each database whole in one group and spread evenly; a group runs on its own cluster.</Info>
+      tables, spread evenly; a group runs on its own cluster. A database that fits goes whole into one group, and a bigger one
+      is spread over as many groups as it needs, the ones holding the fewest tables, each group loading a part sized to its
+      room.</Info>
       {Number(text) !== DEFAULT_TABLES_PER_GROUP && <button className="ghost link reset"
         onClick={() => commit(String(DEFAULT_TABLES_PER_GROUP))}>Reset</button>}</span>
       <input type="number" min={MIN_TABLES_PER_GROUP} max={MAX_TABLES_PER_GROUP} step={100} value={text}
