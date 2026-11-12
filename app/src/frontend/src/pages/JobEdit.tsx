@@ -290,10 +290,9 @@ function useAddTables(jobId: string) {
       if (preview.invalid.length || !preview.tables) return null;
       const servers = (preview.servers as Row[]).map((s) => `${fmtInt(s.tables)} on ${s.server}`).join(", ");
       const ok = await confirm.ask({ title: `Add ${fmtInt(preview.tables)} ${plural(preview.tables, "table")} to this job?`, action: "Add tables",
-        body: <><p>{servers}. Each takes the job's settings: how it writes, its target names and identity columns.</p>
+        body: <><p>{servers}. They take the job's settings and load for the first time at its next run.</p>
           {Number(preview.in_job) > 0 && <p>{fmtInt(preview.in_job)} more {plural(preview.in_job, "line")} the job already has {Number(preview.in_job) === 1 ? "is" : "are"} left as {Number(preview.in_job) === 1 ? "it is" : "they are"}.</p>}
-          {preview.new_groups.length > 0 && <p>A new server gets {fmtInt(preview.new_groups.length)} new {plural(preview.new_groups.length, "group")}.</p>}
-          <p>Their first loads run at the job's next run.</p></> });
+          {preview.new_groups.length > 0 && <p>A new server gets {fmtInt(preview.new_groups.length)} new {plural(preview.new_groups.length, "group")}.</p>}</> });
       return ok ? write(body) : null;
     },
     onSuccess: (r) => { if (r) { setFound(r.summary); toast(`Added ${fmtInt(r.summary.tables)} ${plural(r.summary.tables, "table")}`);
