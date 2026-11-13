@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
+import { retryLine } from "../runDialog";
 import { Cols, Cut, CutCopy, ErrorBox, Notice, Section, fmtInt, fmtTime, oneLine, plural, useConfirm, type ConfirmRequest } from "../components";
 
 /** The failing tables as a job's runs list keeps its columns: the table and the source message share the spare width. */
@@ -110,15 +111,11 @@ export function FailingTables({ jobId, runRefused, changeRefused, removeRefused 
 // What Remove asks first: the table's ingestion state leaves the job, and its target table is kept.
 function removeRequest(row: Row): ConfirmRequest {
   return { title: `Remove ${row.table} from this job?`, action: "Remove", danger: true,
-    body: <><p>This deletes {row.table}'s ingestion state from this job: its control row, its checkpoint and its queued
-      reseeds. This can't be undone. The job's other tables and its run history stay.</p>
-      <p>The target table is kept: nothing is dropped or changed in it.</p></> };
+    body: <p>{row.table}'s ingestion state (its control row, checkpoint and queued reseeds) is deleted from this job. Its
+      target table is kept. This can't be undone.</p> };
 }
 
-// What Retry now starts, for its dialog: one ingest run of one database, on its own job cluster, which costs money.
+// What Retry now loads, for its dialog: the enabled tables of the one database, from their checkpoints.
 function retryRequest(row: Row): ConfirmRequest {
-  return { title: `Retry ${row.src_database} now?`, action: "Retry now",
-    body: <><p>This starts one ingest run for {row.src_database} on {row.server}, and no other database. Its enabled tables load
-      from their checkpoints on one job cluster.</p>
-      <p>The cluster and the source's load cost money while it runs.</p></> };
+  return { title: `Retry ${row.src_database} now?`, action: "Retry now", body: <p>{retryLine(row.src_database, row.server)}</p> };
 }

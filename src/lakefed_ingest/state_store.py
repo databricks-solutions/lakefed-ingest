@@ -1318,6 +1318,23 @@ class StateStore:
                         f"{int(lock_timeout_s)} s for them). Nothing changed. Run the setup job again.") from error
                 sleep(migrate_backoff_s(attempt))
 
+    def apply_comments(self, sql: str, lock_timeout_s: int = LOCK_TIMEOUT_S) -> int:
+        """Apply lakebase_comments.sql (``sql``): the description of every table and column, as Postgres comments,
+        which a Lakebase database registered in Unity Catalog shows as the tables' and columns' comments, for
+        Genie and other AI tools. One transaction, so the descriptions are all applied or none. COMMENT ON takes a
+        SHARE UPDATE EXCLUSIVE lock, which reads and writes don't wait on, and ``lock_timeout_s`` bounds the wait
+        for another migration or vacuum. Comments change no column or row, so they carry no schema version: the
+        setup job applies them on every run. Returns the statements applied."""
+        statements = split_sql_statements(sql)
+        bad = [s[:80] for s in statements if not s.lower().startswith("comment on ")]
+        if bad:
+            raise ValueError(f"lakebase_comments.sql holds only COMMENT ON statements, not: {bad[0]}")
+        with self._cursor() as cur, cur.connection.transaction():
+            cur.execute(f"set local lock_timeout = '{int(lock_timeout_s)}s'")
+            for statement in statements:
+                cur.execute(statement)
+        return len(statements)
+
     def _migrate_once(self, ddl: str, force: bool, lock_timeout_s: int) -> Optional[dict]:
         """One migration attempt, in one transaction (see ``migrate``)."""
         with self._cursor() as cur, cur.connection.transaction():

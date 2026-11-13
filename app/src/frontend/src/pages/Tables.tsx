@@ -82,10 +82,10 @@ export default function Tables() {
           <ConfirmButton label="Enable" plain disabled={!!locked} title={`Enable ${fmtInt(ids.length)} ${plural(ids.length, "table")}?`}
             message="Their ingestion jobs' next runs load them." onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: true } })} />
           <ConfirmButton label="Disable" danger disabled={!!locked} title={`Disable ${fmtInt(ids.length)} ${plural(ids.length, "table")}?`}
-            message="Runs stop loading them. Their target tables, checkpoints and history stay, so enabling them again carries on from where they were."
+            message="Runs stop loading them. Their target tables, checkpoints and history stay."
             onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: false } })} />
           <ConfirmButton label="Force reseed" danger disabled={!!locked} title={`Reseed ${fmtInt(ids.length)} ${plural(ids.length, "table")}?`}
-            message="The next run of each table's ingestion job copies the whole table again from its source. Large tables take a while and load the source."
+            message="The next run of their ingestion jobs copies them again from their sources. Large tables take a while and load the source."
             confirmLabel="Reseed" onConfirm={() => act.mutateAsync({ path: "/tables/reseed", body: { ids } })} />
           </>}
         </>}>

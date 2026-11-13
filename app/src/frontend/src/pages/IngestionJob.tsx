@@ -7,18 +7,20 @@ import { changeInProgress, deleteNotice, rediscoveryBusy, rediscoveryButton, red
   type RediscoveryProgress } from "../pending";
 import { AVAILABLE_WHEN_READY, preparingBar, preparingLine, scheduleWhenReady, setAsideWhy, type PrepareView,
   type SetAside } from "../preparing";
+import { useJobPageRefresh } from "../useJobPageRefresh";
 import { Tree } from "./JobEdit";
 import { TargetTables } from "./TargetTables";
 import { FailingTables } from "./FailingTables";
+import { RunNowDialog } from "./RunNowDialog";
 import { RunningTasks } from "./tasks";
-import { Busy, Cols, Cut, CutCopy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Notice, oneLine, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateSummary, WriteWarnings, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, type ConfirmRequest, Twisty } from "../components";
+import { Busy, Cols, Cut, CutCopy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Notice, oneLine, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateSummary, WriteWarnings, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, usePageStamp, type ConfirmRequest, Twisty } from "../components";
 
 const PAGE = 25;
 /** An ingestion run list's columns, as a job's runs list keeps its own: the run's time, then fixed narrow fields; the job
  * (when several jobs are listed) or the outcome takes what is left. */
 const runWidths = (showJob: boolean) => [150, ...(showJob ? [null, 150] : [null]), 84, 74, 96, 78, 114, 88, 66, 56] as const;
 const GROUP_OF_RUN_WIDTHS = [null, 160, 90, 80, 160, 70] as const;
-const CHECK_WIDTHS = [150, 90, null, 120] as const;
+const CHECK_WIDTHS = [150, 90, 90, null, 120] as const;
 const RUNNING_GROUP_WIDTHS = [null, 190, 90, 240, 120] as const;
 const SET_ASIDE_WIDTHS = [260, 240, null] as const;
 
@@ -142,9 +144,10 @@ function RunningNow({ live }: { live: Row }) {
               a group run for each group with work.</Info></h3>
             <div className="table-wrap"><table {...oneLine(CHECK_WIDTHS, "dense")}>
               <Cols widths={CHECK_WIDTHS} />
-              <thead><tr><th>Status</th><th>Started</th><th>What it found</th><th></th></tr></thead>
+              <thead><tr><th>Status</th><th>Started</th><th>Finished</th><th>What it found</th><th></th></tr></thead>
               <tbody><tr>
                 <td><RunStatus status={null} outcome={check.status} /></td><td>{fmtClock(check.started)}</td>
+                <td>{check.ended ? fmtClock(check.ended) : ""}</td>
                 <td>{found && !checking
                   ? <Cut tipOnlyWhenCut text={`${fmtInt(found.databases_with_work)} ${plural(found.databases_with_work, "database")} changed${
                     found.unchanged_databases != null ? `, ${fmtInt(found.unchanged_databases)} unchanged and stamped` : ""}; started ${
@@ -210,12 +213,11 @@ function Preparation({ jobId, deleteRefusal, onDelete }: { jobId: string; delete
   const listed: SetAside[] = p.set_aside ?? [];
   const busy = act.isPending;
   const leaveOut = () => confirm.ask({ title: "Leave them out?", action: "Leave them out", danger: true,
-    body: <p>The {fmtInt(counts.waiting)} {plural(counts.waiting, "database")} set aside come out of what this job ingests, and it
-      goes on without them. Add them later with Add tables once the job is ready.</p> })
+    body: <p>The {fmtInt(counts.waiting)} {plural(counts.waiting, "database")} set aside leave this job. Add tables brings them
+      back once the job is ready.</p> })
     .then((ok) => ok && act.mutate({ action: "leave-out", body: {} }));
   const stopPreparing = () => confirm.ask({ title: "Stop preparing?", action: "Stop preparing",
-    body: <p>The reads going are stopped and nothing more is written. The job stays paused with its choice and what was read;
-      Prepare again goes on from where it stopped.</p> })
+    body: <p>The reads stop and nothing more is written. Prepare again goes on from where it stopped.</p> })
     .then((ok) => ok && act.mutate({ action: "stop", body: {} }));
   const stopped = Boolean(p.stopped);
   return (
@@ -322,6 +324,7 @@ export default function IngestionJob() {
     onSuccess: (r) => { if (!r.errors?.length) toast("Cancelling the run"); refresh(); },
   });
   const [deleting, setDeleting] = useState(false);
+  const [runDialog, setRunDialog] = useState(false);
   const remove = useMutation({
     mutationFn: (dropTargets: boolean) => api.post<Row>(`/schedules/${encodeURIComponent(id)}/delete`, { drop_targets: dropTargets }),
     onSuccess: () => { toast("Deleting the job"); qc.invalidateQueries(); },
@@ -350,12 +353,16 @@ export default function IngestionJob() {
   const live = useQuery({ queryKey: ["ingestion-job-live", id], queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/live`),
                           refetchInterval: (q) => (busy ? 3_000 : (q.state.data as Row | undefined)?.active ? 5_000 : 15_000) });
   const refusal = (runNow.error as ApiError | null)?.detail;
+  // While a run is going the whole page is read together every 15 s, and once more when it ends (jobPageRefresh.ts).
+  const pageReadAt = useJobPageRefresh(id, live.data);
   const runs = useQuery({
     queryKey: ["ingestion-job-runs", id, before],
     queryFn: () => api.get<Row>(`/ingestion-jobs/${encodeURIComponent(id)}/runs${qs({ before, limit: PAGE })}`),
     refetchInterval: before ? false : 15_000,
   });
   const j = job.data;
+  const readMs = Math.max(job.dataUpdatedAt, pageReadAt);
+  usePageStamp(readMs ? new Date(readMs).toISOString() : undefined, 15, job.error);
   const last = j?.last_job_run;
   const button = runButton(j?.run_now, { starting: runNow.isPending, cancelling: stop.isPending });
   const timeout = runTimeoutNotice(j?.run_now);
@@ -394,7 +401,7 @@ export default function IngestionJob() {
                 <button className={button.tone} disabled={button.disabled} title={button.title ?? undefined}
                   onClick={() => (button.action === "cancel"
                     ? confirm.ask(cancelRunRequest(j, live.data)).then((ok) => ok && stop.mutate())
-                    : button.action === "run" && confirm.ask(runNowRequest(j)).then((ok) => ok && runNow.mutate()))}>{button.label}</button>
+                    : button.action === "run" && setRunDialog(true))}>{button.label}</button>
               </>}</span>} />
       {j && <p className="muted small">Created by {j.created_by ?? "unknown"}{j.created_at ? `, ${fmtTime(j.created_at)}` : ""} ·
         Last updated by {j.updated_by ?? "unknown"}{j.updated_at ? `, ${fmtTime(j.updated_at)}` : ""}</p>}
@@ -403,6 +410,7 @@ export default function IngestionJob() {
       <RunningTasks jobId={id} />
       {j?.prepare && j.prepare.state !== "ready" && !j.delete
         && <Preparation jobId={id} deleteRefusal={j.delete_blocked} onDelete={() => setDeleting(true)} />}
+      {runDialog && j && <RunNowDialog job={j} onClose={(ok) => { setRunDialog(false); if (ok) runNow.mutate(); }} />}
       {deleting && j && <DeleteJobDialog job={j} onClose={(drop) => { setDeleting(false); if (drop !== null) remove.mutate(drop); }} />}
       {deletion && (j?.delete?.state === "deleting" ? <Busy label={deletion.text} />
         : <Notice tone={deletion.tone}>{j?.deleted_at && `Deleted on ${fmtShort(j.deleted_at)}. `}{deletion.text}
@@ -527,17 +535,6 @@ function RediscoveryLast({ last }: { last: Row }) {
   );
 }
 
-// What Run now starts, for its dialog: one run of every group, each on its own cluster, which costs money.
-function runNowRequest(j: Row): ConfirmRequest {
-  const groups = Number(j.run_now?.groups ?? 0);
-  const starts = j.run_now?.check
-    ? `the check job over its ${fmtInt(groups)} ${plural(groups, "group")}, which starts an ingest run, each on its own job cluster, for every group with changes (up to ${fmtInt(groups)} ${plural(groups, "cluster")})`
-    : `an ingest run for each of its ${fmtInt(groups)} ${plural(groups, "group")}, each on its own job cluster (${fmtInt(groups)} ${plural(groups, "cluster")})`;
-  return { title: `Run ${j.name} now?`, action: "Run now",
-    body: <><p>This starts {starts}, over its {fmtInt(j.enabled_tables)} {plural(j.enabled_tables, "table")}.</p>
-      <p>Clusters and the sources' load cost money while they run.</p></> };
-}
-
 /** Delete's dialog: what goes (the job, its Databricks jobs, its groups' tables and their state), what stays (run
  * history and the change log, and any group another job also runs), and the tick box that also drops the target
  * tables only this job writes. Read from the delete preview, so the counts are those the delete job acts on. */
@@ -595,8 +592,7 @@ export function targetTablesText(p: Row, drop: boolean): string {
  * to drop (those no other job writes). */
 export function deleteNowRequest(name: string): ConfirmRequest {
   return { title: `Delete ${name} now?`, action: "Delete now", danger: true,
-    body: <p>It is deleted for good at once, by the delete job: its state goes, and any target tables it was set to drop that
-      no other job writes go with it. It can't be restored after this.</p> };
+    body: <p>Its state is deleted for good, with any target tables it was set to drop that no other job writes. It can't be restored after this.</p> };
 }
 
 // What Cancel run stops, for its dialog, named from the live view: the job's run, its check and its group runs going.
@@ -608,6 +604,6 @@ function cancelRunRequest(j: Row, live: Row | undefined): ConfirmRequest {
     ...(groups.length ? [`${fmtInt(groups.length)} ${plural(groups.length, "group run")} (${groups.map((g) => g.task_collection).join(", ")})`] : []),
   ];
   return { title: `Cancel the run of ${j.name}?`, action: "Cancel run", danger: true,
-    body: <><p>This cancels {parts.length ? parts.join(", ") : "the run of this job going now"} in Databricks.</p>
-      <p>Tables loading now stop part way. The next run loads them again from their last checkpoint.</p></> };
+    body: <p>This cancels {parts.length ? parts.join(", ") : "the run of this job going now"} in Databricks. Tables loading now
+      stop part way and carry on from their last checkpoint at the next run.</p> };
 }

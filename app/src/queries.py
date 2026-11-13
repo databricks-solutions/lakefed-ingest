@@ -2550,6 +2550,23 @@ select t.id, t.src_schema as schema, t.src_table as "table", t.load_type, t.prim
 group by t.id, cp.control_id order by lower(t.src_schema), lower(t.src_table) limit %s offset %s"""
 
 
+def run_preview_sql() -> str:
+    """What one run of a job loads, for Run now's dialog: its enabled tables, the servers and databases they are on, and
+    the first few table names (schema.table, in name order). server and database name the source, and mean something
+    only when there is just one. Reads the control rows alone, no checkpoints. Params: groups, how many names."""
+    return f"""
+with loaded as (
+    select {SERVER} as server, coalesce(t.src_database, '') as database, t.src_schema || '.' || t.src_table as name,
+           lower(t.src_schema) as schema_key, lower(t.src_table) as table_key
+    from {SCHEMA}.control t where t.task_collection = any(%s) and t.task_enabled
+)
+select count(*) as tables, count(distinct server) as servers, count(distinct (server, database)) as databases,
+       min(server) as server, min(database) as database,
+       (select coalesce(array_agg(f.name order by f.schema_key, f.table_key), '{{}}'::text[])
+        from (select * from loaded order by schema_key, table_key limit %s) f) as names
+from loaded"""
+
+
 _TARGET = "t.sink_catalog || '.' || t.sink_schema || '.' || t.sink_table"
 # Rows the run records say each table wrote over the last 7 days: its ok events' merged or appended rows.
 _WRITTEN_7D = (f"(select e.control_id, sum(e.rows_merged) as rows_written, max(e.finished_at) as last_written "
@@ -3271,6 +3288,18 @@ def check_work_found_sql() -> str:
     Param: work ids (list)."""
     return (f"select task_collection, count(*) as databases from {SCHEMA}.check_work where work_id = any(%s) "
             f"group by task_collection")
+
+
+def check_records_since_sql() -> str:
+    """The check job's own records (one ingest_run row per group it checked) since a time: how many there are, how many
+    are still running, how many ended any way but completed (failed, cancelled, skipped), and when the last one
+    finished. This is where the check says it is done, whatever its Databricks task is still waiting for.
+    Params: groups (list), since (timestamptz)."""
+    return (f"select count(*) as records, count(*) filter (where status = 'running') as running, "
+            f"count(*) filter (where status not in ('running', 'completed')) as failed, "
+            f"max(finished_at) as finished_at "
+            f"from {SCHEMA}.ingest_run where task_collection = any(%s) and left(coalesce(work_id, ''), 6) = 'check-' "
+            f"and started_at >= %s")
 
 
 def database_checks_since_sql() -> str:
