@@ -571,7 +571,7 @@ export function targetTablesText(p: Row, drop: boolean): string {
  * to drop (those no other job writes). */
 export function deleteNowRequest(name: string): ConfirmRequest {
   return { title: `Delete ${name} now?`, action: "Delete now", danger: true,
-    body: <p>Its state is deleted for good, with any target tables it was set to drop. It can't be restored after this.</p> };
+    body: <p>Its state is deleted for good, with any target tables it was set to drop that no other job writes. It can't be restored after this.</p> };
 }
 
 // What Cancel run stops, for its dialog, named from the live view: the job's run, its check and its group runs going.

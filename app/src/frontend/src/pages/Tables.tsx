@@ -85,7 +85,7 @@ export default function Tables() {
             message="Runs stop loading them. Their target tables, checkpoints and history stay."
             onConfirm={() => act.mutateAsync({ path: "/tables/enable", body: { ids, enabled: false } })} />
           <ConfirmButton label="Force reseed" danger disabled={!!locked} title={`Reseed ${fmtInt(ids.length)} ${plural(ids.length, "table")}?`}
-            message="The next run of their ingestion jobs copies them again from their sources."
+            message="The next run of their ingestion jobs copies them again from their sources. Large tables take a while and load the source."
             confirmLabel="Reseed" onConfirm={() => act.mutateAsync({ path: "/tables/reseed", body: { ids } })} />
           </>}
         </>}>
