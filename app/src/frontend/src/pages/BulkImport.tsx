@@ -158,8 +158,8 @@ export default function BulkImport() {
   const locked = groupsRefusal(usePermissions().data, [collection.trim()]);
   const [shared, setShared] = useState<Shared>({
     sink_catalog: "main", sink_schema: "bronze_{database}", sink_table: "{table}", client_id: "", freshness_sla_minutes: null,
-    partition_threshold_mb: config?.defaults.partition_threshold_mb ?? 1024,
-    partition_size_mb: config?.defaults.partition_size_mb ?? 512, include_default: true,
+    partition_threshold_mb: config?.defaults.partition_threshold_mb ?? 10240,
+    partition_size_mb: config?.defaults.partition_size_mb ?? 2048, include_default: true,
   });
   const review = useQuery({
     queryKey: ["review", did, shared, progress, collection.trim()],

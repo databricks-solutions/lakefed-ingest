@@ -16,7 +16,7 @@ import main  # noqa: E402
 import queries as q  # noqa: E402
 
 DISCOVERED = [
-    dict(discovery_id="d1", src_database="db1", src_schema="dbo", src_table="orders", row_count=10, size_mb=2048.0,
+    dict(discovery_id="d1", src_database="db1", src_schema="dbo", src_table="orders", row_count=10, size_mb=20480.0,
          ct_enabled=True, primary_key="id", select_list="id, v", excluded_columns=None, rowversion_column=None,
          identity_column=None, load_type="ct", cursor_column=None, partition_candidate="id", notes=None,
          src_type="sqlserver", src_host="h", src_port=None, secret_key="k-db1", registered_id=None),

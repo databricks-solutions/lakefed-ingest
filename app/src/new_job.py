@@ -170,27 +170,46 @@ def _write_mode(load_type: str, settings: dict) -> str:
     return settings["write_mode_changes"] if load_type in js.CHANGE_LOAD_TYPES else "merge"
 
 
-def _line_load_types(text: str):
-    """(the file without its load_type column, {line number: load type}). A discovered table carries the load type
-    discovery recommends for it; a plain CSV has none, and every line takes the job's. The lines are numbered as
+def _line_columns(text: str, names) -> tuple:
+    """(the file without the columns ``names``, {line number: {column: value}} of those it has). Lines are numbered as
     config_import.plan_import numbers the file it is given: from 2, counting only the lines with a value left once the
-    load_type column is gone, so a blank or all-empty line shifts no table onto another's load type."""
+    columns are gone, so a blank or all-empty line shifts no table onto another's values."""
     reader = csv.reader(io.StringIO(text.lstrip("\ufeff")))
     rows = list(reader)
-    if not rows or "load_type" not in [h.strip() for h in rows[0]]:
+    header = [h.strip() for h in rows[0]] if rows else []
+    at = [i for i, h in enumerate(header) if h in names]
+    if not at:
         return text, {}
-    at = [h.strip() for h in rows[0]].index("load_type")
-    types, number = {}, 1
+    taken = set(at)
+    values, number = {}, 1
     for row in rows[1:]:
-        if not any(cell.strip() for cell in row[:at] + row[at + 1:]):
+        if not any(cell.strip() for i, cell in enumerate(row) if i not in taken):
             continue
         number += 1
-        load_type = row[at].strip() if at < len(row) else ""
-        if load_type:
-            types[number] = load_type
+        found = {header[i]: row[i].strip() for i in at if i < len(row) and row[i].strip()}
+        if found:
+            values[number] = found
     out = io.StringIO()
-    csv.writer(out, lineterminator="\n").writerows([row[:at] + row[at + 1:] for row in rows])
-    return out.getvalue(), types
+    # Every other cell stays, a line's extra cells too, so the import still sees a line longer than its header.
+    csv.writer(out, lineterminator="\n").writerows([[cell for i, cell in enumerate(row) if i not in taken] for row in rows])
+    return out.getvalue(), values
+
+
+def _line_load_types(text: str):
+    """(the file without its load_type column, {line number: load type}). A discovered table carries the load type
+    discovery recommends for it; a plain CSV has none, and every line takes the job's."""
+    plain, values = _line_columns(text, ("load_type",))
+    return plain, {line: found["load_type"] for line, found in values.items()}
+
+
+def _partitioning(found: dict) -> Optional[dict]:
+    """A line's partitioning (load_partitioned, partition_col, partition_size_mb) from a discovered table's recommendation
+    (queries.recommended_partitioning's rule, in source_rows_sql), or None when it recommends none."""
+    if not q._truthy(found.get("load_partitioned")):
+        return None
+    size = str(found.get("partition_size_mb") or "").strip()
+    return {"load_partitioned": True, "partition_col": found.get("partition_col") or None,
+            "partition_size_mb": int(size) if size.isdigit() else None}
 
 
 def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int] = None,
@@ -222,7 +241,10 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int]
         out["errors"].append(f"groups per server must be from 1 to {MAX_GROUPS_PER_SERVER}")
     if out["errors"]:
         return out
-    text, line_types = _line_load_types(text)
+    # A discovered table carries discovery's load type and partitioning for it; a plain CSV has neither, and every line
+    # takes the job's load type and no partitioning. They're read here, not by config_import, which has no such columns.
+    text, extras = _line_columns(text, ("load_type",) + PARTITION_COLUMNS)
+    line_types = {line: found["load_type"] for line, found in extras.items() if found.get("load_type")}
     # The file is read as Import CSV reads it; its sink names are made again below, with the job's templates.
     read = ci.plan_import(text, "_new", {"src_type": settings["src_type"], "load_type": settings["load_type"],
                                          "use_remote_query": False, "write_mode": "merge", "fan_in": False,
@@ -248,6 +270,9 @@ def plan(job_name: str, text: str, given: dict, groups_per_server: Optional[int]
             row["load_type"] = line_types[line["line"]]
             if row["load_type"] not in LOAD_TYPES:
                 problems.append(f"load_type must be one of {', '.join(LOAD_TYPES)}")
+        partitioning = _partitioning(extras.get(line["line"], {}))
+        if partitioning:
+            row.update(partitioning)
         server = js.server_of(row)
         row["task_collection"] = place(server, row.get("src_database") or "", name_in_database(row))
         row["write_mode"] = _write_mode(row["load_type"], settings)
@@ -399,7 +424,9 @@ def read_upload(text: str, connection: str, max_lines: int = MAX_LINES) -> dict:
     reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")))
     header = [h.strip() for h in (reader.fieldnames or [])]
     reader.fieldnames = header
-    errors = ci._header_errors([h for h in header if h != "load_type"]) if header else ["the file is empty"]
+    # load_type and the partition columns are per-line extras the plan reads itself (_line_columns), not the import's.
+    extras = ("load_type",) + PARTITION_COLUMNS
+    errors = ci._header_errors([h for h in header if h not in extras]) if header else ["the file is empty"]
     errors += [f"column {c} is not accepted: the file reads through the connection chosen before it, and the job sets "
                f"its groups" for c in header if c in UPLOAD_REFUSED_COLUMNS]
     if header and "src_database" not in header:
@@ -478,8 +505,10 @@ def csv_of(columns: List[str], rows: List[dict]) -> str:
     return out.getvalue()
 
 
+# A discovered table's partitioning, as discovery recommends it (queries.source_rows_sql); not a column of the import.
+PARTITION_COLUMNS = ("load_partitioned", "partition_col", "partition_size_mb")
 DISCOVERY_COLUMNS = ("src_connection", "src_host", "src_port", "secret_key", "src_database", "src_schema", "src_table",
-                     "select_list", "primary_key", "cursor_column", "load_type")
+                     "select_list", "primary_key", "cursor_column", "load_type") + PARTITION_COLUMNS
 
 
 NO_TABLES = "the selection takes no tables"

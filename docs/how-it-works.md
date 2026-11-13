@@ -229,6 +229,12 @@ when every partition succeeds is the target replaced from staging in one atomic 
 grants, row filters, and lineage are kept and readers never see a partial table. A failed seed
 leaves the target untouched; the next attempt rebuilds staging.
 
+A job made from a discovery in the app turns this on for a table of 10 GB or more (SQL Server's allocated size) that
+has a partition column, in 2 GB partitions. Below that, partitioning rarely shortens a run: a run already loads many
+tables at once, and each partitioned table adds a size query, a bounds query, a staging table, a swap and more queries
+on its source. A table with only a text key and no integer identity column has no partition column and loads in one
+read. Change a table's partitioning with Edit tables; it applies from its next seed or full load.
+
 ## Consolidated sinks (optional)
 
 By default each control row owns its sink table, typically one schema per source database. To
