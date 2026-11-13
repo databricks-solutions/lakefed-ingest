@@ -2220,6 +2220,21 @@ def ingestion_job_tree(job_id: int, server: str = "", database: str = "", search
             "jdbc": _job_jdbc(job_id) if not server else None}
 
 
+RUN_PREVIEW_NAMES = 3
+
+
+@app.get("/api/ingestion-jobs/{job_id}/run-preview")
+def ingestion_job_run_preview(job_id: int):
+    """What one run of a job loads, for Run now's dialog: its enabled tables, the servers and databases they are on, and
+    the names of the first few. One read of the control rows, made when the dialog opens and never on the page's poll."""
+    groups = _job_groups(job_id)
+    row = db.query(q.run_preview_sql(), (groups, RUN_PREVIEW_NAMES))[0] if groups else {}
+    tables = int(row.get("tables") or 0)
+    return {"tables": tables, "servers": int(row.get("servers") or 0), "databases": int(row.get("databases") or 0),
+            "server": row.get("server") or None, "database": row.get("database") or None,
+            "names": list(row.get("names") or [])}
+
+
 @app.get("/api/ingestion-jobs/{job_id}/targets")
 def ingestion_job_targets(job_id: int, search: str = "", offset: int = 0, limit: int = 25):
     """A job's target tables: each with the source tables of the job writing it (and how many outside it), their

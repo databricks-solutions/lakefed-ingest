@@ -2550,6 +2550,23 @@ select t.id, t.src_schema as schema, t.src_table as "table", t.load_type, t.prim
 group by t.id, cp.control_id order by lower(t.src_schema), lower(t.src_table) limit %s offset %s"""
 
 
+def run_preview_sql() -> str:
+    """What one run of a job loads, for Run now's dialog: its enabled tables, the servers and databases they are on, and
+    the first few table names (schema.table, in name order). server and database name the source, and mean something
+    only when there is just one. Reads the control rows alone, no checkpoints. Params: groups, how many names."""
+    return f"""
+with loaded as (
+    select {SERVER} as server, coalesce(t.src_database, '') as database, t.src_schema || '.' || t.src_table as name,
+           lower(t.src_schema) as schema_key, lower(t.src_table) as table_key
+    from {SCHEMA}.control t where t.task_collection = any(%s) and t.task_enabled
+)
+select count(*) as tables, count(distinct server) as servers, count(distinct (server, database)) as databases,
+       min(server) as server, min(database) as database,
+       (select coalesce(array_agg(f.name order by f.schema_key, f.table_key), '{{}}'::text[])
+        from (select * from loaded order by schema_key, table_key limit %s) f) as names
+from loaded"""
+
+
 _TARGET = "t.sink_catalog || '.' || t.sink_schema || '.' || t.sink_table"
 # Rows the run records say each table wrote over the last 7 days: its ok events' merged or appended rows.
 _WRITTEN_7D = (f"(select e.control_id, sum(e.rows_merged) as rows_written, max(e.finished_at) as last_written "
