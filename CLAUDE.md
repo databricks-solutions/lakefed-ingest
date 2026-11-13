@@ -256,6 +256,19 @@ secret). See `README.md`, `docs/deploy.md`, `docs/monitoring.md`, `docs/lakebase
   `ct_engine.databricks_collation`'s collation, and every MERGE builds its ON / SET with the sink's
   `sink_key_collations` (`merge_on`, `merge_set`, run through `merge_collated`). Never compare keys exactly.
 
+### Tables (operations app, `app/src/frontend/src`)
+- One line per row. No break inside a word; a long value is cut with an ellipsis and shown whole on hover
+  or keyboard focus (`Cut`). A note or error that must wrap stays readable, with a comment saying why.
+- Coded values by display name, never the stored code: `connectionTypeName` / `SOURCE_TYPE_NAMES`
+  (`cells.ts`), `valueName` for the state database's codes.
+- Short fields (counts, times, status) get fixed narrow columns; the name and host take the spare width.
+  Plain tables use `oneLine(widths)` with `<Cols widths={...} />` (rules in `table.data.one-line`,
+  `styles.css`); grids use `Grid` and `autoColumns`, which cut and add the hover for you.
+- Identifiers (host, secret key, job, warehouse and run ids) get a copy button: `CutCopy` / `CopyButton`.
+- Follow the Databricks screen a table matches (Jobs list, a job's runs list, Catalog Explorer's tables
+  and connections lists) and name it in the doc comment above the table's widths.
+- `app/tests/frontend_one_line_tables_test.py` fails a table that skips these.
+
 ## Job orchestration version (`job_orchestration/`)
 
 All paths in this section are relative to `job_orchestration/`.

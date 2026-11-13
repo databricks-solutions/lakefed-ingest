@@ -13,9 +13,16 @@ import { TargetTables } from "./TargetTables";
 import { FailingTables } from "./FailingTables";
 import { RunNowDialog } from "./RunNowDialog";
 import { RunningTasks } from "./tasks";
-import { Busy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Name, Notice, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateSummary, WriteWarnings, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, usePageStamp, type ConfirmRequest, Twisty } from "../components";
+import { Busy, Cols, Cut, CutCopy, Info, Spinner, OutLink, Crumbs, Badge, ErrorBox, Menu, Modal, Notice, oneLine, PageHead, StatusLine, toast, ProgressBar, RunStatus, Section, StateSummary, WriteWarnings, fmtClock, fmtDuration, fmtInt, fmtShort, fmtSlot, fmtSpeed, fmtTime, jobRunPath, plural, progressFrom, useConfirm, usePageStamp, type ConfirmRequest, Twisty } from "../components";
 
 const PAGE = 25;
+/** An ingestion run list's columns, as a job's runs list keeps its own: the run's time, then fixed narrow fields; the job
+ * (when several jobs are listed) or the outcome takes what is left. */
+const runWidths = (showJob: boolean) => [150, ...(showJob ? [null, 150] : [null]), 84, 74, 96, 78, 114, 88, 66, 56] as const;
+const GROUP_OF_RUN_WIDTHS = [null, 160, 90, 80, 160, 70] as const;
+const CHECK_WIDTHS = [150, 90, 90, null, 120] as const;
+const RUNNING_GROUP_WIDTHS = [null, 190, 90, 240, 120] as const;
+const SET_ASIDE_WIDTHS = [260, 240, null] as const;
 
 /** An ingestion run's rows written: "at least" when some loads recorded no count. */
 export const rowsText = (r: Row) => (r.rows_partial ? `at least ${fmtInt(r.rows_written)}` : fmtInt(r.rows_written));
@@ -38,8 +45,10 @@ function foldPaused(runs: Row[]): (Row | { folded: Row[] })[] {
 export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean }) {
   const columns = showJob ? 11 : 10;
   const [open, setOpen] = useState<string | null>(null);
+  const widths = runWidths(!!showJob);
   return (
-    <div className="table-wrap"><table className="data dense fit wrap-head">
+    <div className="table-wrap"><table {...oneLine(widths, "dense fit")}>
+      <Cols widths={widths} />
       <thead><tr><th>Ingestion run</th>{showJob && <th>Ingestion job</th>}<th>Outcome</th><th className="num">Group runs</th>
         <th className="num">Took</th><th className="num">Tables loaded</th><th className="num">Tables/min</th>
         <th className="num">Rows written</th><th className="num">Parallelism</th><th className="num">Clusters</th>
@@ -53,12 +62,13 @@ export function JobRunsTable({ runs, showJob }: { runs: Row[]; showJob?: boolean
           </tr>
         ) : (
           <Fragment key={`${r.job_id}-${r.slot}`}><tr>
-            <td className="name"><Twisty open={open === `${r.job_id}-${r.slot}`} label="Its group runs"
+            <td className="name"><span className="cell-line"><Twisty open={open === `${r.job_id}-${r.slot}`} label="Its group runs"
               onToggle={() => setOpen(open === `${r.job_id}-${r.slot}` ? null : `${r.job_id}-${r.slot}`)} />
-              <Link to={jobRunPath(r.job_id, r.slot)}>{new Date(r.slot).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</Link>
-              {r.outside && <span className="sub">outside its schedule: Run now or started by hand</span>}</td>
-            {showJob && <td className="name"><Link to={`/ingestion-jobs/${r.job_id}`}><Name>{r.job_name}</Name></Link></td>}
-            <td><RunStatus status={null} outcome={r.outcome} />{r.outcome?.note && <span className="sub">{r.outcome.note}</span>}</td>
+              <Cut text={r.outside ? "Outside its schedule: Run now or started by hand" : ""} tipOnlyWhenCut={!r.outside}>
+                <Link to={jobRunPath(r.job_id, r.slot)}>{new Date(r.slot).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</Link>
+                {r.outside && <span className="sub">outside its schedule</span>}</Cut></span></td>
+            {showJob && <td className="name"><Link to={`/ingestion-jobs/${r.job_id}`}><Cut text={r.job_name} tipOnlyWhenCut /></Link></td>}
+            <td><span className="cell-line"><RunStatus status={null} outcome={r.outcome} />{r.outcome?.note && <Cut text={r.outcome.note} className="cut sub" />}</span></td>
             <td className="num">{fmtInt(r.ran)} of {fmtInt(r.members)}{Number(r.extra) > 0 && <span className="sub">{fmtInt(r.extra)} extra</span>}</td>
             <td className="num">{r.took_s != null ? fmtDuration(r.took_s) : r.running_s != null ? <>{fmtDuration(r.running_s)}<span className="sub">so far</span></> : ""}</td>
             <td className="num">{fmtInt(r.loaded)}</td>
@@ -89,16 +99,17 @@ function RunGroups({ jobId, slot }: { jobId: unknown; slot: string }) {
     <div className="run-groups">
       <p className="muted small">{lines.some((g) => g.check) ? `Its check started ${fmtInt(groups.length)} of the job's ${fmtInt(run.data.members)} ${plural(run.data.members, "group")}: those with changes.`
         : `${fmtInt(groups.length)} of the job's ${fmtInt(run.data.members)} ${plural(run.data.members, "group")} ran.`}</p>
-      <table className="data dense">
+      <table {...oneLine(GROUP_OF_RUN_WIDTHS, "dense")}>
+        <Cols widths={GROUP_OF_RUN_WIDTHS} />
         <thead><tr><th>Ingestion group</th><th>Status</th><th>Started</th><th className="num">Took</th><th>Tables</th><th className="num">Failed</th></tr></thead>
         <tbody>
           {lines.filter((g) => g.check || g.run_id).map((g) => (
             <tr key={`${g.check ? "check-" : ""}${g.task_collection}-${g.run_id ?? g.state}`}>
-              <td className="name">{g.check ? <span className="muted">check</span> : <Link to={`/collections/${encodeURIComponent(g.task_collection)}`}>{g.task_collection}</Link>}</td>
+              <td className="name">{g.check ? <span className="muted">check</span> : <Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><Cut text={g.task_collection} tipOnlyWhenCut /></Link>}</td>
               <td>{g.run_id ? <Link to={`/runs/${g.run_id}`}><RunStatus status={null} outcome={g.status} /></Link> : <RunStatus status={null} outcome={g.status} />}</td>
               <td>{g.started_at ? fmtClock(g.started_at) : ""}</td>
               <td className="num">{g.duration_s != null ? fmtDuration(g.duration_s) : ""}</td>
-              <td style={{ minWidth: 140 }}>{g.check ? "" : <ProgressBar p={progressFrom(g.progress)} />}</td>
+              <td>{g.check ? "" : <ProgressBar p={progressFrom(g.progress)} />}</td>
               <td className="num" style={{ color: Number(g.failed) ? "var(--bad)" : undefined }}>{g.check ? "" : fmtInt(g.failed)}</td>
             </tr>
           ))}
@@ -131,15 +142,16 @@ function RunningNow({ live }: { live: Row }) {
           <li>
             <h3><span className="step-number">1</span>Check<Info label="About the check">Looks at each database for changes, then starts
               a group run for each group with work.</Info></h3>
-            <div className="table-wrap"><table className="data dense">
+            <div className="table-wrap"><table {...oneLine(CHECK_WIDTHS, "dense")}>
+              <Cols widths={CHECK_WIDTHS} />
               <thead><tr><th>Status</th><th>Started</th><th>Finished</th><th>What it found</th><th></th></tr></thead>
               <tbody><tr>
                 <td><RunStatus status={null} outcome={check.status} /></td><td>{fmtClock(check.started)}</td>
                 <td>{check.ended ? fmtClock(check.ended) : ""}</td>
                 <td>{found && !checking
-                  ? <>{fmtInt(found.databases_with_work)} {plural(found.databases_with_work, "database")} changed
-                    {found.unchanged_databases != null && <>, {fmtInt(found.unchanged_databases)} unchanged and stamped</>};{" "}
-                    started {fmtInt(found.started)} of {fmtInt(found.groups)} {plural(found.groups, "group")}</>
+                  ? <Cut tipOnlyWhenCut text={`${fmtInt(found.databases_with_work)} ${plural(found.databases_with_work, "database")} changed${
+                    found.unchanged_databases != null ? `, ${fmtInt(found.unchanged_databases)} unchanged and stamped` : ""}; started ${
+                    fmtInt(found.started)} of ${fmtInt(found.groups)} ${plural(found.groups, "group")}`} />
                   : <Busy label="Checking the databases" />}</td>
                 <td>{check.url && <OutLink href={check.url}>Open run</OutLink>}</td>
               </tr></tbody>
@@ -150,17 +162,18 @@ function RunningNow({ live }: { live: Row }) {
           <h3>{check && <span className="step-number">2</span>}Group runs: {fmtInt(runs.length)}{runs.length ? `, ${fmtInt(going)} going` : ""}</h3>
           {check && !runs.length
             ? <p className="muted small">{checking || !found ? "Start when the check ends." : "No group had changes."}</p>
-            : <div className="table-wrap"><table className="data dense">
+            : <div className="table-wrap"><table {...oneLine(RUNNING_GROUP_WIDTHS, "dense")}>
+              <Cols widths={RUNNING_GROUP_WIDTHS} />
               <thead><tr><th>Ingestion group</th><th>Status</th><th>Started</th><th>Progress</th><th></th></tr></thead>
               <tbody>
                 {runs.map((g) => {
                   const p = g.progress;
                   return (
                     <tr key={g.run_id}>
-                      <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}>{g.task_collection}</Link></td>
-                      <td><RunStatus status={null} outcome={g.status} />{g.status?.note && <span className="sub">{g.status.note}</span>}</td>
+                      <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><Cut text={g.task_collection} tipOnlyWhenCut /></Link></td>
+                      <td><span className="cell-line"><RunStatus status={null} outcome={g.status} />{g.status?.note && <Cut text={g.status.note} className="cut sub" />}</span></td>
                       <td>{fmtClock(g.started)}</td>
-                      <td style={{ minWidth: 220 }}>{p ? <ProgressBar p={progressFrom({ total: p.planned, loaded: p.done, failed: p.failed })} />
+                      <td>{p ? <ProgressBar p={progressFrom({ total: p.planned, loaded: p.done, failed: p.failed })} />
                         : g.active ? <Spinner label="Starting" /> : null}</td>
                       <td>{g.url && <OutLink href={g.url}>Open run</OutLink>}</td>
                     </tr>
@@ -220,10 +233,12 @@ function Preparation({ jobId, deleteRefusal, onDelete }: { jobId: string; delete
       <ErrorBox error={prepare.error || act.error} />
       <WriteWarnings warnings={p.warnings} />
       {listed.length > 0 && <>
-        <div className="table-wrap"><table className="data dense">
+        <div className="table-wrap"><table {...oneLine(SET_ASIDE_WIDTHS, "dense")}>
+          <Cols widths={SET_ASIDE_WIDTHS} />
           <thead><tr><th>Server</th><th>Database</th><th>Why it was set aside</th></tr></thead>
           <tbody>{listed.map((e) => (
-            <tr key={`${e.server}/${e.database}`}><td>{e.server}</td><td className="name">{e.database}</td><td>{setAsideWhy(e)}</td></tr>
+            <tr key={`${e.server}/${e.database}`}><td><CutCopy text={e.server} label={`Copy the server ${e.server}`} /></td>
+              <td className="name"><Cut text={e.database} tipOnlyWhenCut /></td><td><Cut text={setAsideWhy(e)} tipOnlyWhenCut /></td></tr>
           ))}</tbody>
         </table></div>
         {Number(counts.set_aside) > listed.length && <p className="muted small">The first {fmtInt(listed.length)} of{" "}

@@ -1,16 +1,17 @@
 import { useState, type FormEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
-import { ErrorBox, Notice, Spinner } from "../components";
+import { SOURCE_TYPE_NAMES, connectionTypeName } from "../cells";
+import { Cols, Cut, CutCopy, ErrorBox, Notice, Spinner, oneLine } from "../components";
 import { LoginFields } from "./JdbcLoginFields";
 
 /** The props Discover's create choices receive (the same shape as CreateChoiceProps). A JDBC connection needs none of them:
  *  it saves through the app and reads its own list, so the props are accepted and left unused. */
 type ChoiceProps = { workspaceUrl?: string | null; refreshing?: boolean; onRefresh?: () => void };
 
-const SOURCE_TYPES: [string, string][] = [
-  ["sqlserver", "SQL Server"], ["oracle", "Oracle"], ["postgresql", "PostgreSQL"], ["mysql", "MySQL"],
-];
+/** As the Unity Catalog connections list keeps its columns: Name and Host take the spare width, the rest are narrow. */
+const LIST_WIDTHS = [null, 130, null, 140, 190, 100] as const;
+const SOURCE_TYPES = Object.entries(SOURCE_TYPE_NAMES);
 const KEY_PLACEHOLDER = "orders-login, or creds-{database} for one login per database";
 
 type Connection = { name: string; src_type: string; src_host: string; src_port: number; secret_scope: string;
@@ -122,23 +123,24 @@ export function JdbcConnectionForm(_props: ChoiceProps) {
       {connections.isError && <ErrorBox error={connections.error} />}
       {list.length === 0 && !connections.isLoading && <p className="muted">None yet.</p>}
       {list.length > 0 && (
-        <table className="jdbc-list">
+        <div className="table-wrap"><table {...oneLine(LIST_WIDTHS, "jdbc-list")}>
+          <Cols widths={LIST_WIDTHS} />
           <thead>
             <tr><th>Name</th><th>Source</th><th>Host</th><th>Secret scope</th><th>Secret key</th><th>Certificate</th></tr>
           </thead>
           <tbody>
             {list.map((c) => (
               <tr key={c.name}>
-                <td>{c.name}</td>
-                <td>{SOURCE_TYPES.find(([value]) => value === c.src_type)?.[1] ?? c.src_type}</td>
-                <td>{c.src_host}:{c.src_port}</td>
-                <td>{c.secret_scope}</td>
-                <td>{c.secret_key}</td>
+                <td className="name"><Cut text={c.name} tipOnlyWhenCut /></td>
+                <td>{connectionTypeName(c.src_type)}</td>
+                <td><CutCopy text={`${c.src_host}:${c.src_port}`} label={`Copy the host of ${c.name}`} /></td>
+                <td><Cut text={c.secret_scope} tipOnlyWhenCut /></td>
+                <td><CutCopy text={c.secret_key} label={`Copy the secret key of ${c.name}`} /></td>
                 <td>{c.trust === "trust" ? "Trusted" : "Verified"}</td>
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       )}
       {list.length > 0 && (
         <form className="jdbc-form" onSubmit={readDatabases} aria-label="Read a JDBC connection's databases">
@@ -166,7 +168,7 @@ export function JdbcConnectionForm(_props: ChoiceProps) {
  *  only; the secret itself is in the scope and is never shown here. */
 export function JdbcSourceNotice({ jdbc }: { jdbc: Row }) {
   if (jdbc.missing) return <Notice tone="warn">It reads through the JDBC connection {jdbc.name}, which is no longer kept.</Notice>;
-  const type = SOURCE_TYPES.find(([value]) => value === jdbc.src_type)?.[1] ?? jdbc.src_type;
+  const type = connectionTypeName(jdbc.src_type);
   return (
     <Notice tone="info">
       It reads through the JDBC connection <b>{jdbc.name}</b>: {type} at {jdbc.src_host}:{jdbc.src_port}, secret scope{" "}

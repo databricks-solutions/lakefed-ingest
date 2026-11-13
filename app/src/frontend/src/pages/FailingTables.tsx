@@ -1,7 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Row } from "../api";
 import { retryLine } from "../runDialog";
-import { ErrorBox, Notice, Section, fmtInt, fmtTime, plural, useConfirm, type ConfirmRequest } from "../components";
+import { Cols, Cut, CutCopy, ErrorBox, Notice, Section, fmtInt, fmtTime, oneLine, plural, useConfirm, type ConfirmRequest } from "../components";
+
+/** The failing tables as a job's runs list keeps its columns: the table and the source message share the spare width. */
+const WIDTHS = [null, 140, 84, null, 160, 64, 255] as const;
 
 // What each kind of failure means for the table, as its title reads on the page.
 const KIND_NOTE: Record<string, string> = {
@@ -57,7 +60,8 @@ export function FailingTables({ jobId, runRefused, changeRefused, removeRefused 
       <ErrorBox error={retry.error} />
       <ErrorBox error={disable.error} />
       <ErrorBox error={remove.error} />
-      <div className="table-wrap"><table className="data dense wrap-head">
+      <div className="table-wrap"><table {...oneLine(WIDTHS, "dense")}>
+        <Cols widths={WIDTHS} />
         <thead><tr><th>Table and database</th><th>Error class</th><th>Kind</th><th>Source message</th><th>Failing since</th>
           <th className="num">Runs</th><th></th></tr></thead>
         <tbody>
@@ -68,17 +72,18 @@ export function FailingTables({ jobId, runRefused, changeRefused, removeRefused 
               || (remove.isPending && remove.variables?.control_id === row.control_id);
             return (
               <tr key={row.control_id}>
-                <td className="name"><b>{row.table}</b>
-                  <span className="sub">{row.src_database} on {row.server}</span>
-                  <span className="sub">ingestion group {row.task_collection}</span></td>
-                <td>{row.error_class}</td>
+                <td className="name"><Cut
+                  text={`${row.table}, ${row.src_database} on ${row.server}, ingestion group ${row.task_collection}`}>
+                  <b>{row.table}</b><span className="sub">{row.src_database} on {row.server}</span></Cut></td>
+                <td><Cut text={row.error_class} tipOnlyWhenCut /></td>
                 <td title={row.error_kind ? KIND_NOTE[row.error_kind] : "Recorded for failures after this version; not known for earlier ones."}>
                   {row.error_kind ?? <span className="muted">not recorded</span>}</td>
-                <td className="small" title={row.message}>{row.message.length > SHOWN_MESSAGE ? `${row.message.slice(0, SHOWN_MESSAGE)}…` : row.message}</td>
+                <td className="small"><CutCopy text={row.message} label="Copy the source message"
+                  shown={row.message.length > SHOWN_MESSAGE ? `${row.message.slice(0, SHOWN_MESSAGE)}…` : row.message} /></td>
                 <td>{row.failing_since ? fmtTime(row.failing_since)
                   : <span className="muted">before the last 30 days</span>}</td>
-                <td className="num">{fmtInt(row.runs)} {plural(row.runs, "run")}
-                  <span className="sub">{fmtInt(row.failures)} {plural(row.failures, "failure")}</span></td>
+                <td className="num"><Cut text={`${fmtInt(row.failures)} ${plural(row.failures, "failure")}`}>
+                  {fmtInt(row.runs)} {plural(row.runs, "run")}</Cut></td>
                 <td className="actions">
                   <button className="ghost" disabled={!!runRefused || retrying}
                     title={runRefused ?? "Start one ingest run for this table's database alone"}

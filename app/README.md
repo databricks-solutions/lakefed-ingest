@@ -504,6 +504,23 @@ lists always come from the stored discovery.
 Databricks Apps builds the frontend at deploy time (`npm install`, then `npm run build` into
 `src/static/`), so build output isn't committed. `package-lock.json` pins every dependency.
 
+## Tables
+
+Every table keeps its rows on one line, as the Databricks Jobs list, a job's runs list and Catalog Explorer's
+tables and connections lists do:
+
+- A long value is cut with an ellipsis and shown whole on hover or keyboard focus. Nothing breaks inside a word.
+- Coded values show their display name ("SQL Server", "Change tracking"), not the stored code.
+- Short fields sit in fixed narrow columns; the name and host take the spare width. Below a table's narrowest
+  width it scrolls sideways instead of wrapping.
+- Identifiers (a host, a secret key, a job, warehouse or run id) have a copy button.
+- A table names the Databricks screen it follows in the comment above its column widths.
+
+Plain tables use `oneLine(widths)` and `<Cols widths={...} />` from `components.tsx`, with `Cut`, `CutCopy` and
+`CopyButton` for cells; the layout rules are `table.data.one-line` in `styles.css`. The type names come from
+`SOURCE_TYPE_NAMES` in `cells.ts`. The AG Grid lists (`Grid`, `autoColumns`) cut and show a tooltip for a cut value
+themselves. `app/tests/frontend_one_line_tables_test.py` checks the sources for it.
+
 ## Security model
 
 The app runs as its own service principal (created with the app):

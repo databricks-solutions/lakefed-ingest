@@ -5,7 +5,10 @@ import { type ColDef } from "ag-grid-community";
 import { api, type Row } from "../api";
 import { useSettings } from "../App";
 import { groupsRefusal, usePermissions } from "../permissions";
-import { Badge, Busy, ConfirmButton, ErrorBox, FillBox, ToastOn, Grid, Notice, PageHead, Section, Tag, WriteWarnings, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme, Host, plural } from "../components";
+import { Badge, Busy, Cols, ConfirmButton, Cut, ErrorBox, FillBox, ToastOn, Grid, Notice, PageHead, Section, Tag, WriteWarnings, autoColumns, fmtAgo, fmtInt, fmtTime, gridTheme, Host, oneLine, plural } from "../components";
+
+/** The tracked databases list as the Jobs list keeps its columns: the database takes the spare width. */
+const TRACKED_WIDTHS = [null, 260, 90, 130] as const;
 
 const EDITABLE = ["include", "load_type", "primary_key", "cursor_column", "load_partitioned", "partition_col",
   "partition_size_mb", "sink_catalog", "sink_schema", "sink_table", "client_id", "freshness_sla_minutes"];
@@ -59,11 +62,12 @@ function Connections({ picked, onPick }: { picked: Connection | null; onPick: (c
             discovery through the connection, which is not built yet; add new ones in the discovery form below.</p>
           <ErrorBox error={tracked.error} />
           <FillBox min={200}>
-            <table className="data">
+            <table {...oneLine(TRACKED_WIDTHS)}>
+              <Cols widths={TRACKED_WIDTHS} />
               <thead><tr><th>Database</th><th>Ingestion groups</th><th className="num">Tables</th><th className="num">Last success</th></tr></thead>
               <tbody>
                 {(tracked.data ?? []).map((d) => (
-                  <tr key={d.src_database}><td><b>{d.src_database}</b></td><td>{d.collections}</td><td className="num">{fmtInt(d.tables)}</td>
+                  <tr key={d.src_database}><td><Cut text={d.src_database} tipOnlyWhenCut><b>{d.src_database}</b></Cut></td><td><Cut text={String(d.collections ?? "")} tipOnlyWhenCut /></td><td className="num">{fmtInt(d.tables)}</td>
                     <td className="num">{fmtAgo(d.newest_success_at)}</td></tr>
                 ))}
                 {tracked.data && !tracked.data.length && <tr><td colSpan={4} className="muted">Nothing tracked on this source yet.</td></tr>}

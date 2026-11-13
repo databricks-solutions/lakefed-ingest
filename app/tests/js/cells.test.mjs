@@ -2,7 +2,7 @@
 // its port, and whether a cell's text is cut. Run with `node --test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { SOURCE_TYPE_NAMES, connectionTypeName, hostLabel, isCut, tipKeepsClick } from "../../src/frontend/src/cells.ts";
+import { SOURCE_TYPE_NAMES, connectionTypeName, hostLabel, isCut, tableMinWidth, tipKeepsClick } from "../../src/frontend/src/cells.ts";
 
 test("each type the app reads is named as Catalog Explorer names it", () => {
   assert.equal(connectionTypeName("SQLSERVER"), "SQL Server");
@@ -52,4 +52,11 @@ test("a click on text with no tooltip goes on to the row around it, whatever els
 test("a click on text with a tooltip stays with the tooltip unless the row is meant to take it too", () => {
   assert.equal(tipKeepsClick("a long connection name", false), true);
   assert.equal(tipKeepsClick("a long connection name", true), false);
+});
+
+test("a one-line table's narrowest width is its fixed columns plus a set room for each flexible one", () => {
+  assert.equal(tableMinWidth([40, null, 100, null, 180]), 40 + 120 + 100 + 120 + 180);
+  assert.equal(tableMinWidth([40, null, 100, null, 180], 100), 40 + 100 + 100 + 100 + 180);
+  assert.equal(tableMinWidth([80, 120]), 200);
+  assert.equal(tableMinWidth([]), 0);
 });

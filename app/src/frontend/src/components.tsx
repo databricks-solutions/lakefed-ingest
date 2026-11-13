@@ -7,7 +7,7 @@ import { AgGridReact } from "ag-grid-react";
 import { themeQuartz, type ColDef, type GridApi, type GridOptions } from "ag-grid-community";
 import { ApiError, type Row } from "./api";
 import { longWait } from "./pending";
-import { SOURCE_TYPE_NAMES, hostLabel, isCut, tipKeepsClick } from "./cells";
+import { type ColumnWidths, SOURCE_TYPE_NAMES, hostLabel, isCut, tableMinWidth, tipKeepsClick } from "./cells";
 
 // AG Grid in the workspace look: the design system's font, border, header and accent colors (styles.css).
 export const gridTheme = themeQuartz.withParams({
@@ -82,6 +82,12 @@ export function heading(key: string): string {
   return HEADINGS[key] ?? (key.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase()) || " ");
 }
 
+/** The widest an autosized grid column grows: a longer value is cut with an ellipsis and shown whole on hover. */
+const GRID_MAX_COLUMN_WIDTH = 420;
+
+/** A time cell: the short form in the cell, the full date and time on hover, as the plain tables show their times. */
+export const timeCellRenderer = (p: { value?: unknown }) => <span title={fmtTime(p.value)}>{fmtShort(p.value)}</span>;
+
 /** Column defs from the first row's keys (with per-column overrides), so pages stay short. */
 export function autoColumns(rows: Row[], overrides: Record<string, Partial<ColDef>> = {}, hide: string[] = []): ColDef[] {
   const keys = rows.length ? Object.keys(rows[0]) : Object.keys(overrides);
@@ -89,8 +95,9 @@ export function autoColumns(rows: Row[], overrides: Record<string, Partial<ColDe
     field: k,
     headerName: heading(k),
     ...(/(_at|started|finished|ended)$/.test(k)
-      ? { valueFormatter: (p: any) => fmtShort(p.value), tooltipValueGetter: (p: any) => fmtTime(p.value) }
+      ? { valueFormatter: (p: any) => fmtShort(p.value), cellRenderer: timeCellRenderer }
       : VALUE_WORDS[k] ? { valueFormatter: (p: any) => valueName(k, p.value) } : {}),
+    ...(overrides[k]?.flex ? {} : { maxWidth: GRID_MAX_COLUMN_WIDTH }),
     ...overrides[k],
   }));
 }
@@ -169,7 +176,9 @@ export function Grid(props: {
         theme={theme}
         rowData={props.rows ?? []}
         columnDefs={cols}
-        defaultColDef={{ sortable: true, filter: props.filters ?? true, resizable: true, minWidth: 90 }}
+        defaultColDef={{ sortable: true, filter: props.filters ?? true, resizable: true, minWidth: 90,
+          tooltipValueGetter: (p) => String(p.valueFormatted ?? p.value ?? "") }}
+        tooltipShowMode="whenTruncated" enableCellTextSelection
         rowHeight={ROW_HEIGHT} headerHeight={HEADER_HEIGHT}
         autoSizeStrategy={{ type: "fitCellContents" }}
         rowSelection={props.selection
@@ -296,9 +305,10 @@ function TipPop({ id, text, target }: { id: string; text: string; target: DOMRec
 
 /** Text on one line: cut with an ellipsis when it does not fit, the whole text on hover or focus (as the Databricks
  * lists do). Only text that is cut is a tab stop. With `tipOnlyWhenCut` a short text has no tooltip repeating it. With
- * `passClick` a click on the text also reaches the row it sits in, so a row can be chosen by clicking any of its text. */
-export function Cut({ text, className = "cut", tipOnlyWhenCut = false, passClick = false }: {
-  text: string; className?: string; tipOnlyWhenCut?: boolean; passClick?: boolean;
+ * `passClick` a click on the text also reaches the row it sits in, so a row can be chosen by clicking any of its text.
+ * Given `children` (a bold name with a muted note beside it), it shows those and `text` is what the tooltip says. */
+export function Cut({ text, className = "cut", tipOnlyWhenCut = false, passClick = false, children }: {
+  text: string; className?: string; tipOnlyWhenCut?: boolean; passClick?: boolean; children?: ReactNode;
 }) {
   const ref = useRef<HTMLSpanElement>(null);
   const [cut, setCut] = useState(false);
@@ -309,7 +319,24 @@ export function Cut({ text, className = "cut", tipOnlyWhenCut = false, passClick
     return () => window.removeEventListener("resize", measure);
   }, [text]);
   return <Tip text={tipOnlyWhenCut && !cut ? "" : text} focusable={cut} passClick={passClick}>
-    <span ref={ref} className={className}>{text}</span></Tip>;
+    <span ref={ref} className={className}>{children ?? text}</span></Tip>;
+}
+
+/** The columns of a one-line table (`table.data.one-line`): fixed widths in pixels, `null` for the column that takes what
+ * is left. Fixed layout needs them, and they are what keeps a short field narrow and a name wide. */
+export function Cols({ widths }: { widths: ColumnWidths }) {
+  return <colgroup>{widths.map((width, index) => <col key={index} style={width === null ? undefined : { width }} />)}</colgroup>;
+}
+
+/** The props for a one-line table: its class and its narrowest width, from the same widths as its `Cols`. */
+export function oneLine(widths: ColumnWidths, extraClasses = "") {
+  return { className: `data one-line${extraClasses ? ` ${extraClasses}` : ""}`, style: { minWidth: tableMinWidth(widths) } };
+}
+
+/** An identifier on one line with a copy button beside it, shown when the row is hovered or focused (Catalog Explorer
+ * puts a copy icon beside the values you copy: a host, an ID, a full name). */
+export function CutCopy({ text, label, shown }: { text: string; label: string; shown?: ReactNode }) {
+  return <span className="cell-line"><Cut text={text} tipOnlyWhenCut>{shown}</Cut><CopyButton text={text} label={label} /></span>;
 }
 
 /** A host name on one line: cut with an ellipsis when it does not fit, its full name (and port) on hover. */
@@ -401,8 +428,9 @@ export type { StateCounts } from "./bars";
 /** The counts under a bar, in the bar's colours (bars.ts says what they are). */
 function BarCountsLine({ summary, stacked }: { summary: BarSummary; stacked?: boolean }) {
   const className = `bar-counts${stacked ? " stacked" : ""}`;
-  if (summary.allDone) return <span className={className}><span className="tone-loaded all-done"><Check /> {summary.allDone}</span></span>;
-  return <span className={className}>{summary.items.map((entry) => <span key={entry.text} className={`tone-${entry.tone}`}>{entry.text}</span>)}</span>;
+  const whole = summary.allDone ?? summary.items.map((entry) => entry.text).join(" · ");
+  if (summary.allDone) return <Cut text={whole} className={className} tipOnlyWhenCut><span className="tone-loaded all-done"><Check /> {summary.allDone}</span></Cut>;
+  return <Cut text={whole} className={className} tipOnlyWhenCut>{summary.items.map((entry) => <span key={entry.text} className={`tone-${entry.tone}`}>{entry.text}</span>)}</Cut>;
 }
 
 function Check() {
@@ -777,8 +805,8 @@ export function JobStatus({ status }: { status?: Row | null }) {
   return (
     <div className="status-cell">
       <Tag tone={tone}>{status.label}</Tag>
-      {detail.length > 0 && <span className="sub">{detail.join(" · ")}</span>}
-      {status.cause && <span className="sub">{status.cause}</span>}
+      {detail.length > 0 && <Cut text={detail.join(" · ")} className="cut sub" />}
+      {status.cause && <Cut text={String(status.cause)} className="cut sub" />}
     </div>
   );
 }

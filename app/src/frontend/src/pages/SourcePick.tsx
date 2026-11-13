@@ -1,7 +1,7 @@
 import { Fragment, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Notice, Pager, fmtInt, plural, Twisty } from "../components";
+import { Cols, Cut, ErrorBox, Notice, Pager, fmtInt, oneLine, plural, Twisty } from "../components";
 import { TriBox } from "./Discover";
 import { serverRowPick, underFilter } from "./pickState";
 
@@ -19,6 +19,9 @@ const TABLES = 50;
 const same = (a: Row, server: string, database: string) =>
   String(a.server).toLowerCase() === server.toLowerCase() && String(a.database).toLowerCase() === database.toLowerCase();
 export { underFilter };
+
+/** The pick tree's columns as Catalog Explorer's tables list keeps them: the name takes the spare width. */
+export const PICK_WIDTHS = [null, 160, 300] as const;
 
 export function loadTypes(r: Row): string {
   const parts = [["ct", "change tracking"], ["cursor", "cursor"], ["full", "full reload"], ["unset", "the job's"]]
@@ -54,10 +57,10 @@ export function DatabaseTables({ kind, sourceId, server, database, whole, chosen
         const on = whole || chosen.some((c) => c.toLowerCase() === key.toLowerCase());
         return (
           <tr key={key} className="l3"><td className="name" style={{ paddingLeft: 62 }}>
-            <TriBox pick={on ? "all" : "none"} label={key} onClick={() => !whole && onToggle(key)} /> {key}
-            {t.notes && <span className="sub">{t.notes}</span>}</td>
+            <span className="cell-line"><TriBox pick={on ? "all" : "none"} label={key} onClick={() => !whole && onToggle(key)} />
+            <Cut text={t.notes ? `${key}  ${t.notes}` : key} tipOnlyWhenCut>{key}{t.notes && <span className="sub">{t.notes}</span>}</Cut></span></td>
             <td className="num">{t.row_count != null ? `${fmtInt(t.row_count)} rows` : ""}</td>
-            <td>{t.load_type === "ct" ? "Change tracking" : t.load_type === "cursor" ? `Cursor column ${t.cursor_column ?? ""}`
+            <td>{t.load_type === "ct" ? "Change tracking" : t.load_type === "cursor" ? <Cut text={`Cursor column ${t.cursor_column ?? ""}`} tipOnlyWhenCut />
               : t.load_type === "full" ? "Full reload" : <span className="muted">the job's</span>}</td></tr>
         );
       })}
@@ -123,26 +126,29 @@ export function SourcePick({ kind, sourceId, picked, setPicked }: { kind: "uploa
         onChange={(e) => { setFilter(e.target.value); setOffset(0); }} />
         {filter && data && <span className="muted">{fmtInt(data.matched.databases)} {plural(data.matched.databases, "database")},{" "}
           {fmtInt(data.matched.tables)} {plural(data.matched.tables, "table")} match</span>}</div>
-      <div className="table-wrap tree-pick"><table className="data tree">
+      <div className="table-wrap tree-pick"><table {...oneLine(PICK_WIDTHS, "tree")}>
+        <Cols widths={PICK_WIDTHS} />
         <thead><tr><th>Server › database › schema.table</th><th className="num">Databases · tables</th><th>Load types</th></tr></thead>
         <tbody>
           {servers.map((s) => (
-            <tr key={s.server}><td className="name">
+            <tr key={s.server}><td className="name"><span className="cell-line">
               <TriBox pick={serverRowPick({ on: picked.whole_server, filter: picked.filter }, filter,
                 picked.databases.length > 0 || picked.tables.length > 0)}
-                label={`The whole server ${s.server}`} onClick={wholeServer} />{" "}
-              <b>{s.server}</b>, {filter ? <>every database matching "{filter}"</> : "the whole server"}</td>
-              <td className="num">{fmtInt(s.databases)} · {fmtInt(s.tables)}</td><td className="muted">{loadTypes(s)}</td></tr>
+                label={`The whole server ${s.server}`} onClick={wholeServer} />
+              <Cut text={`${s.server}, ${filter ? `every database matching "${filter}"` : "the whole server"}`} tipOnlyWhenCut>
+                <b>{s.server}</b>, {filter ? <>every database matching "{filter}"</> : "the whole server"}</Cut></span></td>
+              <td className="num">{fmtInt(s.databases)} · {fmtInt(s.tables)}</td><td className="muted"><Cut text={loadTypes(s)} tipOnlyWhenCut /></td></tr>
           ))}
           {(data?.databases ?? []).map((d: Row) => (
             <Fragment key={key(d)}>
-              <tr className="l2"><td className="name" style={{ paddingLeft: 30 }}>
+              <tr className="l2"><td className="name" style={{ paddingLeft: 30 }}><span className="cell-line">
                 <TriBox pick={isWhole(d) ? "all" : tablesOf(d).length ? "part" : "none"} label={`The whole database ${d.src_database}`}
-                  onClick={() => !(picked.whole_server && underFilter(d.src_database, picked.filter)) && toggleDatabase(d)} />{" "}
-                <Twisty open={open === key(d)} onToggle={() => setOpen(open === key(d) ? null : key(d))}>{d.src_database}</Twisty>
-                {servers.length > 1 && <span className="sub">{d.server}</span>}</td>
+                  onClick={() => !(picked.whole_server && underFilter(d.src_database, picked.filter)) && toggleDatabase(d)} />
+                <Twisty open={open === key(d)} onToggle={() => setOpen(open === key(d) ? null : key(d))}><Cut tipOnlyWhenCut
+                  text={servers.length > 1 ? `${d.src_database}  ${d.server}` : d.src_database}>{d.src_database}
+                  {servers.length > 1 && <span className="sub">{d.server}</span>}</Cut></Twisty></span></td>
                 <td className="num">{fmtInt(d.tables)}{tablesOf(d).length > 0 && <span className="sub">{fmtInt(tablesOf(d).length)} chosen</span>}</td>
-                <td className="muted">{loadTypes(d)}</td></tr>
+                <td className="muted"><Cut text={loadTypes(d)} tipOnlyWhenCut /></td></tr>
               {open === key(d) && <DatabaseTables kind={kind} sourceId={sourceId} server={d.server} database={d.src_database}
                 whole={isWhole(d)} chosen={tablesOf(d)} onToggle={(t) => toggleTable(d, t)} />}
             </Fragment>

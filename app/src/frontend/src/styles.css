@@ -141,6 +141,7 @@ p.small, .alert, .empty { max-width: 140ch; }
 .seg-notrun { background: repeating-linear-gradient(45deg, var(--s-track) 0 3px, var(--db-border-base) 3px 6px); }
 .seg-track { background: var(--s-track); border: 1px solid var(--border); }
 .state-bar { min-width: 120px; }
+.state-bar > .tip-target, .state-bar .bar-counts.stacked { display: block; }
 .bar-counts { display: flex; flex-wrap: wrap; column-gap: 0; row-gap: 2px; margin-top: 4px; font-size: var(--db-font-size-sm); line-height: 1.3; }
 .bar-counts.stacked { flex-direction: column; }
 .bar-counts.stacked > span + span::before { content: none; }
@@ -283,22 +284,38 @@ table.data.fit .status-cell { min-width: 0; }
 table.data.fit .bar { min-width: 80px; }
 table.data.fit th, table.data.fit td { padding-left: 6px; padding-right: 6px; }
 /* A wide table's two-word headers take two lines, so its last column stays in view at 1200 px. */
-table.data.wrap-head th { white-space: normal; vertical-align: bottom; }
-table.data.wrap-head td.name { min-width: 110px; }
 table.data td.mono { white-space: nowrap; }
-/* The connection picker (Add tables, step 1): one line to a row, as Catalog Explorer's connections list and the Jobs list
-   keep theirs. Name and Host are the flexible columns, Type is fixed and narrow, Owner is cut with an ellipsis. */
-table.data.connections { table-layout: fixed; min-width: 600px; }
+/* One line to a row, as Catalog Explorer's lists and the Jobs list keep theirs (the Tables rule in CLAUDE.md). Columns
+   have set widths (<Cols>), so a short field stays narrow and the name takes what is left; text that does not fit ends
+   in an ellipsis and shows whole on hover or focus (<Cut>), and no word is broken. */
+table.data.one-line { table-layout: fixed; }
+table.data.one-line th, table.data.one-line td { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+table.data.one-line td > a, table.data.one-line td > b, table.data.one-line td > a > b { display: block; overflow: hidden; text-overflow: ellipsis; }
+table.data.one-line td > .tip-target, table.data.one-line .tip-target > .cut, table.data.one-line .tip-target > .host { display: block; }
+/* A note, an error or a pager that spans the row is a sentence, not a cell: it wraps. */
+table.data.one-line td[colspan]:not(.name) { white-space: normal; overflow: visible; }
+table.data.one-line .status-cell { flex-direction: row; align-items: center; gap: var(--db-space-2); min-width: 0; }
+table.data.one-line .status-cell > * { flex: 0 1 auto; min-width: 0; }
+table.data.one-line .status-cell > .tag, table.data.one-line .status-cell > .tip-target:first-child { flex: none; }
+table.data.one-line .state-bar { min-width: 0; }
+table.data.one-line .bar-counts { flex-wrap: nowrap; white-space: nowrap; overflow: hidden; }
+table.data.one-line .bar-counts > span { flex: none; }
+/* A row's actions menu opens below the cell, so its cell must not clip it. */
+table.data.one-line td.card-actions { overflow: visible; flex-wrap: nowrap; }
+/* A tree row's name sits in a twisty button: the button gives way so the name can be cut. */
+table.data.one-line .twisty.named { max-width: 100%; min-width: 0; }
+table.data.one-line .twisty.named > .tip-target { flex: 0 1 auto; min-width: 0; }
+table.data.one-line td .sub { display: inline; margin-left: var(--db-space-2); }
+table.data.one-line .cell-line { display: flex; align-items: center; gap: var(--db-space-1, 4px); }
+table.data.one-line .cell-line .tip-target { flex: 0 1 auto; min-width: 0; }
+/* A tag beside a cut name (a database split over groups) stays whole: the name gives way, not the tag. */
+table.data.one-line .cell-line > .tag { flex: none; }
+/* The connection picker (Add tables, step 1): Name and Host are the flexible columns, Type is fixed and narrow, Owner is cut. */
+table.data.connections { min-width: 600px; }
 table.data.connections .col-pick { width: 40px; }
 table.data.connections .col-name { width: 24%; }
 table.data.connections .col-type { width: 100px; }
 table.data.connections .col-owner { width: 180px; }
-table.data.connections td.cell { white-space: nowrap; overflow: hidden; }
-table.data.connections td.cell b { display: block; overflow: hidden; }
-table.data.connections .cut { display: block; }
-table.data.connections .tip-target { display: block; }
-table.data.connections .cell-line { display: flex; align-items: center; gap: var(--db-space-1, 4px); }
-table.data.connections .cell-line .tip-target { flex: 0 1 auto; min-width: 0; }
 .copy-button { flex: none; padding: 0 4px; min-height: 0; line-height: 1; opacity: 0; }
 tr:hover .copy-button, .copy-button:focus-visible, .copy-button:focus { opacity: 1; }
 .pager { display: flex; align-items: center; justify-content: space-between; gap: var(--db-space-3); flex-wrap: wrap; margin: var(--db-space-2) 0; }
@@ -343,7 +360,6 @@ span.info { display: inline-grid; place-items: center; width: 16px; height: 16px
             font-size: 11px; margin-right: 4px; }
 .mono { font-family: var(--db-font-family-mono, ui-monospace, Menlo, monospace); }
 .tree-search { width: min(420px, 100%); }
-table.tree td .target-path { padding-left: 28px; }
 table.tree tr.l3 td { padding-top: 3px; padding-bottom: 3px; }
 .add-databases { border: 1px solid var(--border); border-radius: 6px; padding: var(--db-space-3); margin-bottom: var(--db-space-3); }
 details.advanced summary { cursor: pointer; display: flex; gap: var(--db-space-2); align-items: baseline; }

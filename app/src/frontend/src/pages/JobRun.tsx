@@ -4,11 +4,14 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { useSettings } from "../App";
 import { api, type Row } from "../api";
-import { OutLink, clusterUrl,
+import { OutLink, clusterUrl, Cols, CopyButton, Cut, oneLine,
   Crumbs, ErrorBox, PageHead, Pager, ProgressBar, ProgressKey, RunStatus, Section, Stamp, Tag, fmtClock, fmtDuration, fmtInt,
   fmtSpeed, jobRunName, plural, progressFrom, progressText, type Tone
 } from "../components";
 import { rowsText } from "./IngestionJob";
+
+const GROUP_RUN_WIDTHS = [null, 190, 90, 80, 170, 90, 100, 170, 70] as const;
+const DATABASE_WIDTHS = [null, 190, 84, 90, 70, 140] as const;
 
 const DATABASES_PAGE = 20;
 
@@ -77,7 +80,8 @@ export default function JobRun() {
           <Section title={`Group runs: ${fmtInt(r.group_runs.filter((g: Row) => !g.check).length)}`}
             note={r.group_runs.some((g: Row) => g.check) ? "The check job's checks first, then running, then waiting, then finished."
               : "Running first, then waiting, then finished."}>
-            <div className="table-wrap"><table className="data">
+            <div className="table-wrap"><table {...oneLine(GROUP_RUN_WIDTHS)}>
+              <Cols widths={GROUP_RUN_WIDTHS} />
               <thead><tr><th>Ingestion group</th><th>Status</th><th>Started</th><th className="num">Took</th><th>Progress</th>
                 <th className="num">Tables/min</th><th className="num">Parallelism</th><th>Cluster</th><th className="num">Failed</th></tr></thead>
               <tbody>
@@ -86,18 +90,21 @@ export default function JobRun() {
                   const waiting = g.state === "waiting";
                   return (
                     <tr key={`${g.task_collection}-${g.check ? "check-" : ""}${g.run_id ?? g.state}`}>
-                      <td className="name"><Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><b>{g.task_collection}</b></Link>
+                      <td className="name"><Cut text={g.task_collection} tipOnlyWhenCut={!g.extra && !g.check}>
+                        <Link to={`/collections/${encodeURIComponent(g.task_collection)}`}><b>{g.task_collection}</b></Link>
                         {g.extra && <span className="sub">extra run, likely started by hand</span>}
-                        {g.check && <span className="sub">check</span>}</td>
+                        {g.check && <span className="sub">check</span>}</Cut></td>
                       <td>{waiting ? <Tag tone={"" as Tone}>Waiting, starts {fmtClock(g.fire_at)}</Tag>
                         : g.state === "starting" ? <Tag tone="run">Starting, triggered {fmtClock(g.fire_at)}</Tag>
                         : g.run_id ? <Link to={`/runs/${g.run_id}`}><RunStatus status={null} outcome={g.status} /></Link>
                         : <RunStatus status={null} outcome={g.status} />}</td>
                       <td>{g.started_at ? fmtClock(g.started_at) : ""}</td>
                       <td className="num">{g.duration_s != null ? fmtDuration(g.duration_s) : ""}</td>
-                      <td style={{ minWidth: 160 }}>{g.check ? "" : <ProgressBar p={gp} />}</td>
+                      <td>{g.check ? "" : <ProgressBar p={gp} />}</td>
                       <td className="num">{g.speed_tables_per_min != null ? fmtSpeed(g.speed_tables_per_min) : ""}</td>
-                      <td className="num">{g.parallelism ?? ""}</td><td className="mono">{g.cluster_id ? <OutLink href={clusterUrl(config?.workspace_url, g.cluster_id)}>{g.cluster_id}</OutLink> : ""}</td>
+                      <td className="num">{g.parallelism ?? ""}</td><td className="mono">{g.cluster_id && <span className="cell-line">
+                        <Cut text={g.cluster_id} tipOnlyWhenCut><OutLink href={clusterUrl(config?.workspace_url, g.cluster_id)}>{g.cluster_id}</OutLink></Cut>
+                        <CopyButton text={g.cluster_id} label={`Copy cluster ${g.cluster_id}`} /></span>}</td>
                       <td className="num" style={{ color: Number(g.failed) ? "var(--bad)" : undefined }}>{g.check ? "" : fmtInt(g.failed)}</td>
                     </tr>
                   );
@@ -106,14 +113,16 @@ export default function JobRun() {
             </table></div>
           </Section>
           <Section title={`Databases: ${fmtInt(dbs.length)}`} note="Every database with table events in this ingestion run: failed first, then in flight, then done.">
-            <div className="table-wrap"><table className="data">
+            <div className="table-wrap"><table {...oneLine(DATABASE_WIDTHS)}>
+              <Cols widths={DATABASE_WIDTHS} />
               <thead><tr><th>Database</th><th>Ingestion group</th><th className="num">Loaded</th><th className="num">In flight</th>
                 <th className="num">Failed</th><th className="num">Rows written</th></tr></thead>
               <tbody>
                 {dbs.slice(dbOffset, dbOffset + DATABASES_PAGE).map((d) => (
                   <tr key={`${d.task_collection}\u001f${d.server}\u001f${d.src_database}`}>
-                    <td className="name"><b>{d.src_database || "(none)"}</b>{manyServers && <span className="sub">{d.server || "(no server)"}</span>}</td>
-                    <td>{d.task_collection}</td><td className="num">{fmtInt(d.loaded)}</td><td className="num">{fmtInt(d.in_flight)}</td>
+                    <td className="name"><Cut text={`${d.src_database || "(none)"}${manyServers ? ` on ${d.server || "(no server)"}` : ""}`} tipOnlyWhenCut={!manyServers}>
+                      <b>{d.src_database || "(none)"}</b>{manyServers && <span className="sub">{d.server || "(no server)"}</span>}</Cut></td>
+                    <td><Cut text={d.task_collection} tipOnlyWhenCut /></td><td className="num">{fmtInt(d.loaded)}</td><td className="num">{fmtInt(d.in_flight)}</td>
                     <td className="num" style={{ color: Number(d.failed) ? "var(--bad)" : undefined }}>{fmtInt(d.failed)}</td>
                     <td className="num">{Number(d.uncounted) ? `at least ${fmtInt(d.rows_written || 0)}` : fmtInt(d.rows_written || 0)}</td>
                   </tr>

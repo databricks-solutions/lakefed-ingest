@@ -3,7 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { type ColDef } from "ag-grid-community";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Grid, PageHead, RunStatus, Section, fmtDuration, fmtInt, fmtSpeed, isLiveOutcome, plural } from "../components";
+import { ErrorBox, Grid, PageHead, RunStatus, Section, fmtDuration, fmtInt, fmtSpeed, isLiveOutcome, plural, timeCellRenderer } from "../components";
 import { JobRunsTable, pausedNotRun } from "./IngestionJob";
 
 /** Tables that needed a read: the run's total less those found unchanged. */
@@ -14,7 +14,7 @@ const COLUMNS: ColDef[] = [
   { field: "task_collection", headerName: "Ingestion group", minWidth: 150 },
   { field: "status", headerName: "Outcome", minWidth: 170, valueGetter: (p) => p.data?.outcome?.label ?? p.data?.status,
     cellRenderer: (p: any) => <RunStatus status={p.data?.status} outcome={p.data?.outcome} /> },
-  { field: "started_at", headerName: "Started", minWidth: 110,
+  { field: "started_at", headerName: "Started", minWidth: 110, cellRenderer: timeCellRenderer,
     valueFormatter: (p) => (p.value ? new Date(p.value).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "") },
   { field: "duration_s", headerName: "Took", type: "rightAligned", minWidth: 80,
     valueFormatter: (p) => (p.value === null || p.value === undefined ? "" : fmtDuration(p.value)) },

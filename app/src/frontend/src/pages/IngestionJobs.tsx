@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { ErrorBox, Info, Notice, OutLink, PageHead, Pager, RunStatus, Section, Twisty, fmtInt, fmtShort, fmtTime, toast, useConfirm,
+import { Cols, Cut, ErrorBox, Info, Notice, OutLink, PageHead, Pager, RunStatus, Section, Twisty, fmtInt, oneLine, fmtShort, fmtTime, toast, useConfirm,
          usePageStamp, type Outcome } from "../components";
 import { daysLeftText } from "../pending";
 import { deleteNowRequest } from "./IngestionJob";
@@ -59,6 +59,8 @@ export default function IngestionJobs() {
 }
 
 const DELETED_PAGE = 10;
+/** The deleted jobs list, as the Jobs list keeps its columns: the name takes the room, the short fields have their own. */
+const DELETED_WIDTHS = [null, 130, 100, 190, 110, 280] as const;
 
 /** The deleted jobs kept for a Restore (not yet purged): closed until opened, its count in the header, a page at a time,
  * each with Restore and Delete now. Shown only when there is one. */
@@ -100,7 +102,8 @@ function Deletions() {
         <ErrorBox error={restore.error} />
         <ErrorBox error={purge.error} />
         {purge.data?.delete_run?.error && <Notice tone="warn">The delete job did not start: {purge.data.delete_run.error}</Notice>}
-        <div className="table-wrap"><table className="data">
+        <div className="table-wrap"><table {...oneLine(DELETED_WIDTHS)}>
+          <Cols widths={DELETED_WIDTHS} />
           <thead><tr><th>Ingestion job</th><th>Deleted</th><th>Days left</th><th>State</th><th className="num">Tables left</th><th /></tr></thead>
           <tbody>
             {rows.map((d) => {
@@ -108,19 +111,19 @@ function Deletions() {
               const refusal = d.delete_refusal ?? undefined;
               return (
                 <tr key={d.id}>
-                  <td className="name"><Link to={`/ingestion-jobs/${encodeURIComponent(d.id)}`}>{d.name}</Link></td>
+                  <td className="name"><Link to={`/ingestion-jobs/${encodeURIComponent(d.id)}`}><Cut text={d.name} tipOnlyWhenCut /></Link></td>
                   <td title={fmtTime(d.deleted_at)}>{fmtShort(d.deleted_at)}</td>
                   <td>{daysLeftText(d.delete?.days_left ?? 0)}</td>
                   <td><OutLink href={d.delete?.run?.url}><RunStatus status={null} outcome={outcome} /></OutLink>
-                    {outcome.note && <span className="sub">{outcome.note}</span>}</td>
+                    {outcome.note && <Cut text={outcome.note} className="cut sub" />}</td>
                   <td className="num">{fmtInt(d.tables_left)}</td>
-                  <td>
+                  <td><span className="cell-line">
                     <button disabled={!!refusal || restore.isPending} title={refusal}
                       onClick={() => restore.mutate(d.id)}>{restore.isPending && restore.variables === d.id ? "Restoring…" : "Restore"}</button>{" "}
                     <button className="danger" disabled={!!refusal || purge.isPending} title={refusal}
                       onClick={() => deleteNow(d)}>Delete now</button>
-                    {refusal && <span className="sub">{refusal}</span>}
-                  </td>
+                    {refusal && <Cut text={refusal} className="cut sub" />}
+                  </span></td>
                 </tr>
               );
             })}

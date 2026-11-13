@@ -1,13 +1,16 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, qs, type Row } from "../api";
-import { Busy, ErrorBox, Info, Modal, Notice, Pager, Tag, Tip, fmtInt, plural, Twisty, useNow } from "../components";
+import { Busy, Cols, Cut, ErrorBox, Info, Modal, Notice, Pager, Tag, Tip, fmtInt, oneLine, plural, Twisty, useNow } from "../components";
 import { useSettings } from "../App";
 import { DatabaseTables } from "./SourcePick";
 import { ConnectionTable } from "./ConnectionTable";
 import { CreateConnectionChoices } from "./CreateConnectionChoices";
 import { accessOf, countsText, likeContaining, readable, selectionCounts, serverRowPick, underFilter, type Pick, type ServerCount } from "./pickState";
 import { connectionFailure, connectionNextBlock, connectionNextLabel, MASTER_ACCESS, readsDone, waitLine, type ErrorCodes } from "../pending";
+
+/** The discover tree's columns as Catalog Explorer's tables list keeps them: the name takes the spare width. */
+const DISCOVER_WIDTHS = [null, 110, 220] as const;
 
 // Add tables, Discover on a source: as Lakeflow Connect's Connection and Source steps. Step 1 is the Unity Catalog
 // connection, tested by Next before anything is discovered; step 2 picks the whole server, whole databases or single tables in
@@ -362,20 +365,23 @@ function Step2({ connection, discoveryId, checksOn, typedNames, picks, setPicks,
       <div className="toolbar"><input className="search" placeholder="Filter databases, e.g. eng_0" value={filter}
         onChange={(e) => { setFilter(e.target.value); setOffset(0); }} />
         <button className="ghost" onClick={() => setAll(shown.filter((d) => !covered(d) && !closed(d)), "all")}>Select all shown</button></div>
-      <div className="table-wrap tree-pick"><table className="data tree">
+      <div className="table-wrap tree-pick"><table {...oneLine(DISCOVER_WIDTHS, "tree")}>
+        <Cols widths={DISCOVER_WIDTHS} />
         <thead><tr><th>Server › database › schema.table</th><th className="num">Tables</th><th>Load type</th></tr></thead>
         <tbody>
-          <tr><td className="name"><TriBox pick={server} label={`The whole server ${connection}`} onClick={tickServer} />{" "}
+          <tr><td className="name"><span className="cell-line"><TriBox pick={server} label={`The whole server ${connection}`} onClick={tickServer} />
+            <Cut tipOnlyWhenCut text={`${connection}, ${discoveryId != null && wholeServer.on && wholeServer.filter
+              ? `every database matching "${wholeServer.filter}"` : "the whole server"}`}>
             <b>{connection}</b>, {discoveryId != null && wholeServer.on && wholeServer.filter
-              ? <>every database matching "{wholeServer.filter}"</> : "the whole server"}</td>
+              ? <>every database matching "{wholeServer.filter}"</> : "the whole server"}</Cut></span></td>
             <td className="num">{fmtInt(total)} {plural(total, "database")}</td>
             <td className="muted">{server === "part" ? "chosen in part" : ""}</td></tr>
           {shown.slice(0, 500).map((d) => (
             <Fragment key={d}>
-              <tr className={`l2${closed(d) ? " closed" : ""}`}><td className="name" style={{ paddingLeft: 30 }}>
-                <TriBox pick={pickOf(d)} label={`The whole database ${d}`} onClick={() => !covered(d) && setAll([d], pickOf(d) === "all" ? "none" : "all")} />{" "}
+              <tr className={`l2${closed(d) ? " closed" : ""}`}><td className="name" style={{ paddingLeft: 30 }}><span className="cell-line">
+                <TriBox pick={pickOf(d)} label={`The whole database ${d}`} onClick={() => !covered(d) && setAll([d], pickOf(d) === "all" ? "none" : "all")} />
                 <Twisty open={open === d} onToggle={() => openDatabase(d)}
-                  closed={closed(d) ? `${d} can't be opened: ${String(seen[d]?.why ?? "the connection's login can't open this database")}` : undefined}>{d}</Twisty></td>
+                  closed={closed(d) ? `${d} can't be opened: ${String(seen[d]?.why ?? "the connection's login can't open this database")}` : undefined}><Cut text={d} tipOnlyWhenCut /></Twisty></span></td>
                 <td className="num">{reading === d ? "reading…" : ""}</td>
                 <td className="muted">{closed(d) ? <Tip text={String(seen[d]?.why ?? "the connection's login can't open this database")} focusable>
                   can't open: hover for why</Tip>

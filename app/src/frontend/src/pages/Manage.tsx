@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Navigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api, type Row } from "../api";
-import { ErrorBox, Metric, Notice, OutLink, PageHead, Section, fmtTime, plural } from "../components";
+import { Cols, Cut, CutCopy, ErrorBox, Metric, Notice, OutLink, PageHead, Section, fmtTime, oneLine, plural } from "../components";
 import { usePermissions } from "../permissions";
 import { useSettings } from "../App";
 import {
@@ -36,19 +36,24 @@ function Export() {
   );
 }
 
+/** The Databricks jobs list as the Jobs list keeps its columns: the job takes the spare width, the id has its own. */
+const JOB_WIDTHS = [220, null, 190] as const;
+const WAREHOUSE_WIDTHS = [null, 220, 220, 110, 240] as const;
+
 function DatabricksJobs() {
   const list = useQuery({ queryKey: ["manage-jobs"], queryFn: () => api.get<Row[]>("/manage/jobs") });
   return (
     <Section title="Databricks jobs">
       <ErrorBox error={list.error} />
-      <div className="table-wrap"><table className="data">
+      <div className="table-wrap"><table {...oneLine(JOB_WIDTHS)}>
+        <Cols widths={JOB_WIDTHS} />
         <thead><tr><th>Used for</th><th>Databricks job</th><th>Job ID</th></tr></thead>
         <tbody>{(list.data ?? []).map((job) => (
           <tr key={job.job_id}>
-            <td>{job.role}</td>
-            <td>{job.url ? <OutLink href={job.url}>{job.name ?? `Job ${job.job_id}`}</OutLink> : job.name ?? `Job ${job.job_id}`}
-              {job.error && <span className="sub">{job.error}</span>}</td>
-            <td className="mono">{job.job_id}</td>
+            <td><Cut text={job.role} tipOnlyWhenCut /></td>
+            <td>{job.url ? <OutLink href={job.url}>{job.name ?? `Job ${job.job_id}`}</OutLink> : <Cut text={job.name ?? `Job ${job.job_id}`} tipOnlyWhenCut />}
+              {job.error && <Cut text={job.error} className="cut sub" />}</td>
+            <td className="mono"><CutCopy text={String(job.job_id)} label={`Copy the job ID ${job.job_id}`} /></td>
           </tr>
         ))}</tbody>
       </table></div>
@@ -96,13 +101,15 @@ function Warehouse() {
     <Section title="SQL warehouse">
       <p className="muted small">Where the app runs its queries on the sources: the connection test, the database list,
         the access checks and the table reads. Set in the bundle, by the app_warehouse_id variable.</p>
-      <div className="table-wrap"><table className="data">
-        <thead><tr><th>SQL warehouse</th><th>Type</th><th>State</th><th>Set by</th></tr></thead>
+      <div className="table-wrap"><table {...oneLine(WAREHOUSE_WIDTHS)}>
+        <Cols widths={WAREHOUSE_WIDTHS} />
+        <thead><tr><th>SQL warehouse</th><th>Warehouse ID</th><th>Type</th><th>State</th><th>Set by</th></tr></thead>
         <tbody><tr>
-          <td>{warehouse.name ?? "Not known"}{warehouse.id && <span className="sub mono">{warehouse.id}</span>}</td>
-          <td>{warehouseKind(warehouse)}</td>
+          <td><Cut text={warehouse.name ?? "Not known"} tipOnlyWhenCut /></td>
+          <td className="mono">{warehouse.id ? <CutCopy text={String(warehouse.id)} label="Copy the warehouse ID" /> : <span className="muted">Not known</span>}</td>
+          <td><Cut text={warehouseKind(warehouse)} tipOnlyWhenCut /></td>
           <td>{warehouse.state ?? "Not known"}</td>
-          <td>{warehouseChosenBy(warehouse)}</td>
+          <td><Cut text={warehouseChosenBy(warehouse)} tipOnlyWhenCut /></td>
         </tr></tbody>
       </table></div>
       {warehouse.problem && <Notice tone="warn">{warehouse.problem}</Notice>}

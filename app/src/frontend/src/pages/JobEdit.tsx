@@ -3,7 +3,7 @@ import { JdbcSourceNotice } from "./JdbcConnectionForm";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, qs, type Row } from "../api";
-import { Crumbs, ConfirmButton, ErrorBox, Info, Menu, Notice, PageHead, Pager, Section, StateBar, fmtInt, plural, useConfirm, Twisty,
+import { Cols, Crumbs, ConfirmButton, Cut, ErrorBox, Info, Menu, Notice, PageHead, Pager, Section, StateBar, fmtInt, oneLine, plural, useConfirm, Twisty,
          Busy, Chevron, OutLink, Required, StatusLine, WriteWarnings, toast } from "../components";
 import { usePermissions } from "../permissions";
 import { CADENCES, IdentityFields, ParameterField, ParameterFields, RunFields, WritesFields } from "./jobForm";
@@ -18,6 +18,10 @@ import { AVAILABLE_WHEN_READY } from "../preparing";
 // asks before a change to data; the rest is saved with Save.
 
 const PAGE = 25;
+/** The tree's columns as Catalog Explorer's tables list keeps them: the name takes the spare width, the short fields have their own. */
+const GROUP_PREVIEW_WIDTHS = [null, 150, 120, 120, 260] as const;
+const COMPUTE_WIDTHS = [220, 220, null, 220] as const;
+const TREE_WIDTHS = [null, 190, 110, 120, 200, 72, 160] as const;
 const LOAD_TYPES: Record<string, string> = { ct: "Change tracking", cursor: "Cursor column", full: "Full reload" };
 
 /** Why the signed-in user may not change this job (their Databricks permission), or null when they may. */
@@ -76,14 +80,14 @@ function TableRows({ jobId, server, database, locked, readOnly }: { jobId: strin
     <>
       {(tables.data?.items ?? []).map((t: Row) => (
         <tr key={t.id} className="l3">
-          <td className="name">{t.schema}.{t.table}</td>
+          <td className="name"><Cut text={`${t.schema}.${t.table}`} tipOnlyWhenCut /></td>
           <td>{readOnly ? LOAD_TYPES[t.load_type] ?? t.load_type : <select value={t.load_type} disabled={edit.isPending || !!locked}
             title={locked ?? "Changes this table in every database of the job"} onChange={(e) => edit.mutate({ t, load_type: e.target.value })}>
             <option value="ct">Change tracking</option><option value="cursor">Cursor column</option>
             <option value="full">Full reload</option></select>}</td>
-          <td className="mono">{t.primary_key}</td>
+          <td className="mono"><Cut text={String(t.primary_key ?? "")} tipOnlyWhenCut /></td>
           <td className="num">{fmtInt(t.columns)} columns</td>
-          <td className="mono">{t.target}</td>
+          <td className="mono"><Cut text={String(t.target ?? "")} tipOnlyWhenCut /></td>
           <td>{readOnly ? (t.enabled ? "on" : <span className="muted">off</span>) : <input type="checkbox" checked={!!t.enabled}
             disabled={enable.isPending || !!locked} title={locked ?? undefined} onChange={() => enable.mutate(t)} />}</td>
           <td><StateBar row={t} /></td>
@@ -138,9 +142,10 @@ function DatabaseRows({ jobId, server, locked, readOnly }: { jobId: string; serv
       {(dbs.data?.items ?? []).map((d: Row) => (
         <Fragment key={d.database}>
           <tr className="l2">
-            <td className="name"><Twisty open={open === d.database} onToggle={() => setOpen(open === d.database ? null : d.database)}>{d.database}</Twisty>
-              <SplitDatabaseTag groups={d.groups} /></td>
-            <td className="muted">{d.client_id ? `client_id ${d.client_id}` : ""}</td>
+            <td className="name"><span className="cell-line">
+              <Twisty open={open === d.database} onToggle={() => setOpen(open === d.database ? null : d.database)}><Cut text={d.database} tipOnlyWhenCut /></Twisty>
+              <SplitDatabaseTag groups={d.groups} /></span></td>
+            <td className="muted"><Cut text={d.client_id ? `client_id ${d.client_id}` : ""} tipOnlyWhenCut /></td>
             <td></td>
             <td className="num">{fmtInt(d.tables)} {Number(d.missing) > 0 && <span className="tag warn">{fmtInt(d.missing)} missing</span>}</td>
             <td></td>
@@ -168,15 +173,16 @@ export function Tree({ jobId, locked, readOnly }: { jobId: string; locked: Locke
   return (
     <div className="table-wrap">
       {servers.data?.jdbc && <JdbcSourceNotice jdbc={servers.data.jdbc} />}
-      <table className="data tree">
+      <table {...oneLine(TREE_WIDTHS, "tree")}>
+        <Cols widths={TREE_WIDTHS} />
         <thead><tr><th>Server › database › table</th><th>Read through · load type</th><th>Key</th>
           <th className="num">Databases · tables</th><th>Target table</th><th>Enabled</th><th>State now</th></tr></thead>
         <tbody>
           {(servers.data?.items ?? []).map((s: Row) => (
             <Fragment key={s.server}>
               <tr>
-                <td className="name"><Twisty open={open === s.server} onToggle={() => setOpen(open === s.server ? null : s.server)}><b>{s.server}</b></Twisty></td>
-                <td>{s.src_connection ? `UC connection ${s.src_connection}` : `JDBC ${s.src_host}`}</td>
+                <td className="name"><Twisty open={open === s.server} onToggle={() => setOpen(open === s.server ? null : s.server)}><Cut text={s.server} tipOnlyWhenCut><b>{s.server}</b></Cut></Twisty></td>
+                <td><Cut text={s.src_connection ? `UC connection ${s.src_connection}` : `JDBC ${s.src_host}`} tipOnlyWhenCut /></td>
                 <td></td>
                 <td className="num">{fmtInt(s.databases)} · {fmtInt(s.tables)}</td>
                 <td></td>
@@ -683,11 +689,12 @@ function Groups({ jobId, locked, saved }: { jobId: string; locked: Locked; saved
       <ErrorBox error={error} />
       {summary && (
         <>
-          <table className="data dense">
+          <table {...oneLine(GROUP_PREVIEW_WIDTHS, "dense")}>
+            <Cols widths={GROUP_PREVIEW_WIDTHS} />
             <thead><tr><th>Server</th><th className="num">Databases · tables</th><th className="num">Groups now</th>
               <th className="num">Groups after</th><th className="num">Databases that move</th></tr></thead>
             <tbody>{(summary.servers ?? []).map((line: Row) => (
-              <tr key={line.server}><td><b>{line.server}</b></td><td className="num">{fmtInt(line.databases)} · {fmtInt(line.tables)}</td>
+              <tr key={line.server}><td><Cut text={line.server} tipOnlyWhenCut><b>{line.server}</b></Cut></td><td className="num">{fmtInt(line.databases)} · {fmtInt(line.tables)}</td>
                 <td className="num">{fmtInt(line.groups_before)}</td><td className="num">{fmtInt(line.groups_after)}</td>
                 <td className="num">{line.groups_after === line.groups_before ? "none" : `${fmtInt(line.databases_moving)} (${fmtInt(line.tables_moving)} ${plural(line.tables_moving, "table")})`}</td></tr>
             ))}</tbody>
@@ -743,15 +750,16 @@ function Compute({ jobId }: { jobId: string }) {
         <Fragment key={job.role}>
           <h4>{job.role === "check" ? "The check" : "Each group run"}</h4>
           {job.error && <p className="muted">{job.error}</p>}
-          <table className="data">
+          <table {...oneLine(COMPUTE_WIDTHS)}>
+            <Cols widths={COMPUTE_WIDTHS} />
             <thead><tr><th>Task</th><th>Setting</th><th>Value</th><th>Set by</th></tr></thead>
             <tbody>
               {job.compute.map((task: Row) => task.fields.filter((f: Row) => !(job.role !== "check" && CLUSTER_FIELDS.includes(f.name)))
                 .map((f: Row, i: number) => (
                 <tr key={`${task.task}-${f.name}`}>
-                  <td>{i === 0 ? <><b>{task.task}</b> <span className="muted">{task.kind}</span></> : ""}</td>
-                  <td>{f.name}</td><td className="mono">{f.value}</td>
-                  <td className="muted">{f.source}</td>
+                  <td>{i === 0 ? <Cut text={`${task.task} ${task.kind}`} tipOnlyWhenCut><b>{task.task}</b> <span className="muted">{task.kind}</span></Cut> : ""}</td>
+                  <td><Cut text={String(f.name)} tipOnlyWhenCut /></td><td className="mono"><Cut text={String(f.value ?? "")} tipOnlyWhenCut /></td>
+                  <td className="muted"><Cut text={String(f.source ?? "")} tipOnlyWhenCut /></td>
                 </tr>
               )))}
             </tbody>
