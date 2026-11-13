@@ -551,11 +551,14 @@ def run_state_label(run: dict) -> dict:
 
 
 def live_view(wrappers: List[dict], checks: List[dict], ingest_runs: List[dict], groups: Iterable[str],
-              found: List[dict], stamped: Optional[int], running: List[dict], now: datetime) -> dict:
+              found: List[dict], stamped: Optional[int], running: List[dict], now: datetime,
+              check_record: Optional[dict] = None) -> dict:
     """The job run going now, as the Jobs UI shows a run with its tasks: the wrapper runs, then (check kind) the
     check and what it found, then the group runs it started, each with its state and, once Lakebase has it, its
     progress. Nothing when none of them is going. `ingest_runs` are the ingestion job's runs (active and recent);
-    the group runs shown are this job's groups' runs that are going or began since the run being shown did."""
+    the group runs shown are this job's groups' runs that are going or began since the run being shown did.
+    ``check_record`` is the check's own record (queries.check_records_since_sql), read while its Databricks task is
+    still going: see _check_view."""
     groups = set(groups)
     mine = [r for r in ingest_runs if (r.get("parameters") or {}).get("task_collection") in groups]
     check = max(checks, key=lambda r: r.get("started") or "", default=None)
@@ -575,11 +578,28 @@ def live_view(wrappers: List[dict], checks: List[dict], ingest_runs: List[dict],
             "progress": {"done": int(p.get("tables_checked") or 0), "planned": int(p.get("enabled_tables") or 0),
                          "failed": int(p.get("tables_failed") or 0), "group_run_id": p.get("run_id")} if p else None})
     with_work = {f["task_collection"]: int(f["databases"]) for f in found}
+    started_by_check = sum(1 for g in group_runs if check and (g["started"] or "") >= (check.get("started") or ""))
     return {
         "active": True,
         "wrappers": [dict(w, status=run_state_label(w)) for w in wrappers if is_active(w)],
-        "check": dict(check, status=run_state_label(check)) if check else None,
+        "check": _check_view(check, check_record, started_by_check) if check else None,
         "found": None if not check else {
             "groups_with_work": len(with_work), "databases_with_work": sum(with_work.values()),
             "unchanged_databases": stamped, "groups": len(groups), "started": len(group_runs)},
         "group_runs": group_runs, "read_at": now.isoformat()}
+
+
+def _check_view(check: dict, record: Optional[dict], group_runs_started_by_check: int) -> dict:
+    """The check as step 1 shows it. Its Databricks task waits for the group runs it starts (so a failed group run fails
+    the check), so it stays Running long after the check itself is done. The check's own record knows better. The
+    check finishes checking every group before it starts any run, so once it has started a group run and every
+    record has finished without failing, the step is Succeeded at the time its last record finished, and the
+    waiting belongs to the group runs of step 2. Before that, and when the check's task has ended or a record
+    failed, the step is the task's own state."""
+    view = dict(check, status=run_state_label(check))
+    finished_at = record.get("finished_at") if record else None
+    if (is_active(check) and record and finished_at and group_runs_started_by_check and int(record["records"])
+            and not int(record["running"]) and not int(record["failed"])):
+        view.update(status={"label": "Succeeded", "tone": "ok"}, ended=_aware(finished_at).isoformat(),
+                    done_by_record=True)
+    return view

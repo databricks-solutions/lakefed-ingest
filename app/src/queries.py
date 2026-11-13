@@ -3290,6 +3290,18 @@ def check_work_found_sql() -> str:
             f"group by task_collection")
 
 
+def check_records_since_sql() -> str:
+    """The check job's own records (one ingest_run row per group it checked) since a time: how many there are, how many
+    are still running, how many ended any way but completed (failed, cancelled, skipped), and when the last one
+    finished. This is where the check says it is done, whatever its Databricks task is still waiting for.
+    Params: groups (list), since (timestamptz)."""
+    return (f"select count(*) as records, count(*) filter (where status = 'running') as running, "
+            f"count(*) filter (where status not in ('running', 'completed')) as failed, "
+            f"max(finished_at) as finished_at "
+            f"from {SCHEMA}.ingest_run where task_collection = any(%s) and left(coalesce(work_id, ''), 6) = 'check-' "
+            f"and started_at >= %s")
+
+
 def database_checks_since_sql() -> str:
     """How many databases of some groups a check found unchanged and stamped since a time. Params: groups (list),
     since (timestamptz)."""
